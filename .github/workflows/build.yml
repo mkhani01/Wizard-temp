@@ -1,0 +1,131 @@
+# Build AOS Migration Wizard for Windows (.exe), macOS (.app + .dmg), and Linux (binary).
+# Artifacts are available to download from the Actions run summary (free for public repos).
+name: Build executables
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:  # Allow manual "Run workflow" from Actions tab
+
+jobs:
+  build-windows:
+    name: Windows (exe)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build executable
+        run: |
+          pyinstaller --onefile --noconfirm --clean --name AOS-Migration-Wizard wizard.py
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AOS-Migration-Wizard-windows
+          path: dist/AOS-Migration-Wizard.exe
+
+  build-macos:
+    name: macOS (app + dmg)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Install create-dmg (for DMG)
+        run: brew install create-dmg
+
+      - name: Build .app with PyInstaller
+        run: |
+          pyinstaller --noconfirm --clean --onedir --windowed --name AOS-Migration-Wizard wizard.py
+          # PyInstaller outputs a folder; wrap as .app bundle
+          if [ -d "dist/AOS-Migration-Wizard.app" ]; then
+            echo "Already have .app bundle"
+          else
+            mkdir -p "dist/AOS-Migration-Wizard.app/Contents/MacOS"
+            cp -R dist/AOS-Migration-Wizard/* "dist/AOS-Migration-Wizard.app/Contents/MacOS/" || true
+            # Ensure executable has correct name
+            EXE=$(find "dist/AOS-Migration-Wizard.app/Contents/MacOS" -type f -executable | head -1)
+            if [ -n "$EXE" ] && [ "$(basename "$EXE")" != "AOS-Migration-Wizard" ]; then
+              mv "$EXE" "dist/AOS-Migration-Wizard.app/Contents/MacOS/AOS-Migration-Wizard"
+            fi
+            python3 -c "
+          import plistlib
+          p = {
+            'CFBundleExecutable': 'AOS-Migration-Wizard',
+            'CFBundleIdentifier': 'com.aos.migration-wizard',
+            'CFBundleName': 'AOS Migration Wizard',
+            'CFBundlePackageType': 'APPL',
+          }
+          with open('dist/AOS-Migration-Wizard.app/Contents/Info.plist', 'wb') as f:
+            plistlib.dump(p, f)
+          "
+          fi
+
+      - name: Create DMG
+        run: |
+          mkdir -p dmg_content
+          cp -R dist/AOS-Migration-Wizard.app dmg_content/
+          DMG_NAME="AOS-Migration-Wizard-1.0.0.dmg"
+          rm -f "dist/$DMG_NAME"
+          create-dmg \
+            --volname "AOS Migration Wizard" \
+            --window-size 500 320 \
+            --icon "AOS-Migration-Wizard.app" 180 150 \
+            --app-drop-link 320 150 \
+            "dist/$DMG_NAME" \
+            dmg_content
+
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: AOS-Migration-Wizard-macos
+          path: |
+            dist/AOS-Migration-Wizard.app
+            dist/AOS-Migration-Wizard-1.0.0.dmg
+
+  build-linux:
+    name: Linux (binary)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build executable
+        run: |
+          pyinstaller --onefile --noconfirm --clean --name AOS-Migration-Wizard wizard.py
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AOS-Migration-Wizard-linux
+          path: dist/AOS-Migration-Wizard

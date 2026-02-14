@@ -1,0 +1,42 @@
+# Environment and secrets
+.env
+.env.local
+*.env
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+*.manifest
+*.spec
+
+# Generated / output
+client_availability_migration.sql
+client_availability_migration.ts
+client_availability_data.json
+*.log
+migration_wizard_*.log
+travel_distances_migration.log
+feasible_pairs_migration.log
+output/
+
+# IDE and OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Cache
+.cache/
+
+# PyInstaller
+*.spec
+dist/
+build/
+assets/
