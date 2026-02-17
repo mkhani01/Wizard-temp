@@ -1,5 +1,6 @@
 # Build AOS Migration Wizard for Windows (.exe), macOS (.app + .dmg), and Linux (binary).
 # Artifacts are available to download from the Actions run summary (free for public repos).
+# Hidden imports ensure the app works like local when run as a single file on any OS.
 name: Build executables
 
 on:
@@ -28,7 +29,14 @@ jobs:
 
       - name: Build executable
         run: |
-          pyinstaller --onefile --noconfirm --clean --name AOS-Migration-Wizard wizard.py
+          pyinstaller --onefile --noconfirm --clean --name AOS-Migration-Wizard `
+            --hidden-import=areaMigration --hidden-import=availabilityTypeMigration `
+            --hidden-import=clientAvailabilityMigration --hidden-import=clientLocationsMigration `
+            --hidden-import=clientsMigration --hidden-import=distance_migration `
+            --hidden-import=feasible_pairs_migration --hidden-import=geocodeCalculation `
+            --hidden-import=userAvailabilityMigration --hidden-import=userLocationsMigration `
+            --hidden-import=usersMigration --hidden-import=tests --hidden-import=tests.test_before_run `
+            wizard.py
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
@@ -57,7 +65,14 @@ jobs:
 
       - name: Build .app with PyInstaller
         run: |
-          pyinstaller --noconfirm --clean --onedir --windowed --name AOS-Migration-Wizard wizard.py
+          pyinstaller --noconfirm --clean --onedir --windowed --name AOS-Migration-Wizard \
+            --hidden-import=areaMigration --hidden-import=availabilityTypeMigration \
+            --hidden-import=clientAvailabilityMigration --hidden-import=clientLocationsMigration \
+            --hidden-import=clientsMigration --hidden-import=distance_migration \
+            --hidden-import=feasible_pairs_migration --hidden-import=geocodeCalculation \
+            --hidden-import=userAvailabilityMigration --hidden-import=userLocationsMigration \
+            --hidden-import=usersMigration --hidden-import=tests --hidden-import=tests.test_before_run \
+            wizard.py
           # PyInstaller outputs a folder; wrap as .app bundle
           if [ -d "dist/AOS-Migration-Wizard.app" ]; then
             echo "Already have .app bundle"
@@ -115,6 +130,9 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install tkinter (for wizard GUI)
+        run: sudo apt-get update && sudo apt-get install -y python3-tk
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -122,7 +140,14 @@ jobs:
 
       - name: Build executable
         run: |
-          pyinstaller --onefile --noconfirm --clean --name AOS-Migration-Wizard wizard.py
+          pyinstaller --onefile --noconfirm --clean --name AOS-Migration-Wizard \
+            --hidden-import=areaMigration --hidden-import=availabilityTypeMigration \
+            --hidden-import=clientAvailabilityMigration --hidden-import=clientLocationsMigration \
+            --hidden-import=clientsMigration --hidden-import=distance_migration \
+            --hidden-import=feasible_pairs_migration --hidden-import=geocodeCalculation \
+            --hidden-import=userAvailabilityMigration --hidden-import=userLocationsMigration \
+            --hidden-import=usersMigration --hidden-import=tests --hidden-import=tests.test_before_run \
+            wizard.py
 
       - name: Upload Linux artifact
         uses: actions/upload-artifact@v4

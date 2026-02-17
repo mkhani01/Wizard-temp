@@ -39,11 +39,16 @@ except ModuleNotFoundError as e:
         sys.exit(1)
     raise
 
-# Project root (parent of this file; when frozen by PyInstaller, use executable dir)
+# Project root: when frozen = dir containing the exe (assets, cwd, logs); when dev = this file's dir.
+# Bundle root (frozen only): PyInstaller extracts to _MEIPASS; use it for imports so areaMigration etc. are found.
 if getattr(sys, "frozen", False):
     PROJECT_ROOT = Path(sys.executable).resolve().parent
+    BUNDLE_ROOT = Path(sys._MEIPASS).resolve() if hasattr(sys, "_MEIPASS") else PROJECT_ROOT
+    if str(BUNDLE_ROOT) not in sys.path:
+        sys.path.insert(0, str(BUNDLE_ROOT))
 else:
     PROJECT_ROOT = Path(__file__).resolve().parent
+    BUNDLE_ROOT = PROJECT_ROOT
 ASSETS = PROJECT_ROOT / "assets"
 
 # Step indices
@@ -725,8 +730,8 @@ class MigrationWizard:
     def _do_run(self, log_path: Path):
         import io
         os.chdir(PROJECT_ROOT)
-        if str(PROJECT_ROOT) not in sys.path:
-            sys.path.insert(0, str(PROJECT_ROOT))
+        if str(BUNDLE_ROOT) not in sys.path:
+            sys.path.insert(0, str(BUNDLE_ROOT))
         buf = io.StringIO()
         log_fmt = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
         handler = logging.StreamHandler(buf)
@@ -877,52 +882,52 @@ class MigrationWizard:
         return order
 
     def _run_users(self):
-        sys.path.insert(0, str(PROJECT_ROOT))
+        sys.path.insert(0, str(BUNDLE_ROOT))
         from usersMigration.main import run
         return run()
 
     def _run_availability_types(self):
-        sys.path.insert(0, str(PROJECT_ROOT))
+        sys.path.insert(0, str(BUNDLE_ROOT))
         from availabilityTypeMigration.main import run
         return run()
 
     def _run_user_availability(self):
-        sys.path.insert(0, str(PROJECT_ROOT))
+        sys.path.insert(0, str(BUNDLE_ROOT))
         from userAvailabilityMigration.main import run
         return run()
 
     def _run_clients(self):
-        sys.path.insert(0, str(PROJECT_ROOT))
+        sys.path.insert(0, str(BUNDLE_ROOT))
         from clientsMigration.main import run
         return run()
 
     def _run_client_availability(self):
-        sys.path.insert(0, str(PROJECT_ROOT))
+        sys.path.insert(0, str(BUNDLE_ROOT))
         from clientAvailabilityMigration.main import run
         return run()
 
     def _run_geocode_api(self):
-        sys.path.insert(0, str(PROJECT_ROOT))
+        sys.path.insert(0, str(BUNDLE_ROOT))
         from geocodeCalculation.main import run
         return run()
 
     def _run_client_locations(self):
-        sys.path.insert(0, str(PROJECT_ROOT))
+        sys.path.insert(0, str(BUNDLE_ROOT))
         from clientLocationsMigration.main import run
         return run()
 
     def _run_user_locations(self):
-        sys.path.insert(0, str(PROJECT_ROOT))
+        sys.path.insert(0, str(BUNDLE_ROOT))
         from userLocationsMigration.main import run
         return run()
 
     def _run_travel_distances(self):
-        sys.path.insert(0, str(PROJECT_ROOT))
+        sys.path.insert(0, str(BUNDLE_ROOT))
         from distance_migration.travel_distances_migration import run
         return run()
 
     def _run_feasible_pairs(self):
-        sys.path.insert(0, str(PROJECT_ROOT))
+        sys.path.insert(0, str(BUNDLE_ROOT))
         from feasible_pairs_migration.feasible_pairs_migration import run as run_feasible_pairs
         csv_path = ASSETS / "visit_data.csv"
         return run_feasible_pairs(csv_path=str(csv_path))
