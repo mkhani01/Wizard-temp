@@ -18,12 +18,13 @@ from pathlib import Path
 from . import config as db_config
 from . import csv_parser
 from . import db_seed
+from migration_support import get_project_root, get_assets_dir
 
 logger = logging.getLogger(__name__)
 
-# Default assets path (wizard copies files here)
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_CSV_DIR = PROJECT_ROOT / "assets" / "availabilitytypes"
+# Default assets path (wizard copies files here; uses exe dir when frozen)
+PROJECT_ROOT = get_project_root()
+DEFAULT_CSV_DIR = get_assets_dir() / "availabilitytypes"
 
 
 def _setup_logging(log_to_file=True):

@@ -219,8 +219,9 @@ def run():
         logger.error("Required: DB_NAME, DB_USER, DB_PASSWORD")
         return False
     
-    # Get JSON path
-    json_path = Path(__file__).parent.parent / 'assets' / 'usersBackup.json'
+    # Get JSON path (uses exe dir when frozen)
+    from migration_support import get_assets_dir
+    json_path = get_assets_dir() / 'usersBackup.json'
     
     if not json_path.exists():
         logger.error(f"JSON file not found: {json_path}")

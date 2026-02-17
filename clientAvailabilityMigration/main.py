@@ -711,7 +711,8 @@ def run(xlsx_path: Optional[str] = None) -> bool:
     ╚════════════════════════════════════════════════════════════════╝
     """)
     
-    filepath = Path(xlsx_path) if xlsx_path else Path(__file__).parent.parent / 'assets' / 'clientAvailability' / 'ClientHoursWithServiceType.xlsx'
+    from migration_support import get_assets_dir
+    filepath = Path(xlsx_path) if xlsx_path else get_assets_dir() / 'clientAvailability' / 'ClientHoursWithServiceType.xlsx'
     logger.info(f"Excel file path: {filepath}")
     
     connection = None

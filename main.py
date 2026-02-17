@@ -6,13 +6,19 @@ from dotenv import load_dotenv
 # Ensure project/bundle root is on path (script dir when dev; PyInstaller bundle when single-file exe)
 if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
     _PROJECT_ROOT = Path(sys._MEIPASS).resolve()
+    _ASSETS_ROOT = Path(sys.executable).resolve().parent
 else:
     _PROJECT_ROOT = Path(__file__).resolve().parent
+    _ASSETS_ROOT = _PROJECT_ROOT
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
-
-# Load environment variables
-load_dotenv()
+os.environ["AOS_MIGRATION_PROJECT_ROOT"] = str(_ASSETS_ROOT)
+# When frozen, use exe dir for .env and cwd (logs, cache, assets) so it works regardless of launch cwd
+if getattr(sys, "frozen", False):
+    os.chdir(_ASSETS_ROOT)
+    load_dotenv(_ASSETS_ROOT / ".env")
+else:
+    load_dotenv()
 
 
 def print_usage():

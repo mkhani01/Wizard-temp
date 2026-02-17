@@ -508,7 +508,8 @@ def run(csv_path=None):
     elif len(sys.argv) > 1:
         csv_path = Path(sys.argv[1])
     else:
-        csv_path = Path(__file__).parent.parent / 'assets' / 'visit_data.csv'
+        from migration_support import get_assets_dir
+        csv_path = get_assets_dir() / 'visit_data.csv'
     
     if not csv_path.exists():
         logger.error(f"CSV file not found: {csv_path}")

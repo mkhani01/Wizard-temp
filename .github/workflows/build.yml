@@ -35,7 +35,7 @@ jobs:
             --hidden-import=clientsMigration --hidden-import=distance_migration `
             --hidden-import=feasible_pairs_migration --hidden-import=geocodeCalculation `
             --hidden-import=userAvailabilityMigration --hidden-import=userLocationsMigration `
-            --hidden-import=usersMigration --hidden-import=tests --hidden-import=tests.test_before_run `
+            --hidden-import=usersMigration --hidden-import=tests --hidden-import=tests.test_before_run --hidden-import=migration_support `
             wizard.py
 
       - name: Upload Windows artifact
@@ -71,7 +71,7 @@ jobs:
             --hidden-import=clientsMigration --hidden-import=distance_migration \
             --hidden-import=feasible_pairs_migration --hidden-import=geocodeCalculation \
             --hidden-import=userAvailabilityMigration --hidden-import=userLocationsMigration \
-            --hidden-import=usersMigration --hidden-import=tests --hidden-import=tests.test_before_run \
+            --hidden-import=usersMigration --hidden-import=tests --hidden-import=tests.test_before_run --hidden-import=migration_support \
             wizard.py
           # PyInstaller outputs a folder; wrap as .app bundle
           if [ -d "dist/AOS-Migration-Wizard.app" ]; then
@@ -146,7 +146,7 @@ jobs:
             --hidden-import=clientsMigration --hidden-import=distance_migration \
             --hidden-import=feasible_pairs_migration --hidden-import=geocodeCalculation \
             --hidden-import=userAvailabilityMigration --hidden-import=userLocationsMigration \
-            --hidden-import=usersMigration --hidden-import=tests --hidden-import=tests.test_before_run \
+            --hidden-import=usersMigration --hidden-import=tests --hidden-import=tests.test_before_run --hidden-import=migration_support \
             wizard.py
 
       - name: Upload Linux artifact

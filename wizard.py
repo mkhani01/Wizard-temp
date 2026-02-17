@@ -50,6 +50,15 @@ else:
     PROJECT_ROOT = Path(__file__).resolve().parent
     BUNDLE_ROOT = PROJECT_ROOT
 ASSETS = PROJECT_ROOT / "assets"
+# So migration modules (usersMigration, etc.) resolve assets next to exe when frozen
+os.environ["AOS_MIGRATION_PROJECT_ROOT"] = str(PROJECT_ROOT)
+# Load .env from exe dir when frozen (optional; DB/API keys can also be set in the wizard form)
+if getattr(sys, "frozen", False):
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(PROJECT_ROOT / ".env")
+    except Exception:
+        pass
 
 # Step indices
 STEP_WELCOME = 0

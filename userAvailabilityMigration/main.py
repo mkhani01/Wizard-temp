@@ -633,7 +633,8 @@ def run(xlsx_path: Optional[str] = None) -> bool:
         filepath = Path(xlsx_path)
     else:
         # Default path
-        filepath = Path(__file__).parent.parent / 'assets' / 'userAvailabilities' / 'userAvailabilities.xlsx'
+        from migration_support import get_assets_dir
+        filepath = get_assets_dir() / 'userAvailabilities' / 'userAvailabilities.xlsx'
     
     logger.info(f"Excel file path: {filepath}")
     

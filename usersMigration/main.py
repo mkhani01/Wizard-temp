@@ -8,6 +8,8 @@ import csv
 import logging
 from pathlib import Path
 from datetime import datetime
+
+from migration_support import get_assets_dir
 import psycopg2
 from psycopg2.extras import RealDictCursor, execute_values
 
@@ -501,8 +503,8 @@ def run():
         logger.error("Required: DB_NAME, DB_USER, DB_PASSWORD")
         return False
     
-    # Get CSV path
-    csv_path = Path(__file__).parent.parent / 'assets' / 'CareAssistantExport.csv'
+    # Get CSV path (uses exe dir when frozen, project root when dev)
+    csv_path = get_assets_dir() / 'CareAssistantExport.csv'
     
     if not csv_path.exists():
         logger.error(f"CSV file not found: {csv_path}")

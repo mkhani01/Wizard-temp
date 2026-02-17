@@ -88,9 +88,12 @@ def connect_to_database(config):
 
 
 class GeocodeCache:
-    """Manages geocoding cache in .cache/geocode folder"""
+    """Manages geocoding cache in .cache/geocode (under project/exe root so it works when frozen)."""
     
-    def __init__(self, cache_dir='.cache/geocode'):
+    def __init__(self, cache_dir=None):
+        if cache_dir is None:
+            from migration_support import get_project_root
+            cache_dir = get_project_root() / ".cache" / "geocode"
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"Cache directory: {self.cache_dir.absolute()}")
@@ -572,8 +575,9 @@ def run():
         logger.error("Missing database configuration")
         return False
     
-    # Check IE.txt file
-    ie_file = Path(__file__).parent.parent / 'assets' / 'IE.txt'
+    # Check IE.txt file (uses exe dir when frozen)
+    from migration_support import get_assets_dir
+    ie_file = get_assets_dir() / 'IE.txt'
     if not ie_file.exists():
         logger.error(f"IE.txt not found: {ie_file}")
         return False
