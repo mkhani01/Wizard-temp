@@ -1,80 +1,48 @@
 """
-User Availability Migration - January & February 2026
-Analyzes March 2026 data and generates availability records by subtracting 4 weeks (28 days).
-- Core → recurring (is_temp=False): start_date, end_date, occurs_every=4.
-- All other availability types → temporary (is_temp=True): effective_date_from, effective_date_to.
-- type_id and is_unavailability are resolved from availability_types table (by type name).
+User Availability Migration Script
+===================================
+Migrates user availability data from Excel file to database.
+
+Rules:
+- Only records with "Type" = "Core" are processed
+- Care Assistant Name has titles (Mr, Mrs, Miss, Ms, Dr, Prof) - stripped to match user
+- Start Date - 28 days = start_date for seeding (recurring availability)
+- occurs_every = 4 (monthly recurrence - first week of each month)
+- "Core" availability type must exist in database (throws error if not found)
+- is_temp = False (recurring), is_unavailability = False
 """
 
 import os
+import sys
 import logging
 from pathlib import Path
-from datetime import datetime, timedelta, time, date
+from datetime import datetime, timedelta, date, time
 from collections import defaultdict
-import psycopg2
-from psycopg2.extras import RealDictCursor, execute_values
-import openpyxl
+from typing import Optional, Dict, List, Tuple, Any
 
-# Configure logging
+try:
+    import psycopg2
+    from psycopg2.extras import RealDictCursor, execute_values
+    import openpyxl
+except ImportError as e:
+    print(f"Missing required package: {e}")
+    print("Please install: pip install psycopg2-binary openpyxl")
+    sys.exit(1)
+
+
+# Configure comprehensive logging
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s',
     handlers=[
-        logging.FileHandler('migration_jan2026_from_march.log'),
-        logging.StreamHandler()
+        logging.FileHandler('migration_core_availability.log', mode='w'),
+        logging.StreamHandler(sys.stdout)
     ]
 )
 logger = logging.getLogger(__name__)
 
 
-def get_db_config():
-    """Get database configuration from environment variables"""
-    return {
-        'host': os.getenv('DB_HOST', 'localhost'),
-        'port': int(os.getenv('DB_PORT', '5432')),
-        'database': os.getenv('DB_NAME'),
-        'user': os.getenv('DB_USER'),
-        'password': os.getenv('DB_PASSWORD')
-    }
-
-
-def connect_to_database(config):
-    """Connect to PostgreSQL database"""
-    try:
-        logger.info("Connecting to PostgreSQL...")
-        connection = psycopg2.connect(
-            host=config['host'],
-            port=config['port'],
-            database=config['database'],
-            user=config['user'],
-            password=config['password'],
-            cursor_factory=RealDictCursor
-        )
-        connection.autocommit = False
-        logger.info("✓ Connected to database")
-        return connection
-    except Exception as e:
-        logger.error(f"✗ Failed to connect: {e}")
-        raise
-
-
-def get_all_users(connection):
-    """Get all users from database"""
-    cursor = connection.cursor()
-    try:
-        cursor.execute("SELECT id, name, lastname FROM \"user\"")
-        users = {}
-        for row in cursor.fetchall():
-            key = f"{row['name']} {row['lastname']}".strip().lower()
-            users[key] = row['id']
-        
-        logger.info(f"Loaded {len(users)} users from database")
-        return users
-    finally:
-        cursor.close()
-
-
-# Excel column indices (0-based) - based on header row:
+# Excel column indices (0-based) based on the header:
 # A(0): Care Assistant Name
 # B(1): Care Assistant Franchise
 # C(2): Care Assistant Team
@@ -85,479 +53,475 @@ def get_all_users(connection):
 # H(7): End Date
 # I(8): End Time
 # J(9): Hours
-# K(10): Type  <-- This is the availability type name (e.g., "Core", "Office availability")
+# K(10): Type
 # L(11): Notes
 
-CARE_ASSISTANT_NAME_COLUMN = 0
-FRANCHISE_COLUMN = 1
-TEAM_COLUMN = 2
-CARE_ASSISTANT_TYPE_COLUMN = 3
-GRADE_TYPE_COLUMN = 4
-START_DATE_COLUMN = 5
-START_TIME_COLUMN = 6
-END_DATE_COLUMN = 7
-END_TIME_COLUMN = 8
-HOURS_COLUMN = 9
-TYPE_NAME_COLUMN_INDEX = 10  # "Type" column - availability type name
-NOTES_COLUMN = 11
+COLUMN_CARE_ASSISTANT_NAME = 0
+COLUMN_FRANCHISE = 1
+COLUMN_TEAM = 2
+COLUMN_CARE_ASSISTANT_TYPE = 3
+COLUMN_GRADE_TYPE = 4
+COLUMN_START_DATE = 5
+COLUMN_START_TIME = 6
+COLUMN_END_DATE = 7
+COLUMN_END_TIME = 8
+COLUMN_HOURS = 9
+COLUMN_TYPE = 10
+COLUMN_NOTES = 11
+
+# Days of week enum values (must match DayOfWeek enum in entity)
+DAYS_OF_WEEK = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+
+# Titles to strip from names
+TITLES = ['Mr', 'Mrs', 'Miss', 'Ms', 'Dr', 'Prof', 'Mr.', 'Mrs.', 'Miss.', 'Ms.', 'Dr.', 'Prof.']
 
 
-def get_availability_types(connection):
-    """
-    Load availability_types from DB: name -> {id, is_unavailability}.
-    is_unavailability is True when type enum is 'unavailability'.
-    """
+class MigrationError(Exception):
+    """Custom exception for migration errors"""
+    pass
+
+
+def get_db_config() -> Dict[str, Any]:
+    """Get database configuration from environment variables"""
+    config = {
+        'host': os.getenv('DB_HOST', 'localhost'),
+        'port': int(os.getenv('DB_PORT', '5432')),
+        'database': os.getenv('DB_NAME'),
+        'user': os.getenv('DB_USER'),
+        'password': os.getenv('DB_PASSWORD')
+    }
+    
+    missing = [k for k, v in config.items() if not v]
+    if missing:
+        raise MigrationError(f"Missing database configuration: {missing}")
+    
+    return config
+
+
+def connect_to_database(config: Dict[str, Any]):
+    """Connect to PostgreSQL database"""
+    try:
+        logger.info(f"Connecting to PostgreSQL at {config['host']}:{config['port']}/{config['database']}...")
+        connection = psycopg2.connect(
+            host=config['host'],
+            port=config['port'],
+            database=config['database'],
+            user=config['user'],
+            password=config['password'],
+            cursor_factory=RealDictCursor
+        )
+        connection.autocommit = False
+        logger.info("✓ Database connection established successfully")
+        return connection
+    except Exception as e:
+        logger.error(f"✗ Failed to connect to database: {e}")
+        raise MigrationError(f"Database connection failed: {e}")
+
+
+def get_all_users(connection) -> Dict[str, int]:
+    """Get all users from database mapped by 'name lastname' (lowercase)"""
     cursor = connection.cursor()
     try:
-        cursor.execute(
-            "SELECT id, name, type FROM availability_types WHERE deleted_at IS NULL"
-        )
-        result = {}
+        cursor.execute('SELECT id, name, lastname FROM "user" WHERE deleted_at IS NULL')
+        users = {}
         for row in cursor.fetchall():
             name = (row['name'] or '').strip()
-            if not name:
-                continue
-            result[name.lower()] = {
-                'id': row['id'],
-                'is_unavailability': (row['type'] or '').strip().lower() == 'unavailability',
-            }
-        logger.info(f"Loaded {len(result)} availability types from database")
-        return result
+            lastname = (row['lastname'] or '').strip()
+            key = f"{name} {lastname}".strip().lower()
+            if key:
+                users[key] = row['id']
+        
+        logger.info(f"✓ Loaded {len(users)} users from database")
+        logger.debug(f"Sample user keys: {list(users.keys())[:5]}")
+        return users
     finally:
         cursor.close()
 
 
-def strip_title(full_name):
-    """Strip title from name"""
-    titles = ['Mr', 'Mrs', 'Miss', 'Ms', 'Dr', 'Prof']
+def get_core_availability_type(connection) -> Tuple[int, bool]:
+    """
+    Get the 'Core' availability type from database.
+    Returns (type_id, is_unavailability).
+    Throws error if not found.
+    """
+    cursor = connection.cursor()
+    try:
+        # Try to find 'Core' type (case-insensitive)
+        cursor.execute(
+            "SELECT id, name, type FROM availability_types "
+            "WHERE LOWER(name) = 'core' AND deleted_at IS NULL"
+        )
+        row = cursor.fetchone()
+        
+        if not row:
+            # Log all available types for debugging
+            cursor.execute("SELECT id, name, type FROM availability_types WHERE deleted_at IS NULL")
+            all_types = cursor.fetchall()
+            logger.error("Available availability types in database:")
+            for t in all_types:
+                logger.error(f"  - ID: {t['id']}, Name: '{t['name']}', Type: '{t['type']}'")
+            
+            raise MigrationError(
+                "CRITICAL: 'Core' availability type not found in database. "
+                "Please ensure the 'Core' availability type is seeded before running this migration."
+            )
+        
+        type_id = row['id']
+        is_unavailability = (row['type'] or '').strip().lower() == 'unavailability'
+        
+        logger.info(f"✓ Found 'Core' availability type: ID={type_id}, is_unavailability={is_unavailability}")
+        return type_id, is_unavailability
+        
+    finally:
+        cursor.close()
+
+
+def strip_title(full_name: str) -> str:
+    """Strip title from name and return cleaned name"""
+    if not full_name:
+        return ''
+    
     parts = full_name.strip().split()
-    if parts and parts[0] in titles:
-        return ' '.join(parts[1:])
-    return full_name
+    if not parts:
+        return ''
+    
+    # Remove title from beginning
+    while parts and parts[0] in TITLES:
+        parts = parts[1:]
+    
+    return ' '.join(parts)
 
 
-def parse_time_value(time_val):
-    """Parse time from various formats"""
+def parse_time_value(time_val) -> Optional[time]:
+    """Parse time from various formats (datetime.time, string, etc.)"""
+    if time_val is None:
+        return None
+    
     if isinstance(time_val, time):
         return time_val
+    
+    if isinstance(time_val, datetime):
+        return time_val.time()
+    
     if isinstance(time_val, str):
         try:
+            # Try HH:MM:SS format
             parts = time_val.split(':')
-            return time(int(parts[0]), int(parts[1]), int(parts[2]) if len(parts) > 2 else 0)
-        except:
-            return None
+            if len(parts) >= 2:
+                hours = int(parts[0])
+                minutes = int(parts[1])
+                seconds = int(parts[2]) if len(parts) > 2 else 0
+                return time(hours, minutes, seconds)
+        except (ValueError, IndexError):
+            pass
+    
     return None
 
 
-def parse_date_value(date_val):
-    """Parse date from various formats"""
+def parse_date_value(date_val) -> Optional[date]:
+    """Parse date from various formats (datetime, date, string)"""
+    if date_val is None:
+        return None
+    
     if isinstance(date_val, datetime):
         return date_val.date()
+    
     if isinstance(date_val, date):
         return date_val
+    
     if isinstance(date_val, str):
-        try:
-            return datetime.strptime(date_val.strip(), '%d/%m/%Y').date()
-        except:
+        date_str = date_val.strip()
+        # Try DD/MM/YYYY format (common in UK/EU)
+        for fmt in ['%d/%m/%Y', '%Y-%m-%d', '%d-%m-%Y', '%m/%d/%Y']:
             try:
-                return datetime.strptime(date_val.strip(), '%Y-%m-%d').date()
-            except:
-                return None
+                return datetime.strptime(date_str, fmt).date()
+            except ValueError:
+                continue
+    
     return None
 
 
-def get_day_of_week(date_obj):
-    """Get day of week from date"""
-    days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
-    return days[date_obj.weekday()]
+def get_day_of_week(date_obj: date) -> str:
+    """Get day of week name from date (Monday=0 to Sunday=6)"""
+    return DAYS_OF_WEEK[date_obj.weekday()]
 
 
-def get_week_of_month(date_obj):
+def format_time_str(t: time) -> str:
+    """Format time as HH:MM:SS string"""
+    return t.strftime('%H:%M:%S')
+
+
+def format_date_str(d: date) -> str:
+    """Format date as YYYY-MM-DD string"""
+    return d.strftime('%Y-%m-%d')
+
+
+def process_xlsx_file(filepath: Path, users_map: Dict[str, int]) -> Tuple[List[Dict], List[str]]:
     """
-    Get which week of the month this date falls in (1-4+)
-    Week starts on Monday
+    Process the Excel file and extract Core availability records.
+    
+    Returns:
+        Tuple of (valid_records, unmatched_users)
     """
-    # Find the first Monday of the month
-    first_day = date_obj.replace(day=1)
-    first_monday = first_day
+    logger.info(f"\n{'='*60}")
+    logger.info(f"PROCESSING EXCEL FILE: {filepath}")
+    logger.info(f"{'='*60}")
     
-    # If month doesn't start on Monday, find first Monday
-    if first_day.weekday() != 0:  # 0 = Monday
-        days_until_monday = (7 - first_day.weekday()) % 7
-        if days_until_monday > 0:
-            first_monday = first_day + timedelta(days=days_until_monday)
-    
-    # Calculate which week this date is in
-    if date_obj < first_monday:
-        # Days before first Monday are "week 0" or belong to previous month's last week
-        return 0
-    
-    days_since_first_monday = (date_obj - first_monday).days
-    week_number = (days_since_first_monday // 7) + 1
-    
-    return week_number
-
-
-def map_source_date_backward_4_weeks(source_date):
-    """
-    Map source date to target by subtracting 4 weeks (28 days).
-    Accepts result in January or February 2026.
-    """
-    target_date = source_date - timedelta(days=28)
-    if target_date.year == 2026 and target_date.month in [1, 2]:
-        return target_date
-    return None
-
-
-def _normalize_type_name(raw):
-    """Normalize availability type name for lookup (strip, lowercase). Default to 'Core' if empty."""
-    if raw is None:
-        return 'core'
-    s = str(raw).strip()
-    return s.lower() if s else 'core'
-
-
-def process_xlsx_file(filepath, users_map):
-    """Process the availability XLSX file - March 2026 data. Reads type name from column TYPE_NAME_COLUMN_INDEX."""
-    logger.info(f"\nProcessing: {filepath}")
+    if not filepath.exists():
+        raise MigrationError(f"Excel file not found: {filepath}")
     
     try:
         wb = openpyxl.load_workbook(filepath, data_only=True)
     except Exception as e:
-        logger.error(f"Failed to load workbook: {e}")
-        return {}, []
+        raise MigrationError(f"Failed to load Excel file: {e}")
     
-    if 'Care Assistant Availability' not in wb.sheetnames:
-        logger.error("'Care Assistant Availability' sheet not found")
-        return {}, []
+    # Check for expected sheet
+    sheet_name = 'Care Assistant Availability'
+    if sheet_name not in wb.sheetnames:
+        available_sheets = wb.sheetnames
+        logger.warning(f"Sheet '{sheet_name}' not found. Available sheets: {available_sheets}")
+        # Try first sheet as fallback
+        sheet_name = wb.sheetnames[0]
+        logger.info(f"Using sheet: {sheet_name}")
     
-    ws = wb['Care Assistant Availability']
+    ws = wb[sheet_name]
     
-    # Group records by user
-    user_records = defaultdict(list)
+    # Log header row for debugging
+    header_row = list(ws.iter_rows(min_row=1, max_row=1, values_only=True))[0]
+    logger.info(f"Header row: {header_row}")
+    
+    valid_records = []
     unmatched_users = set()
+    skipped_non_core = 0
+    skipped_missing_data = 0
+    total_rows = 0
     
-    # Parse rows (skip header)
-    for row_num, row in enumerate(ws.iter_rows(min_row=2, values_only=True), 2):
-        care_assistant_name = row[CARE_ASSISTANT_NAME_COLUMN]
-        start_date_val = row[START_DATE_COLUMN]
-        start_time_val = row[START_TIME_COLUMN]
-        end_date_val = row[END_DATE_COLUMN]
-        end_time_val = row[END_TIME_COLUMN]
-        type_name_raw = row[TYPE_NAME_COLUMN_INDEX] if len(row) > TYPE_NAME_COLUMN_INDEX else None
+    # Process data rows (skip header)
+    for row_num, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+        total_rows += 1
         
+        # Extract values from row
+        care_assistant_name = row[COLUMN_CARE_ASSISTANT_NAME] if len(row) > COLUMN_CARE_ASSISTANT_NAME else None
+        start_date_val = row[COLUMN_START_DATE] if len(row) > COLUMN_START_DATE else None
+        start_time_val = row[COLUMN_START_TIME] if len(row) > COLUMN_START_TIME else None
+        end_time_val = row[COLUMN_END_TIME] if len(row) > COLUMN_END_TIME else None
+        type_val = row[COLUMN_TYPE] if len(row) > COLUMN_TYPE else None
+        
+        # Skip empty rows
         if not care_assistant_name:
             continue
         
+        # Normalize type value
+        type_str = str(type_val).strip() if type_val else ''
+        
+        # ONLY process "Core" records
+        if type_str.lower() != 'core':
+            skipped_non_core += 1
+            logger.debug(f"Row {row_num}: Skipping non-Core record (Type='{type_str}')")
+            continue
+        
         # Strip title and match user
-        name_without_title = strip_title(care_assistant_name)
+        name_without_title = strip_title(str(care_assistant_name))
         user_key = name_without_title.strip().lower()
         
         user_id = users_map.get(user_key)
         if not user_id:
-            unmatched_users.add(care_assistant_name)
+            unmatched_users.add(str(care_assistant_name))
+            logger.warning(f"Row {row_num}: User not found - '{care_assistant_name}' (key: '{user_key}')")
             continue
         
         # Parse dates and times
         start_date = parse_date_value(start_date_val)
-        end_date = parse_date_value(end_date_val)
         start_time = parse_time_value(start_time_val)
         end_time = parse_time_value(end_time_val)
         
+        # Validate required fields
         if not all([start_date, start_time, end_time]):
-            logger.warning(f"Row {row_num}: Missing date/time data")
+            skipped_missing_data += 1
+            logger.warning(
+                f"Row {row_num}: Missing required data for user '{care_assistant_name}' - "
+                f"start_date={start_date}, start_time={start_time}, end_time={end_time}"
+            )
             continue
         
-        # Only process March 2026 data
-        if start_date.year != 2026 or start_date.month != 3:
-            continue
+        # Calculate target start_date (Start Date - 28 days)
+        target_start_date = start_date - timedelta(days=28)
         
-        user_records[user_id].append({
-            'march_date': start_date,
+        valid_records.append({
+            'user_id': user_id,
+            'user_name': care_assistant_name,
+            'original_start_date': start_date,
+            'target_start_date': target_start_date,
             'start_time': start_time,
             'end_time': end_time,
-            'end_date': end_date,
-            'type_name': _normalize_type_name(type_name_raw),
-            'source_file': str(filepath),
+            'day_of_week': get_day_of_week(target_start_date),
             'source_row': row_num,
-            'source_sheet': 'Care Assistant Availability',
-            'type_name_raw': type_name_raw,
-        })
-    
-    logger.info(f"Extracted records for {len(user_records)} users from March 2026")
-    
-    return user_records, list(unmatched_users)
-
-
-def handle_overnight_shift(pattern):
-    """Split overnight shifts into two separate availability records"""
-    start_time = pattern['start_time']
-    end_time = pattern['end_time']
-    start_date = pattern['start_date']
-    
-    if end_time < start_time:
-        # Overnight shift - split into two
-        patterns = []
-        
-        # First part: start_time to 23:59:59
-        patterns.append({
-            'day_of_week': get_day_of_week(start_date),
-            'start_time': start_time,
-            'end_time': time(23, 59, 59),
-            'start_date': start_date,
-            'occurs_every': pattern['occurs_every']
         })
         
-        # Second part: 00:00:00 to end_time next day
-        next_day = start_date + timedelta(days=1)
-        patterns.append({
-            'day_of_week': get_day_of_week(next_day),
-            'start_time': time(0, 0, 0),
-            'end_time': end_time,
-            'start_date': next_day,
-            'occurs_every': pattern['occurs_every']
-        })
-        
-        return patterns
-    else:
-        # Normal shift - return as is with day_of_week
-        return [{
-            'day_of_week': get_day_of_week(start_date),
-            'start_time': start_time,
-            'end_time': end_time,
-            'start_date': start_date,
-            'occurs_every': pattern['occurs_every']
-        }]
-
-
-def check_if_weekly_pattern(all_records, jan_date, start_time, end_time):
-    """
-    Check if a day+time combination appears weekly (occurs_every=1) or monthly (occurs_every=4)
-    By checking how many times this day-of-week + time appears in February
-    """
-    if not jan_date:
-        return False
-    
-    day_of_week = jan_date.weekday()
-    
-    # Count occurrences of this day+time in February
-    count = 0
-    for record in all_records:
-        if (record['feb_date'].weekday() == day_of_week and
-            record['start_time'] == start_time and
-            record['end_time'] == end_time):
-            count += 1
-    
-    # If appears 4 times (once per week in Feb), it's weekly
-    # Otherwise it's monthly
-    return count >= 4
-
-
-def calculate_correct_start_date(jan_date, all_records, start_time, end_time):
-    """
-    For monthly patterns (occurs_every=4), we need to ensure that all February dates
-    for this day+time are exactly 0, 4, 8... weeks from the startDate.
-    
-    This function finds the correct startDate in January that makes the recurrence work.
-    """
-    if not jan_date:
-        return None
-    
-    day_of_week = jan_date.weekday()
-    
-    # Get all February dates for this day+time
-    feb_dates = []
-    for record in all_records:
-        if (record['feb_date'].weekday() == day_of_week and
-            record['start_time'] == start_time and
-            record['end_time'] == end_time):
-            feb_dates.append(record['feb_date'])
-    
-    if not feb_dates:
-        return jan_date
-    
-    # For each February date, calculate how many weeks it is from jan_date
-    weeks_from_jan = []
-    for feb_date in feb_dates:
-        days_diff = (feb_date - jan_date).days
-        weeks = days_diff // 7
-        weeks_from_jan.append(weeks)
-    
-    # Check if all weeks are divisible by 4 (occurs_every=4)
-    # If not, we need to adjust the start date
-    all_divisible_by_4 = all(w % 4 == 0 for w in weeks_from_jan)
-    
-    if all_divisible_by_4:
-        return jan_date
-    
-    # If not all divisible, we need to find an earlier date that works
-    # Try backing up by 1, 2, or 3 weeks to find a date where all Feb dates are 4-week multiples
-    for backup_weeks in range(1, 4):
-        test_date = jan_date - timedelta(weeks=backup_weeks)
-        
-        # Make sure it's still in January
-        if test_date.month != 1:
-            continue
-        
-        # Check if all Feb dates are now divisible by 4 from this date
-        all_work = True
-        for feb_date in feb_dates:
-            days_diff = (feb_date - test_date).days
-            weeks = days_diff // 7
-            if weeks % 4 != 0:
-                all_work = False
-                break
-        
-        if all_work:
-            return test_date
-    
-    # If we can't find a better date, return the original
-    return jan_date
-
-
-def _resolve_type(type_name, availability_types_map, source_context=None):
-    """Resolve type_id and is_unavailability from type name. Returns (type_id, is_unavailability)."""
-    info = availability_types_map.get(type_name)
-    if info:
-        return info['id'], info['is_unavailability']
-    # Log with source location so user can fix column mapping or data (e.g. wrong column = client/area name)
-    if source_context:
-        logger.warning(
-            "Availability type not found in DB (will insert with type_id=NULL): type_name=%r | "
-            "source: file=%s, sheet=%s, row=%s, column_index=%s (TYPE_NAME_COLUMN_INDEX), raw_value=%r",
-            type_name,
-            source_context.get('source_file', '?'),
-            source_context.get('source_sheet', '?'),
-            source_context.get('source_row', '?'),
-            TYPE_NAME_COLUMN_INDEX,
-            source_context.get('type_name_raw'),
+        logger.debug(
+            f"Row {row_num}: Valid record - User ID={user_id}, "
+            f"Original Date={format_date_str(start_date)}, "
+            f"Target Date={format_date_str(target_start_date)}, "
+            f"Time={format_time_str(start_time)}-{format_time_str(end_time)}"
         )
-    else:
-        logger.warning("Availability type not found in DB (will insert with type_id=NULL): %r", type_name)
-    return None, False
+    
+    logger.info(f"\n{'='*60}")
+    logger.info("EXCEL PROCESSING SUMMARY")
+    logger.info(f"{'='*60}")
+    logger.info(f"Total rows processed: {total_rows}")
+    logger.info(f"Valid Core records extracted: {len(valid_records)}")
+    logger.info(f"Skipped (non-Core type): {skipped_non_core}")
+    logger.info(f"Skipped (missing data): {skipped_missing_data}")
+    logger.info(f"Unmatched users: {len(unmatched_users)}")
+    
+    return valid_records, list(unmatched_users)
 
 
-def generate_january_availabilities(user_records_map, availability_types_map):
+def generate_availability_records(
+    records: List[Dict], 
+    core_type_id: int,
+    is_unavailability: bool
+) -> List[Dict]:
     """
-    Generate January & February 2026 availability records from March 2026 data (4 weeks backward).
-    - Core → recurring: is_temp=False, start_date, end_date, occurs_every=4.
-    - Other types → temporary: is_temp=True, effective_date_from, effective_date_to.
-    - type_id and is_unavailability come from availability_types (by type name).
+    Generate availability records for database insertion.
+    
+    Rules:
+    - is_temp = False (recurring availability)
+    - start_date = target_start_date (original date - 28 days)
+    - end_date = None (no end date)
+    - occurs_every = 4 (monthly recurrence)
+    - days = [day_of_week of target_start_date]
     """
+    logger.info(f"\n{'='*60}")
+    logger.info("GENERATING AVAILABILITY RECORDS")
+    logger.info(f"{'='*60}")
+    
     availabilities = []
     
-    for user_id, records in user_records_map.items():
-        logger.info(f"  Processing user_id={user_id} ({len(records)} March records)")
+    for record in records:
+        user_id = record['user_id']
+        target_start_date = record['target_start_date']
+        start_time = record['start_time']
+        end_time = record['end_time']
+        day_of_week = record['day_of_week']
         
-        for record in records:
-            march_date = record['march_date']
-            target_date = map_source_date_backward_4_weeks(march_date)
-            if not target_date:
-                logger.debug(f"    Skipping {march_date} - mapped date not in Jan/Feb 2026")
-                continue
+        # Handle overnight shifts (end_time < start_time)
+        if end_time < start_time:
+            logger.warning(
+                f"Overnight shift detected for user {user_id}: "
+                f"{format_time_str(start_time)}-{format_time_str(end_time)}. "
+                f"Splitting into two records."
+            )
             
-            type_name = record.get('type_name') or 'core'
-            source_context = {
-                'source_file': record.get('source_file'),
-                'source_row': record.get('source_row'),
-                'source_sheet': record.get('source_sheet'),
-                'type_name_raw': record.get('type_name_raw'),
-            } if record.get('source_file') is not None else None
-            type_id, is_unavailability = _resolve_type(type_name, availability_types_map, source_context)
-            is_core = type_name == 'core'
+            # First part: start_time to 23:59:59
+            availabilities.append({
+                'user_id': user_id,
+                'days': [day_of_week],
+                'start_time': format_time_str(start_time),
+                'end_time': '23:59:59',
+                'is_temp': False,
+                'is_unavailability': is_unavailability,
+                'type_id': core_type_id,
+                'start_date': format_date_str(target_start_date),
+                'end_date': None,
+                'occurs_every': 4,
+                'effective_date_from': None,
+                'effective_date_to': None,
+            })
             
-            # For temp records: effective dates = Excel dates as-is (no backward mapping)
-            excel_end_date = record.get('end_date') or march_date
+            # Second part: 00:00:00 to end_time (next day)
+            next_day = target_start_date + timedelta(days=1)
+            next_day_of_week = get_day_of_week(next_day)
             
-            if is_core:
-                # Recurring: is_temp=False, start_date, end_date, occurs_every=4
-                shift_patterns = handle_overnight_shift({
-                    'start_time': record['start_time'],
-                    'end_time': record['end_time'],
-                    'start_date': target_date,
-                    'occurs_every': 4
-                })
-                for shift in shift_patterns:
-                    if shift['start_date'].year == 2026 and shift['start_date'].month in [1, 2]:
-                        availabilities.append({
-                            'user_id': user_id,
-                            'days': [shift['day_of_week']],
-                            'start_time': shift['start_time'],
-                            'end_time': shift['end_time'],
-                            'is_temp': False,
-                            'is_unavailability': is_unavailability,
-                            'type_id': type_id,
-                            'start_date': shift['start_date'],
-                            'end_date': None,
-                            'occurs_every': 4,
-                            'effective_date_from': None,
-                            'effective_date_to': None,
-                        })
-            else:
-                # Temporary: is_temp=True; effective_date_from/to = Excel dates (no 4-week backward mapping)
-                shift_patterns = handle_overnight_shift({
-                    'start_time': record['start_time'],
-                    'end_time': record['end_time'],
-                    'start_date': target_date,
-                    'occurs_every': 1
-                })
-                for shift in shift_patterns:
-                    if shift['start_date'].year == 2026 and shift['start_date'].month in [1, 2]:
-                        availabilities.append({
-                            'user_id': user_id,
-                            'days': [shift['day_of_week']],
-                            'start_time': shift['start_time'],
-                            'end_time': shift['end_time'],
-                            'is_temp': True,
-                            'is_unavailability': is_unavailability,
-                            'type_id': type_id,
-                            'start_date': None,
-                            'end_date': None,
-                            'occurs_every': None,
-                            'effective_date_from': march_date,
-                            'effective_date_to': excel_end_date,
-                        })
-        
-        logger.info(f"    → Generated {len([a for a in availabilities if a['user_id'] == user_id])} records")
+            availabilities.append({
+                'user_id': user_id,
+                'days': [next_day_of_week],
+                'start_time': '00:00:00',
+                'end_time': format_time_str(end_time),
+                'is_temp': False,
+                'is_unavailability': is_unavailability,
+                'type_id': core_type_id,
+                'start_date': format_date_str(next_day),
+                'end_date': None,
+                'occurs_every': 4,
+                'effective_date_from': None,
+                'effective_date_to': None,
+            })
+        else:
+            # Normal shift
+            availabilities.append({
+                'user_id': user_id,
+                'days': [day_of_week],
+                'start_time': format_time_str(start_time),
+                'end_time': format_time_str(end_time),
+                'is_temp': False,
+                'is_unavailability': is_unavailability,
+                'type_id': core_type_id,
+                'start_date': format_date_str(target_start_date),
+                'end_date': None,
+                'occurs_every': 4,
+                'effective_date_from': None,
+                'effective_date_to': None,
+            })
     
+    logger.info(f"Generated {len(availabilities)} availability records")
     return availabilities
 
 
-def deduplicate_availabilities(availabilities):
-    """Remove duplicate availabilities; keep separate records per user/day/time/date/type."""
+def deduplicate_availabilities(availabilities: List[Dict]) -> List[Dict]:
+    """Remove duplicate availabilities based on user_id, days, start_time, end_time, start_date"""
     unique_map = {}
+    duplicates = 0
+    
     for avail in availabilities:
-        date_part = avail.get('start_date') or avail.get('effective_date_from')
         key = (
             avail['user_id'],
             tuple(avail['days']),
             avail['start_time'],
             avail['end_time'],
-            date_part,
-            avail.get('type_id'),
-            avail.get('is_temp'),
+            avail['start_date'],
         )
-        unique_map[key] = avail
+        
+        if key in unique_map:
+            duplicates += 1
+            logger.debug(f"Duplicate found: {key}")
+        else:
+            unique_map[key] = avail
+    
+    logger.info(f"Deduplication: {len(availabilities)} -> {len(unique_map)} records ({duplicates} duplicates removed)")
     return list(unique_map.values())
 
 
-def seed_availabilities(connection, availabilities):
-    """Insert user availabilities into database (with type_id)."""
+def seed_availabilities(connection, availabilities: List[Dict]) -> int:
+    """Insert user availabilities into database"""
     if not availabilities:
         logger.warning("No availabilities to insert")
-        return False
+        return 0
     
-    unique_availabilities = deduplicate_availabilities(availabilities)
-    logger.info(f"After deduplication: {len(unique_availabilities)} unique records")
-    
-    logger.info(f"Inserting {len(unique_availabilities)} availability records...")
+    logger.info(f"\n{'='*60}")
+    logger.info("SEEDING DATABASE")
+    logger.info(f"{'='*60}")
     
     cursor = connection.cursor()
     try:
-        insert_query = """
+        # First, verify the enum type exists
+        cursor.execute(
+            "SELECT typname FROM pg_type WHERE typname = 'user_availabilities_days_enum'"
+        )
+        enum_exists = cursor.fetchone()
+        
+        if not enum_exists:
+            logger.warning("Enum type 'user_availabilities_days_enum' not found. Using text array cast.")
+            array_cast = '::text[]'
+        else:
+            array_cast = '::text[]::user_availabilities_days_enum[]'
+        
+        insert_query = f"""
             INSERT INTO user_availabilities (
-                user_id, days, start_time, end_time, is_temp, is_unavailability, type_id,
-                start_date, end_date, occurs_every, effective_date_from, effective_date_to,
+                user_id, days, start_time, end_time, 
+                is_temp, is_unavailability, type_id,
+                start_date, end_date, occurs_every, 
+                effective_date_from, effective_date_to,
                 created_date, last_modified_date
             ) VALUES %s
             RETURNING id
@@ -571,114 +535,176 @@ def seed_availabilities(connection, availabilities):
                 avail['end_time'],
                 avail['is_temp'],
                 avail['is_unavailability'],
-                avail.get('type_id'),
-                avail.get('start_date'),
-                avail.get('end_date'),
-                avail.get('occurs_every'),
-                avail.get('effective_date_from'),
-                avail.get('effective_date_to'),
+                avail['type_id'],
+                avail['start_date'],
+                avail['end_date'],
+                avail['occurs_every'],
+                avail['effective_date_from'],
+                avail['effective_date_to'],
             )
-            for avail in unique_availabilities
+            for avail in availabilities
         ]
+        
+        logger.info(f"Inserting {len(availability_tuples)} records...")
         
         execute_values(
             cursor,
             insert_query,
             availability_tuples,
-            template="(%s, %s::text[]::user_availabilities_days_enum[], %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())"
+            template=f"(%s, %s{array_cast}, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())"
         )
         
         inserted = cursor.fetchall()
         connection.commit()
         
         logger.info(f"✓ Successfully inserted {len(inserted)} availability records")
-        return True
+        return len(inserted)
         
     except Exception as e:
         connection.rollback()
         logger.error(f"✗ Failed to insert availabilities: {e}")
-        raise
+        raise MigrationError(f"Database insertion failed: {e}")
     finally:
         cursor.close()
 
 
-def run():
+def generate_summary_report(
+    records: List[Dict],
+    availabilities: List[Dict],
+    unmatched_users: List[str],
+    inserted_count: int
+) -> str:
+    """Generate a summary report of the migration"""
+    report = []
+    report.append("\n" + "="*70)
+    report.append("MIGRATION SUMMARY REPORT")
+    report.append("="*70)
+    
+    report.append(f"\n📊 INPUT DATA:")
+    report.append(f"   - Valid Core records extracted: {len(records)}")
+    report.append(f"   - Unmatched users: {len(unmatched_users)}")
+    
+    if unmatched_users:
+        report.append(f"\n⚠️  UNMATCHED USERS ({len(unmatched_users)}):")
+        for user in sorted(unmatched_users):
+            report.append(f"   - {user}")
+    
+    report.append(f"\n📋 GENERATED RECORDS:")
+    report.append(f"   - Total availability records: {len(availabilities)}")
+    
+    # Group by user
+    by_user = defaultdict(int)
+    for a in availabilities:
+        by_user[a['user_id']] += 1
+    
+    report.append(f"   - Unique users: {len(by_user)}")
+    report.append(f"   - Records per user (avg): {len(availabilities)/len(by_user):.1f}" if by_user else "   - Records per user: N/A")
+    
+    report.append(f"\n✅ DATABASE:")
+    report.append(f"   - Records inserted: {inserted_count}")
+    
+    # Sample records
+    report.append(f"\n📝 SAMPLE RECORDS (first 5):")
+    for i, a in enumerate(availabilities[:5]):
+        report.append(f"   {i+1}. User ID: {a['user_id']}, Day: {a['days']}, "
+                     f"Time: {a['start_time']}-{a['end_time']}, "
+                     f"Start Date: {a['start_date']}, Occurs Every: {a['occurs_every']} weeks")
+    
+    report.append("\n" + "="*70)
+    
+    return "\n".join(report)
+
+
+def run(xlsx_path: Optional[str] = None) -> bool:
     """Main execution function"""
     print("""
-    ╔══════════════════════════════════════════════════════════╗
-    ║   User Availability Migration - January & February 2026   ║
-    ║   From March 2026 data (4 weeks backward); Core=recurring, others=temp ║
-    ╚══════════════════════════════════════════════════════════╝
+    ╔══════════════════════════════════════════════════════════════╗
+    ║   USER AVAILABILITY MIGRATION - CORE RECORDS ONLY            ║
+    ║   Rules:                                                     ║
+    ║   - Only "Core" type records are processed                   ║
+    ║   - Start Date - 28 days = recurring start_date              ║
+    ║   - occurs_every = 4 (monthly - first week of each month)    ║
+    ║   - is_temp = False (recurring availability)                 ║
+    ╚══════════════════════════════════════════════════════════════╝
     """)
     
-    config = get_db_config()
+    # Determine Excel file path
+    if xlsx_path:
+        filepath = Path(xlsx_path)
+    else:
+        # Default path
+        filepath = Path(__file__).parent.parent / 'assets' / 'userAvailabilities' / 'userAvailabilities.xlsx'
     
-    if not all([config['database'], config['user'], config['password']]):
-        logger.error("Missing database configuration in .env file")
-        return False
-    
-    xlsx_path = Path(__file__).parent.parent / 'assets' / 'userAvailabilities' / 'userAvailabilities.xlsx'
-    
-    if not xlsx_path.exists():
-        logger.error(f"File not found: {xlsx_path}")
-        return False
+    logger.info(f"Excel file path: {filepath}")
     
     connection = None
+    
     try:
-        logger.info("\n" + "="*60)
+        # Step 1: Database connection
+        logger.info(f"\n{'='*60}")
         logger.info("STEP 1: DATABASE CONNECTION")
-        logger.info("="*60)
+        logger.info(f"{'='*60}")
+        
+        config = get_db_config()
         connection = connect_to_database(config)
         
-        logger.info("\n" + "="*60)
-        logger.info("STEP 2: LOAD USERS & AVAILABILITY TYPES")
-        logger.info("="*60)
+        # Step 2: Load reference data
+        logger.info(f"\n{'='*60}")
+        logger.info("STEP 2: LOAD REFERENCE DATA")
+        logger.info(f"{'='*60}")
+        
         users_map = get_all_users(connection)
-        availability_types_map = get_availability_types(connection)
+        core_type_id, is_unavailability = get_core_availability_type(connection)
         
-        logger.info("\n" + "="*60)
-        logger.info("STEP 3: EXTRACT MARCH 2026 DATA")
-        logger.info("="*60)
-        user_records_map, unmatched_users = process_xlsx_file(xlsx_path, users_map)
+        # Step 3: Process Excel file
+        logger.info(f"\n{'='*60}")
+        logger.info("STEP 3: PROCESS EXCEL FILE")
+        logger.info(f"{'='*60}")
         
-        logger.info("\n" + "="*60)
-        logger.info("STEP 4: GENERATE JANUARY & FEBRUARY 2026 AVAILABILITIES")
-        logger.info("="*60)
-        availabilities = generate_january_availabilities(user_records_map, availability_types_map)
-        logger.info(f"Generated {len(availabilities)} January & February 2026 availability records")
+        records, unmatched_users = process_xlsx_file(filepath, users_map)
         
-        logger.info("\n" + "="*60)
-        logger.info("STEP 5: SEED DATABASE")
-        logger.info("="*60)
-        
-        if availabilities:
-            success = seed_availabilities(connection, availabilities)
-        else:
-            logger.warning("No availabilities generated")
-            success = False
-        
-        if unmatched_users:
-            logger.warning("\n" + "="*60)
-            logger.warning("UNMATCHED USERS")
-            logger.warning("="*60)
-            logger.warning(f"The following {len(unmatched_users)} users were not found in database:")
-            for user_name in sorted(unmatched_users):
-                logger.warning(f"  - {user_name}")
-        
-        if success:
-            print("\n" + "="*60)
-            print("✓ JANUARY & FEBRUARY 2026 AVAILABILITY MIGRATION COMPLETED")
-            print("="*60)
-            return True
-        else:
-            print("\n" + "="*60)
-            print("✗ JANUARY & FEBRUARY 2026 AVAILABILITY MIGRATION FAILED")
-            print("="*60)
+        if not records:
+            logger.error("No valid Core records found in Excel file")
             return False
-            
-    except Exception as e:
-        logger.error(f"Migration error: {e}", exc_info=True)
+        
+        # Step 4: Generate availability records
+        logger.info(f"\n{'='*60}")
+        logger.info("STEP 4: GENERATE AVAILABILITY RECORDS")
+        logger.info(f"{'='*60}")
+        
+        availabilities = generate_availability_records(records, core_type_id, is_unavailability)
+        availabilities = deduplicate_availabilities(availabilities)
+        
+        # Step 5: Seed database
+        logger.info(f"\n{'='*60}")
+        logger.info("STEP 5: SEED DATABASE")
+        logger.info(f"{'='*60}")
+        
+        inserted_count = seed_availabilities(connection, availabilities)
+        
+        # Generate summary report
+        report = generate_summary_report(records, availabilities, unmatched_users, inserted_count)
+        print(report)
+        
+        # Log to file
+        logger.info(report)
+        
+        print("\n" + "="*60)
+        print("✓ MIGRATION COMPLETED SUCCESSFULLY")
+        print("="*60)
+        
+        return True
+        
+    except MigrationError as e:
+        logger.error(f"Migration error: {e}")
+        print(f"\n✗ MIGRATION FAILED: {e}")
         return False
+        
+    except Exception as e:
+        logger.exception(f"Unexpected error: {e}")
+        print(f"\n✗ MIGRATION FAILED: {e}")
+        return False
+        
     finally:
         if connection:
             connection.close()
@@ -686,6 +712,8 @@ def run():
 
 
 if __name__ == "__main__":
-    import sys
-    success = run()
+    # Allow passing Excel file path as argument
+    xlsx_arg = sys.argv[1] if len(sys.argv) > 1 else None
+    
+    success = run(xlsx_arg)
     sys.exit(0 if success else 1)

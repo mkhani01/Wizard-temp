@@ -99,7 +99,7 @@ OPT_ASSET_PATH = {
     OPT_AVAILABILITY_TYPES: "availabilitytypes/availabilityTypes.csv",
     OPT_CAREGIVERS_AVAILABILITY: "userAvailabilities/userAvailabilities.xlsx",
     OPT_CLIENTS: "CustomerExport.csv",
-    OPT_CLIENTS_AVAILABILITY: "ClientHoursWithServiceType.xlsx",
+    OPT_CLIENTS_AVAILABILITY: "clientAvailability/ClientHoursWithServiceType.xlsx",
     OPT_GEOCODE_CLIENT_FILE: "clientbackup.json",
     OPT_GEOCODE_CAREGIVER_FILE: "usersBackup.json",
     OPT_FVISIT_HISTORY: "visit_data.csv",
@@ -389,9 +389,9 @@ class MigrationWizard:
             (OPT_CAREGIVERS_AVAILABILITY, "Caregivers Availability", "Import each caregiver’s availability from an Excel workbook. Hint: Requires Availability types. File is usually userAvailabilities.xlsx. You will select it in the next step."),
             (OPT_CLIENTS, "Clients", "Import clients from a CSV export. Hint: Use a file like CustomerExport.csv. You will choose the file in the next step."),
             (OPT_CLIENTS_AVAILABILITY, "Clients Availability", "Import client availability from Excel. Hint: Requires Availability types. You can select one file or a folder of workbooks (e.g. Client Hours with Service Type)."),
-            (OPT_GEOCODE_API, "Calculated Geocode (Google API)", "Use Google Maps API to fill in latitude/longitude from postcodes for clients and caregivers. Hint: You need a Google Maps API key and the Irish cities file (IE.txt). Only one geocode method can be used (API or file-based)."),
-            (OPT_GEOCODE_CLIENT_FILE, "Get clients location from file", "Update client latitude/longitude from a JSON backup file (e.g. clientbackup.json). File must contain “latitude”, “longitude”, “name”, “lastname” for each record. Only available when “Calculated Geocode” is not selected."),
-            (OPT_GEOCODE_CAREGIVER_FILE, "Get users location from file", "Update user (caregiver) latitude/longitude from a JSON backup file (e.g. usersBackup.json). File must contain “latitude”, “longitude”, “name”, “lastname” for each record. Only available when “Calculated Geocode” is not selected."),
+            (OPT_GEOCODE_CLIENT_FILE, "Get clients location from file", "Update client latitude/longitude from a JSON backup file (e.g. clientbackup.json). File must contain \"latitude\", \"longitude\", \"name\", \"lastname\" for each record. This is useful for manually seeding known coordinates before using the Google API."),
+            (OPT_GEOCODE_CAREGIVER_FILE, "Get users location from file", "Update user (caregiver) latitude/longitude from a JSON backup file (e.g. usersBackup.json). File must contain \"latitude\", \"longitude\", \"name\", \"lastname\" for each record. This is useful for manually seeding known coordinates before using the Google API."),
+            (OPT_GEOCODE_API, "Calculated Geocode (Google API)", "Use Google Maps API to fill in latitude/longitude from postcodes for users and clients that have NULL coordinates. This runs AFTER file-based location imports (if selected), only geocoding records with postcodes but missing lat/long. You need a Google Maps API key and the Irish cities file (IE.txt). Can be combined with file-based options."),
             (OPT_CALCULATE_DISTANCES, "Calculate distances", "Compute travel distances between caregivers and clients using OSRM. Reads user and client lat/long from the database, calls OSRM for each pair and travel method (driving, cycling, walking), then inserts or updates the travel_distances table. Runs a verification step when done. Requires network access to OSRM."),
             (OPT_FVISIT_HISTORY, "Feasible pairs (visit history)", "Seed feasible_pairs from visit data CSV (Assignee = caregiver, Customer = client). Pick a CSV with columns Assignee and Customer in the next step."),
         ]
@@ -426,15 +426,7 @@ class MigrationWizard:
         )
 
     def _sync_checkbox_dependencies(self):
-        """Apply dependencies: Geocode file options disabled when API selected; Caregivers/Clients availability only when Availability types selected."""
-        # Geocode: disable file-based options when API is selected
-        use_api = self.check_vars[OPT_GEOCODE_API].get()
-        for opt in (OPT_GEOCODE_CLIENT_FILE, OPT_GEOCODE_CAREGIVER_FILE):
-            cb = getattr(self, "_cb_%s" % opt, None)
-            if cb is not None:
-                cb.config(state="disabled" if use_api else "normal")
-                if use_api:
-                    self.check_vars[opt].set(False)
+        """Apply dependencies: Caregivers/Clients availability only when Availability types selected."""
         # Availability: enable Caregivers/Clients availability only when Availability types is selected
         has_availability_types = self.check_vars[OPT_AVAILABILITY_TYPES].get()
         for opt in (OPT_CAREGIVERS_AVAILABILITY, OPT_CLIENTS_AVAILABILITY):
@@ -486,10 +478,6 @@ class MigrationWizard:
             row += 1
         for key in FILE_OPTIONS:
             if key not in selected:
-                continue
-            if key == OPT_GEOCODE_CLIENT_FILE and self.check_vars[OPT_GEOCODE_API].get():
-                continue
-            if key == OPT_GEOCODE_CAREGIVER_FILE and self.check_vars[OPT_GEOCODE_API].get():
                 continue
             label = {
                 OPT_CAREGIVERS: "Caregivers CSV:",
@@ -695,10 +683,6 @@ class MigrationWizard:
         for key in FILE_OPTIONS:
             if key not in selected:
                 continue
-            if key == OPT_GEOCODE_CLIENT_FILE and self.check_vars[OPT_GEOCODE_API].get():
-                continue
-            if key == OPT_GEOCODE_CAREGIVER_FILE and self.check_vars[OPT_GEOCODE_API].get():
-                continue
             path = self.file_paths.get(key)
             if path is None:
                 continue
@@ -848,10 +832,6 @@ class MigrationWizard:
         for key in FILE_OPTIONS:
             if not self.check_vars[key].get():
                 continue
-            if key == OPT_GEOCODE_CLIENT_FILE and self.check_vars[OPT_GEOCODE_API].get():
-                continue
-            if key == OPT_GEOCODE_CAREGIVER_FILE and self.check_vars[OPT_GEOCODE_API].get():
-                continue
             path_var = self.file_paths.get(key)
             if not path_var or not hasattr(path_var, "get"):
                 continue
@@ -882,13 +862,14 @@ class MigrationWizard:
             order.append(("Clients", self._run_clients))
         if self.check_vars[OPT_CLIENTS_AVAILABILITY].get():
             order.append(("Clients Availability", self._run_client_availability))
+        # File-based geocoding runs first (manual seeding)
+        if self.check_vars[OPT_GEOCODE_CLIENT_FILE].get():
+            order.append(("Client Geocode (file)", self._run_client_locations))
+        if self.check_vars[OPT_GEOCODE_CAREGIVER_FILE].get():
+            order.append(("Caregiver Geocode (file)", self._run_user_locations))
+        # Google API geocoding runs after file-based (fills in remaining nulls)
         if self.check_vars[OPT_GEOCODE_API].get():
             order.append(("Calculated Geocode (API)", self._run_geocode_api))
-        else:
-            if self.check_vars[OPT_GEOCODE_CLIENT_FILE].get():
-                order.append(("Client Geocode (file)", self._run_client_locations))
-            if self.check_vars[OPT_GEOCODE_CAREGIVER_FILE].get():
-                order.append(("Caregiver Geocode (file)", self._run_user_locations))
         if self.check_vars[OPT_CALCULATE_DISTANCES].get():
             order.append(("Calculate distances", self._run_travel_distances))
         if self.check_vars[OPT_FVISIT_HISTORY].get():

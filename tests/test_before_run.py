@@ -2,17 +2,24 @@
 """
 Pre-run sanity checks: run before starting the migration wizard or CLI.
 Verifies environment, dependencies, and that migration modules are importable.
+When run as a frozen exe (PyInstaller), skips dev-only checks (Python version, pip deps)
+and uses the executable's directory as project root so no Python install is required.
 """
 
 import sys
 import os
 from pathlib import Path
 
-# Project root (parent of tests/)
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-os.chdir(PROJECT_ROOT)
+# When frozen (PyInstaller exe), project root = directory containing the exe (no Python needed).
+# Otherwise, project root = parent of tests/.
+if getattr(sys, "frozen", False):
+    PROJECT_ROOT = Path(sys.executable).resolve().parent
+    os.chdir(PROJECT_ROOT)
+else:
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent
+    if str(PROJECT_ROOT) not in sys.path:
+        sys.path.insert(0, str(PROJECT_ROOT))
+    os.chdir(PROJECT_ROOT)
 
 
 def check_python_version():
@@ -88,12 +95,23 @@ def check_project_layout():
     return True
 
 
+def _is_frozen():
+    """True when running as a PyInstaller one-file or one-dir exe (no Python install required)."""
+    return getattr(sys, "frozen", False)
+
+
 def run_all():
-    """Run all pre-run checks. Returns True if all passed."""
+    """Run all pre-run checks. Returns True if all passed.
+    When frozen (standalone exe), skips Python/pip checks so the exe is self-contained.
+    """
     print("Pre-run checks (run before migration):\n")
     ok = True
-    ok &= check_python_version()
-    ok &= check_dependencies()
+    if not _is_frozen():
+        ok &= check_python_version()
+        ok &= check_dependencies()
+    else:
+        # Bundled exe: runtime and deps are already inside the exe
+        print("  ✓ Standalone executable (checks simplified)")
     ok &= check_migration_imports()
     ok &= check_project_layout()
     print("")

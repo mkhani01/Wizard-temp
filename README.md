@@ -226,7 +226,45 @@ create-dmg --volname "AOS Migration Wizard" --window-size 500 300 dist/AOS-Migra
 pkgbuild --identifier com.aos.migration-wizard --root dist/AOS-Migration-Wizard.app --install-location /Applications/AOS-Migration-Wizard.app AOS-Migration-Wizard.pkg
 ```
 
-### 5. Linux: binary and (optional) AppImage
+### 5. Trusting the app on Windows (Defender / SmartScreen / other AV)
+
+Windows Defender and other security software often block or quarantine PyInstaller-built executables (false positives). To run the migration wizard without it being stopped:
+
+**Option A – Add a folder exclusion in Windows Defender**
+
+1. Open **Windows Security** (search “Windows Security” in Start).
+2. Go to **Virus & threat protection** → **Manage settings** (under “Virus & threat protection settings”).
+3. Scroll to **Exclusions** → **Add or remove exclusions** → **Add an exclusion** → **Folder**.
+4. Add one or both of:
+   - The **project folder** (e.g. `C:\Users\YourName\...\Migration`), so scripts and venv are not scanned.
+   - The **output folder** where the exe lives (e.g. `C:\...\Migration\dist` or the folder where you copied `AOS-Migration-Wizard.exe`).
+
+**Option B – Restore a quarantined file**
+
+If Defender already removed the exe:
+
+1. **Windows Security** → **Virus & threat protection** → **Protection history**.
+2. Find the entry for `AOS-Migration-Wizard.exe` (or your migration exe).
+3. Click it → **Actions** → **Restore**. The file will be restored and often allowed after you choose “Restore”.
+
+**Option C – SmartScreen “Windows protected your PC”**
+
+If you see “Windows protected your PC” when running the exe:
+
+1. Click **More info**.
+2. Click **Run anyway**.
+
+**Other antivirus software**
+
+- Add the same folder (project or `dist`) as an **exclusion** or **trusted path** in your AV’s settings (e.g. Norton, McAfee, Kaspersky). The exact menu name varies (e.g. “Exclusions”, “Trusted files”, “Allow list”).
+
+**If you don’t want to add exclusions**
+
+Run the wizard without building an exe: from the project folder run `python wizard.py` (with `.venv` activated). No standalone exe is involved, so AV is less likely to block it.
+
+---
+
+### 6. Linux: binary and (optional) AppImage
 
 **Binary:**
 

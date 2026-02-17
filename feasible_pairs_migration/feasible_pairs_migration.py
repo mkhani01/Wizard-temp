@@ -242,41 +242,58 @@ def load_existing_feasible_pairs(connection):
         cursor.close()
 
 
+def is_personal_care_row(row):
+    """
+    Check if the row represents a Personal Care service.
+    Both 'Planned Service Type Description' AND 'Planned Service Requirement Type Description'
+    must equal "Personal Care".
+    """
+    service_type = safe_strip(row.get('Planned Service Type Description', ''))
+    requirement_type = safe_strip(row.get('Planned Service Requirement Type Description', ''))
+    
+    return service_type == 'Personal Care' and requirement_type == 'Personal Care'
+
+
 def extract_visit_frequencies_from_csv(csv_path, users_lookup, clients_lookup):
     """
     Extract visit frequencies from CSV file.
     
     For each row:
-    1. Parse Assignee name to find caregiver (User)
-    2. Parse Customer name to find client
-    3. Count occurrences of each (caregiver, client) pair
+    1. Filter: Only process rows where both "Planned Service Type Description" 
+       AND "Planned Service Requirement Type Description" equal "Personal Care"
+    2. Parse "Planned Employee Name" to find caregiver (User) - format: "lastname, firstname"
+    3. Parse "Service Location Name" to find client - format: "lastname, firstname"
+    4. Count occurrences of each (caregiver, client) pair
     
     Returns a dictionary: (caregiver_id, client_id) -> frequency
     """
     frequencies = defaultdict(int)
     stats = {
         'total_rows': 0,
+        'personal_care_rows': 0,
         'valid_rows': 0,
         'matched_pairs': 0,
         'unmatched_caregivers': set(),
         'unmatched_clients': set(),
+        'skipped_non_personal_care': 0,
     }
     
     logger.info(f"Reading CSV: {csv_path}")
     logger.info("Processing visit data (this may take a while for large files)...")
+    logger.info("Filter: Only 'Personal Care' service types will be processed")
     
     # Process in batches to handle large files efficiently
     batch_size = 10000
     processed = 0
     
-    # Support multiple column naming conventions:
-    # - Assignee / Customer (generic)
-    # - Actual Employee Name / Planned Employee Name, Customer Name (VisitExport / "All Visit Details")
-    def get_assignee(row):
-        v = row.get('Assignee') or row.get('Actual Employee Name') or row.get('Planned Employee Name')
+    def get_employee_name(row):
+        """Get employee name from 'Planned Employee Name' column (format: lastname, firstname)"""
+        v = row.get('Planned Employee Name')
         return safe_strip(v) if v else ''
-    def get_customer(row):
-        v = row.get('Customer') or row.get('Customer Name')
+    
+    def get_service_location_name(row):
+        """Get client name from 'Service Location Name' column (format: lastname, firstname)"""
+        v = row.get('Service Location Name')
         return safe_strip(v) if v else ''
 
     with open(csv_path, 'r', encoding='utf-8') as file:
@@ -286,46 +303,58 @@ def extract_visit_frequencies_from_csv(csv_path, users_lookup, clients_lookup):
             stats['total_rows'] += 1
             processed += 1
             
-            assignee_name = get_assignee(row)
-            customer_name = get_customer(row)
-            
-            if not assignee_name or not customer_name:
+            # Filter: Only process Personal Care rows
+            if not is_personal_care_row(row):
+                stats['skipped_non_personal_care'] += 1
                 continue
             
-            # Parse assignee name into first name and last name
-            assignee_first, assignee_last = parse_full_name(assignee_name)
+            stats['personal_care_rows'] += 1
             
-            # Parse customer name into first name and last name
-            customer_first, customer_last = parse_full_name(customer_name)
+            # Get employee name (caregiver) from "Planned Employee Name"
+            employee_name = get_employee_name(row)
             
-            if not assignee_first or not assignee_last:
-                stats['unmatched_caregivers'].add(assignee_name)
+            # Get client name from "Service Location Name"
+            service_location_name = get_service_location_name(row)
+            
+            if not employee_name or not service_location_name:
                 continue
             
-            if not customer_first or not customer_last:
-                stats['unmatched_clients'].add(customer_name)
+            # Parse employee name into first name and last name
+            # Format: "lastname, firstname"
+            employee_first, employee_last = parse_full_name(employee_name)
+            
+            # Parse service location name into first name and last name
+            # Format: "lastname, firstname"
+            client_first, client_last = parse_full_name(service_location_name)
+            
+            if not employee_first or not employee_last:
+                stats['unmatched_caregivers'].add(employee_name)
+                continue
+            
+            if not client_first or not client_last:
+                stats['unmatched_clients'].add(service_location_name)
                 continue
             
             # Look up caregiver in users table
-            caregiver_key = (assignee_first.lower(), assignee_last.lower())
+            caregiver_key = (employee_first.lower(), employee_last.lower())
             caregiver_id = users_lookup.get(caregiver_key)
             
             # If not found, try variations
             if not caregiver_id:
                 # Try with just the first part of first name
-                first_part = assignee_first.split()[0] if assignee_first else ''
-                alt_key = (first_part.lower(), assignee_last.lower())
+                first_part = employee_first.split()[0] if employee_first else ''
+                alt_key = (first_part.lower(), employee_last.lower())
                 caregiver_id = users_lookup.get(alt_key)
             
             # Look up client in clients table
-            client_key = (customer_first.lower(), customer_last.lower())
+            client_key = (client_first.lower(), client_last.lower())
             client_id = clients_lookup.get(client_key)
             
             # If not found, try variations
             if not client_id:
                 # Try with just the first part of first name
-                first_part = customer_first.split()[0] if customer_first else ''
-                alt_key = (first_part.lower(), customer_last.lower())
+                first_part = client_first.split()[0] if client_first else ''
+                alt_key = (first_part.lower(), client_last.lower())
                 client_id = clients_lookup.get(alt_key)
             
             # Record the pair if both found
@@ -335,9 +364,9 @@ def extract_visit_frequencies_from_csv(csv_path, users_lookup, clients_lookup):
                 stats['valid_rows'] += 1
             else:
                 if not caregiver_id:
-                    stats['unmatched_caregivers'].add(assignee_name)
+                    stats['unmatched_caregivers'].add(employee_name)
                 if not client_id:
-                    stats['unmatched_clients'].add(customer_name)
+                    stats['unmatched_clients'].add(service_location_name)
             
             # Log progress every batch
             if processed % batch_size == 0:
@@ -349,6 +378,8 @@ def extract_visit_frequencies_from_csv(csv_path, users_lookup, clients_lookup):
     
     logger.info(f"\nProcessing complete!")
     logger.info(f"  Total rows processed: {stats['total_rows']}")
+    logger.info(f"  Rows skipped (non-Personal Care): {stats['skipped_non_personal_care']}")
+    logger.info(f"  Personal Care rows: {stats['personal_care_rows']}")
     logger.info(f"  Valid visit records: {stats['valid_rows']}")
     logger.info(f"  Unique caregiver-client pairs: {stats['matched_pairs']}")
     logger.info(f"  Total visits recorded: {stats['total_visits']}")
@@ -536,6 +567,8 @@ def run(csv_path=None):
             print("="*60)
             print(f"\nSummary:")
             print(f"  - Total CSV rows processed: {stats['total_rows']}")
+            print(f"  - Rows skipped (non-Personal Care): {stats['skipped_non_personal_care']}")
+            print(f"  - Personal Care rows: {stats['personal_care_rows']}")
             print(f"  - Valid visit records: {stats['valid_rows']}")
             print(f"  - Unique caregiver-client pairs: {stats['matched_pairs']}")
             print(f"  - Total visits recorded: {stats['total_visits']}")

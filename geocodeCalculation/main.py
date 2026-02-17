@@ -297,49 +297,52 @@ def get_h3_hexagon_for_dense_check(lat, lng, cities):
 
 
 def get_users_with_postcodes(connection):
-    """Get all users with postcodes"""
+    """Get all users with postcodes but without lat/long (null coordinates)"""
     cursor = connection.cursor()
     try:
         query = """
             SELECT id, name, lastname, postcode
             FROM "user"
             WHERE postcode IS NOT NULL AND postcode != ''
+            AND (latitude IS NULL OR longitude IS NULL)
             ORDER BY id
         """
         cursor.execute(query)
         users = cursor.fetchall()
-        logger.info(f"Found {len(users)} users with postcodes")
+        logger.info(f"Found {len(users)} users with postcodes but no coordinates")
         return users
     finally:
         cursor.close()
 
 
 def get_clients_with_postcodes(connection):
-    """Get all clients with postcodes"""
+    """Get all clients with postcodes but without lat/long (null coordinates)"""
     cursor = connection.cursor()
     try:
         query = """
             SELECT id, name, lastname, postcode
             FROM client
             WHERE postcode IS NOT NULL AND postcode != ''
+            AND (latitude IS NULL OR longitude IS NULL)
             ORDER BY id
         """
         cursor.execute(query)
         clients = cursor.fetchall()
-        logger.info(f"Found {len(clients)} clients with postcodes")
+        logger.info(f"Found {len(clients)} clients with postcodes but no coordinates")
         return clients
     finally:
         cursor.close()
 
 
 def get_users_without_postcodes(connection):
-    """Get users without postcodes"""
+    """Get users without postcodes AND without coordinates (cannot be geocoded)"""
     cursor = connection.cursor()
     try:
         query = """
             SELECT id, name, lastname
             FROM "user"
-            WHERE postcode IS NULL OR postcode = ''
+            WHERE (postcode IS NULL OR postcode = '')
+            AND (latitude IS NULL OR longitude IS NULL)
         """
         cursor.execute(query)
         return cursor.fetchall()
@@ -348,13 +351,14 @@ def get_users_without_postcodes(connection):
 
 
 def get_clients_without_postcodes(connection):
-    """Get clients without postcodes"""
+    """Get clients without postcodes AND without coordinates (cannot be geocoded)"""
     cursor = connection.cursor()
     try:
         query = """
             SELECT id, name, lastname
             FROM client
-            WHERE postcode IS NULL OR postcode = ''
+            WHERE (postcode IS NULL OR postcode = '')
+            AND (latitude IS NULL OR longitude IS NULL)
         """
         cursor.execute(query)
         return cursor.fetchall()
@@ -546,6 +550,7 @@ def run():
     ╔══════════════════════════════════════════════════════════╗
     ║         Geocode Calculation Migration                    ║
     ║         Postcode → Lat/Lng → H3 Hexagon                  ║
+    ║         (Only for records with null coordinates)         ║
     ╚══════════════════════════════════════════════════════════╝
     """)
     
@@ -592,10 +597,20 @@ def run():
         logger.info("\n" + "="*60)
         logger.info("STEP 3: FETCH RECORDS")
         logger.info("="*60)
+        logger.info("Fetching users and clients that need geocoding:")
+        logger.info("  - WITH postcode but WITHOUT coordinates → will be geocoded")
+        logger.info("  - WITHOUT postcode and WITHOUT coordinates → will be logged as warnings")
+        logger.info("")
         users = get_users_with_postcodes(connection)
         clients = get_clients_with_postcodes(connection)
         users_no_postcode = get_users_without_postcodes(connection)
         clients_no_postcode = get_clients_without_postcodes(connection)
+
+        logger.info(f"Summary:")
+        logger.info(f"  - {len(users)} users to geocode")
+        logger.info(f"  - {len(clients)} clients to geocode")
+        logger.info(f"  - {len(users_no_postcode)} users without postcodes (will skip)")
+        logger.info(f"  - {len(clients_no_postcode)} clients without postcodes (will skip)")
         
         logger.info("\n" + "="*60)
         logger.info("STEP 4: PROCESS USERS")
@@ -610,19 +625,21 @@ def run():
             logger.info("="*60)
             clients_success = process_clients(connection, geocoder, clients, cities)
         
-        # Log records without postcodes
+        # Log records without postcodes (and missing coordinates - cannot be geocoded)
         if users_no_postcode or clients_no_postcode:
             logger.warning("\n" + "="*60)
-            logger.warning("RECORDS WITHOUT POSTCODES")
+            logger.warning("⚠️  RECORDS MISSING POSTCODES (CANNOT BE GEOCODED)")
             logger.warning("="*60)
-            
+            logger.warning("These records have no postcode and no coordinates.")
+            logger.warning("They cannot be geocoded and need manual address entry.")
+
             if users_no_postcode:
                 logger.warning(f"\n{len(users_no_postcode)} Users without postcodes:")
                 for user in users_no_postcode[:20]:
                     logger.warning(f"  - User ID {user['id']}: {user['name']} {user['lastname']}")
                 if len(users_no_postcode) > 20:
                     logger.warning(f"  ... and {len(users_no_postcode) - 20} more")
-            
+
             if clients_no_postcode:
                 logger.warning(f"\n{len(clients_no_postcode)} Clients without postcodes:")
                 for client in clients_no_postcode[:20]:
