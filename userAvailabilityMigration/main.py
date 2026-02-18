@@ -492,15 +492,33 @@ def deduplicate_availabilities(availabilities: List[Dict]) -> List[Dict]:
     return list(unique_map.values())
 
 
+def clear_user_availabilities(connection) -> None:
+    """Remove all existing rows from user_availabilities before seeding."""
+    cursor = connection.cursor()
+    try:
+        cursor.execute("DELETE FROM user_availabilities")
+        deleted = cursor.rowcount
+        connection.commit()
+        logger.info(f"Cleared user_availabilities: {deleted} existing row(s) removed")
+    except Exception as e:
+        connection.rollback()
+        logger.error(f"Failed to clear user_availabilities: {e}")
+        raise MigrationError(f"Failed to clear user_availabilities: {e}")
+    finally:
+        cursor.close()
+
+
 def seed_availabilities(connection, availabilities: List[Dict]) -> int:
     """Insert user availabilities into database"""
-    if not availabilities:
-        logger.warning("No availabilities to insert")
-        return 0
-    
     logger.info(f"\n{'='*60}")
     logger.info("SEEDING DATABASE")
     logger.info(f"{'='*60}")
+    
+    clear_user_availabilities(connection)
+    
+    if not availabilities:
+        logger.warning("No availabilities to insert")
+        return 0
     
     cursor = connection.cursor()
     try:
