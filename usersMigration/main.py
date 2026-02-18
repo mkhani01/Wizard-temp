@@ -304,24 +304,11 @@ def seed_users(connection, users):
     
     cursor = connection.cursor()
     try:
-        # Resolve sequence for user.id (table may have no DEFAULT, causing NOT NULL violation)
-        cursor.execute(
-            """SELECT pg_get_serial_sequence('"user"', 'id') AS seq_name"""
-        )
-        row = cursor.fetchone()
-        seq_name = (row and row.get("seq_name")) or "user_id_seq"
-        seq_name = str(seq_name).strip() if seq_name else "user_id_seq"
-        # Ensure sequence exists (table may have no DEFAULT; create if missing)
-        try:
-            cursor.execute("CREATE SEQUENCE IF NOT EXISTS user_id_seq")
-        except Exception as e:
-            logger.debug("Sequence user_id_seq create/skip: %s", e)
-        # nextval() needs a regclass; quote if it contains a schema (e.g. public.user_id_seq)
-        seq_sql = "nextval('%s'::regclass)" % seq_name.replace("'", "''")
-        # Build insert query: include id via nextval(seq) so each row gets a generated id
+        # Do NOT include id in INSERT: let DB default get_next_daily_id('user') generate
+        # YYYYMMDD + 6-digit sequence (e.g. 20260218000001). Same pattern as clients migration.
         insert_query = """
             INSERT INTO "user" (
-                id, name, lastname, middle_name, preferred_name, email, phone_number,
+                name, lastname, middle_name, preferred_name, email, phone_number,
                 password, is_loginable, is_caregiver, birth_date, gender, marital_status,
                 "ppsNumber", town, county, postcode, travel_method, status,
                 title_id, nationality_id, religion_id, origin_id,
@@ -351,7 +338,7 @@ def seed_users(connection, users):
                 last_modified_date = NOW()
             RETURNING id, email
         """
-        
+
         # Required keys for each user (must match tuple order and template)
         required_keys = [
             'name', 'lastname', 'middle_name', 'preferred_name', 'email', 'phone_number',
@@ -397,15 +384,14 @@ def seed_users(connection, users):
             logger.warning("No valid user tuples to insert after validation")
             return False
 
-        logger.info("Inserting %d user rows (id=nextval + 22 fields + created_date, last_modified_date)...", len(user_tuples))
-        # 25 columns: id (nextval), 22 from tuple, created_date, last_modified_date. Template must have exactly 22 %%s to match tuple length.
+        logger.info("Inserting %d user rows (id from DB default get_next_daily_id)...", len(user_tuples))
+        # 22 columns from tuple + created_date, last_modified_date
         template = "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())"
-        template_with_id = "(" + seq_sql + ", " + template[1:]
         execute_values(
             cursor,
             insert_query,
             user_tuples,
-            template=template_with_id,
+            template=template,
             fetch=True,
         )
         
