@@ -570,6 +570,12 @@ def seed_clients(connection, clients):
         logger.info(f"  - {len(to_insert)} new clients to insert")
         logger.info(f"  - {len(to_update)} existing clients to update")
         
+        # Clients in DB but not in file(s) -> set status to Deactive
+        keys_in_file = {f"{c['name']}|{c['lastname']}" for c in clients}
+        to_deactivate_ids = [existing[key] for key in existing if key not in keys_in_file]
+        if to_deactivate_ids:
+            logger.info(f"  - {len(to_deactivate_ids)} existing clients not in file(s) will be deactivated")
+        
         processed = []
         
         # INSERT new clients
@@ -752,6 +758,14 @@ def seed_clients(connection, clients):
         
         if to_update:
             logger.info(f"✓ Updated {len(to_update)} existing clients")
+        
+        # Deactivate clients that are in DB but not in the given file(s)
+        if to_deactivate_ids:
+            cursor.execute(
+                "UPDATE client SET status = 'Deactive', last_modified_date = NOW() WHERE id = ANY(%s)",
+                (to_deactivate_ids,),
+            )
+            logger.info(f"✓ Deactivated {len(to_deactivate_ids)} clients not present in file(s)")
         
         # Link clients to groups (many-to-many)
         if processed:

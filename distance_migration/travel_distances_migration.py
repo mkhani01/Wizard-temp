@@ -2,6 +2,7 @@
 Travel Distances Migration (Fast Bulk Version)
 Loads users and clients, computes distances via OSRM, then performs a BULK INSERT.
 - Wipes existing travel_distances table before starting.
+- Computes: user→user, client→client, user→client, client→user (separate requests).
 - Uses execute_values for massive speedup (100x faster than row-by-row).
 - Maps OSRM profiles (driving-car) to DB enums (car).
 """
@@ -153,88 +154,155 @@ def run():
         users = load_users_with_locations(connection)
         clients = load_clients_with_locations(connection)
 
-        if not users or not clients:
-            logger.warning("No users with coordinates or no clients with coordinates. Nothing to migrate.")
+        if not users and not clients:
+            logger.warning("No users and no clients with coordinates. Nothing to migrate.")
             return True
 
         cursor = connection.cursor()
-        
+        now = datetime.utcnow()
+
         # --- STEP 1: WIPE OLD DATA ---
         logger.warning("Clearing existing travel_distances table...")
         cursor.execute("TRUNCATE TABLE travel_distances RESTART IDENTITY;")
         connection.commit()
         logger.info("✓ Table cleared.")
-        
-        total_expected = len(users) * len(clients) * len(OSRM_METHODS)
+
+        total_expected = (
+            len(users) ** 2 * len(OSRM_METHODS)
+            + len(clients) ** 2 * len(OSRM_METHODS)
+            + len(users) * len(clients) * len(OSRM_METHODS) * 2  # user→client and client→user
+        )
         logger.info(f"Total expected distance records: {total_expected}")
 
-        # --- STEP 2: CALCULATE & BULK INSERT ---
+        # --- STEP 2: CALCULATE & BULK INSERT (user↔user, client↔client, user↔client, client↔user) ---
+        batch_data = []
+        processed_count = 0
+
+        def flush_batch():
+            nonlocal batch_data, processed_count
+            if not batch_data:
+                return
+            insert_batch(cursor, batch_data)
+            connection.commit()
+            logger.info(f"  Inserted {processed_count} records so far...")
+            batch_data = []
+
+        def add_rows(dist_map, dur_map, from_type, to_type, db_enum_method):
+            nonlocal batch_data, processed_count
+            for (from_id, to_id), dist_km in dist_map.items():
+                if dist_km is None:
+                    continue
+                dur_min = dur_map.get((from_id, to_id), 0)
+                distance_meters = int(round(dist_km * 1000))
+                duration_minutes = int(dur_min) if dur_min else 0
+                row_data = (
+                    from_type,
+                    from_id,
+                    to_type,
+                    to_id,
+                    db_enum_method,
+                    distance_meters,
+                    duration_minutes,
+                    CALCULATION_STATUS_COMPLETED,
+                    None,
+                    now,
+                    now,
+                    now,
+                )
+                batch_data.append(row_data)
+                processed_count += 1
+                if len(batch_data) >= DB_INSERT_BATCH_SIZE:
+                    flush_batch()
+
         for osrm_method in OSRM_METHODS:
             db_enum_method = TRAVEL_METHOD_MAP[osrm_method]
             logger.info("")
             logger.info("=" * 60)
             logger.info(f"Travel method: {osrm_method} (saving as '{db_enum_method}')")
             logger.info("=" * 60)
-            
-            try:
-                matrix_result = get_distance_matrix(
-                    entities_info1=users,
-                    entities_info2=clients,
-                    travel_method=osrm_method,
-                    step_size=DEFAULT_STEP_SIZE,
-                )
-            except Exception as e:
-                logger.exception("OSRM request failed for %s", osrm_method)
-                # Continue to next method instead of crashing everything
-                continue
 
-            dist_map = matrix_result["distance"]
-            dur_map = matrix_result["duration"]
+            # 1. User → User
+            if users:
+                try:
+                    matrix_result = get_distance_matrix(
+                        entities_info1=users,
+                        entities_info2=users,
+                        travel_method=osrm_method,
+                        step_size=DEFAULT_STEP_SIZE,
+                    )
+                    add_rows(
+                        matrix_result["distance"],
+                        matrix_result["duration"],
+                        ENTITY_TYPE_USER,
+                        ENTITY_TYPE_USER,
+                        db_enum_method,
+                    )
+                    logger.info("  ✓ User → User")
+                except Exception as e:
+                    logger.exception("OSRM user→user failed for %s: %s", osrm_method, e)
 
-            # Prepare batch data
-            now = datetime.utcnow()
-            batch_data = []
-            processed_count = 0
+            # 2. Client → Client
+            if clients:
+                try:
+                    matrix_result = get_distance_matrix(
+                        entities_info1=clients,
+                        entities_info2=clients,
+                        travel_method=osrm_method,
+                        step_size=DEFAULT_STEP_SIZE,
+                    )
+                    add_rows(
+                        matrix_result["distance"],
+                        matrix_result["duration"],
+                        ENTITY_TYPE_CLIENT,
+                        ENTITY_TYPE_CLIENT,
+                        db_enum_method,
+                    )
+                    logger.info("  ✓ Client → Client")
+                except Exception as e:
+                    logger.exception("OSRM client→client failed for %s: %s", osrm_method, e)
 
-            for (user_id, client_id), dist_km in dist_map.items():
-                if dist_km is None:
-                    continue
-                
-                dur_min = dur_map.get((user_id, client_id), 0)
-                distance_meters = int(round(dist_km * 1000))
-                duration_minutes = int(dur_min) if dur_min else 0
-                
-                # Create a tuple for the insert
-                # Columns: from_type, from_id, to_type, to_id, travel_method, distance_meters, duration_minutes, status, error, last_calc, created, updated
-                row_data = (
-                    ENTITY_TYPE_USER,
-                    user_id,
-                    ENTITY_TYPE_CLIENT,
-                    client_id,
-                    db_enum_method,
-                    distance_meters,
-                    duration_minutes,
-                    CALCULATION_STATUS_COMPLETED,
-                    None, # error_message
-                    now,  # last_calculated_at
-                    now,  # created_at
-                    now   # updated_at
-                )
-                batch_data.append(row_data)
-                processed_count += 1
+            # 3. User → Client
+            if users and clients:
+                try:
+                    matrix_result = get_distance_matrix(
+                        entities_info1=users,
+                        entities_info2=clients,
+                        travel_method=osrm_method,
+                        step_size=DEFAULT_STEP_SIZE,
+                    )
+                    add_rows(
+                        matrix_result["distance"],
+                        matrix_result["duration"],
+                        ENTITY_TYPE_USER,
+                        ENTITY_TYPE_CLIENT,
+                        db_enum_method,
+                    )
+                    logger.info("  ✓ User → Client")
+                except Exception as e:
+                    logger.exception("OSRM user→client failed for %s: %s", osrm_method, e)
 
-                # Insert in chunks of DB_INSERT_BATCH_SIZE
-                if len(batch_data) >= DB_INSERT_BATCH_SIZE:
-                    insert_batch(cursor, batch_data)
-                    connection.commit()
-                    logger.info(f"  Inserted {processed_count} / {len(dist_map)} records for {db_enum_method}...")
-                    batch_data = [] # Reset batch
+            # 4. Client → User (separate request; direction matters)
+            if users and clients:
+                try:
+                    matrix_result = get_distance_matrix(
+                        entities_info1=clients,
+                        entities_info2=users,
+                        travel_method=osrm_method,
+                        step_size=DEFAULT_STEP_SIZE,
+                    )
+                    add_rows(
+                        matrix_result["distance"],
+                        matrix_result["duration"],
+                        ENTITY_TYPE_CLIENT,
+                        ENTITY_TYPE_USER,
+                        db_enum_method,
+                    )
+                    logger.info("  ✓ Client → User")
+                except Exception as e:
+                    logger.exception("OSRM client→user failed for %s: %s", osrm_method, e)
 
-            # Insert remaining items for this method
-            if batch_data:
-                insert_batch(cursor, batch_data)
-                connection.commit()
-                logger.info(f"  Inserted {processed_count} / {len(dist_map)} records for {db_enum_method}...")
+        # Insert any remaining rows
+        flush_batch()
 
         logger.info("")
         logger.info("✓ Migration completed successfully.")
