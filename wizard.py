@@ -903,7 +903,8 @@ class MigrationWizard:
     def _run_user_availability(self):
         sys.path.insert(0, str(BUNDLE_ROOT))
         from userAvailabilityMigration.main import run
-        return run()
+        xlsx_path = str(ASSETS / OPT_ASSET_PATH[OPT_CAREGIVERS_AVAILABILITY])
+        return run(xlsx_path)
 
     def _run_clients(self):
         sys.path.insert(0, str(BUNDLE_ROOT))

@@ -196,16 +196,36 @@ def extract_users_from_csv(csv_path, lookups):
             email = row.get('Email', '').strip().lower()
             if not email:
                 stats["skipped_no_email"] += 1
-                logger.warning("Row %d: Skipping - no email", row_num)
+                logger.warning(
+                    "Row %d: Skipping - no email (First Name=%r, Last Name=%r)",
+                    row_num, row.get('First Name', '').strip(), row.get('Last Name', '').strip()
+                )
                 continue
             
             # Basic fields
             first_name = row.get('First Name', '').strip()
             last_name = row.get('Last Name', '').strip()
             
+            # If Last Name is empty but First Name contains spaces, split: "Mary Scullion" or "Mrs Mary Scullion" -> Mary, Scullion
+            if not last_name and first_name and ' ' in first_name:
+                parts = first_name.split()
+                titles = {'Mr', 'Mrs', 'Miss', 'Ms', 'Dr', 'Prof', 'Mr.', 'Mrs.', 'Miss.', 'Ms.', 'Dr.', 'Prof.'}
+                while parts and parts[0] in titles:
+                    parts = parts[1:]
+                if len(parts) >= 2:
+                    first_name = parts[0]
+                    last_name = ' '.join(parts[1:])
+                    logger.debug("Row %d: Split full name into first=%r, last=%r", row_num, first_name, last_name)
+                else:
+                    first_name = parts[0] if parts else ''
+                    last_name = ''
+            
             if not first_name or not last_name:
                 stats["skipped_no_name"] += 1
-                logger.warning("Row %d: Skipping - missing name", row_num)
+                logger.warning(
+                    "Row %d: Skipping - missing name (First Name=%r, Last Name=%r, Email=%r)",
+                    row_num, first_name, last_name, email
+                )
                 continue
             
             # Phone number (prefer Mobile, fallback to Home) - clean Excel formatting
