@@ -72,32 +72,38 @@ def load_client_locations_from_json(json_path):
     # Extract location data
     client_locations = []
     skipped = 0
-    
-    for client in clients:
+
+    for idx, client in enumerate(clients):
         name = client.get('name', '').strip()
         lastname = client.get('lastname', '').strip()
         latitude = client.get('latitude')
         longitude = client.get('longitude')
-        
-        # Skip if missing required fields
+
         if not name or not lastname:
             skipped += 1
+            logger.warning(
+                "Item %d: SKIPPED - missing name/lastname | name=%r, lastname=%r, lat=%r, long=%r",
+                idx + 1, name, lastname, latitude, longitude
+            )
             continue
-        
-        # Skip if no location data
+
         if latitude is None or longitude is None:
             skipped += 1
+            logger.warning(
+                "Item %d: SKIPPED - missing coordinates | name=%r, lastname=%r, lat=%r, long=%r",
+                idx + 1, name, lastname, latitude, longitude
+            )
             continue
-        
+
         client_locations.append({
             'name': name,
             'lastname': lastname,
             'latitude': latitude,
             'longitude': longitude
         })
-    
-    logger.info(f"Extracted {len(client_locations)} clients with location data")
-    logger.info(f"Skipped {skipped} clients (missing name/lastname or coordinates)")
+        logger.info("Item %d: ADDED | name=%r, lastname=%r, lat=%s, long=%s", idx + 1, name, lastname, latitude, longitude)
+
+    logger.info("Extracted %d clients with location data; skipped %d", len(client_locations), skipped)
     
     return client_locations
 
@@ -137,7 +143,7 @@ def update_client_locations(connection, client_locations):
             
             if len(matches) == 0:
                 not_found_count += 1
-                logger.warning(f"Client not found: {name} {lastname}")
+                logger.warning("SEED SKIP - client not found | name=%r, lastname=%r, lat=%s, long=%s", name, lastname, latitude, longitude)
                 failed_updates.append({
                     'name': name,
                     'lastname': lastname,
@@ -147,11 +153,11 @@ def update_client_locations(connection, client_locations):
             
             if len(matches) > 1:
                 multiple_matches_count += 1
-                logger.warning(f"Multiple clients found for: {name} {lastname} ({len(matches)} matches)")
+                logger.warning("SEED SKIP - multiple clients found | name=%r, lastname=%r, matches=%d", name, lastname, len(matches))
                 failed_updates.append({
                     'name': name,
                     'lastname': lastname,
-                    'reason': f'multiple_matches_{len(matches)}'
+                    'reason': 'multiple_matches_%d' % len(matches)
                 })
                 continue
             
@@ -169,10 +175,8 @@ def update_client_locations(connection, client_locations):
             )
             
             updated_count += 1
-            
-            if updated_count <= 5:
-                logger.info(f"✓ Updated: {name} {lastname} (ID: {client_id}) -> ({latitude}, {longitude})")
-        
+            logger.info("  SEEDED client location id=%s name=%r lastname=%r lat=%s long=%s", client_id, name, lastname, latitude, longitude)
+
         connection.commit()
         
         # Summary

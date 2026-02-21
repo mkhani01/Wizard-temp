@@ -64,18 +64,26 @@ def extract_areas_from_csv(csv_path):
     """Extract unique areas from CSV"""
     areas = set()
     
-    logger.info(f"Reading CSV: {csv_path}")
+    logger.info("Reading CSV: %s", csv_path)
     
     with open(csv_path, 'r', encoding='utf-8') as f:
         reader = csv.DictReader(f)
+        row_num = 0
         for row in reader:
+            row_num += 1
             area = row.get('Area', '').strip()
             if area:
                 areas.add(area)
+                logger.info("Row %d: ADDED area | Area=%r", row_num, area)
+            else:
+                logger.warning(
+                    "Row %d: SKIPPED - empty Area | row keys=%s",
+                    row_num, list(row.keys())
+                )
     
-    logger.info(f"Found {len(areas)} unique areas:")
+    logger.info("Found %d unique areas:", len(areas))
     for area in sorted(areas):
-        logger.info(f"  - {area}")
+        logger.info("  - %s", area)
     
     return areas
 
@@ -135,9 +143,9 @@ def seed_areas(connection, areas):
         inserted = cursor.fetchall()
         connection.commit()
         
-        logger.info(f"\n✓ Successfully inserted {len(inserted)} areas:")
+        logger.info("Successfully inserted %d areas:", len(inserted))
         for row in inserted:
-            logger.info(f"  - {row['name']} (ID: {row['id']})")
+            logger.info("  SEEDED area id=%s name=%r", row['id'], row['name'])
         
         return True
         

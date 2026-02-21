@@ -114,12 +114,18 @@ def extract_from_csv(csv_path):
 
             name = _safe_strip(_get_column(row, CSV_COLUMNS["name"]))
             if not name:
-                logger.warning("Row %s: Skipping - missing name", row_num)
+                logger.warning(
+                    "Row %d: SKIPPED - missing name | row=%s",
+                    row_num, {k: v for k, v in row.items() if v}
+                )
                 continue
 
             type_value = _parse_type(_get_column(row, CSV_COLUMNS["type"]))
             if not type_value:
-                logger.warning("Row %s: Skipping - invalid type for name=%s", row_num, name)
+                logger.warning(
+                    "Row %d: SKIPPED - invalid type | name=%r, type_raw=%r, category=%r",
+                    row_num, name, _get_column(row, CSV_COLUMNS["type"]), _get_column(row, CSV_COLUMNS["category"])
+                )
                 continue
 
             category_value = _parse_category(_get_column(row, CSV_COLUMNS["category"]))
@@ -142,6 +148,10 @@ def extract_from_csv(csv_path):
                 "icon": icon,
                 "is_paid": is_paid,
             })
+            logger.info(
+                "Row %d: ADDED | name=%r, type=%s, category=%s, is_paid=%s",
+                row_num, name, type_value, category_value, is_paid
+            )
 
     logger.info("Extracted %s availability types from CSV", len(types))
     return types

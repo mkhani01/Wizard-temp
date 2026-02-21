@@ -401,11 +401,14 @@ def extract_clients_from_csv(csv_path, lookups):
             # Basic fields
             first_name = safe_get('First Name')
             last_name = safe_get('Last Name')
-            
+
             if not first_name or not last_name:
-                logger.warning(f"Row {row_num}: Skipping - missing name")
+                logger.warning(
+                    "Row %d: SKIPPED - missing name | First Name=%r, Last Name=%r, Email=%r, Area=%r, PIN=%r, Phone=%r",
+                    row_num, first_name, last_name, safe_get('Email'), safe_get('Area'), safe_get('PIN Number'), safe_get('Phone')
+                )
                 continue
-            
+
             # Generate unique identifier for this client
             pin_number = clean_excel_value(safe_get('PIN Number'))
             
@@ -530,10 +533,14 @@ def extract_clients_from_csv(csv_path, lookups):
                 'created_date': created_date or datetime.now(),
                 'updated_date': updated_date or datetime.now(),
             }
-            
+
             clients.append(client_data)
-    
-    logger.info(f"Extracted {len(clients)} clients from CSV")
+            logger.info(
+                "Row %d: ADDED | name=%r, lastname=%r, email=%r, area=%r, status=%s, pin=%r",
+                row_num, first_name, last_name, client_data.get('email'), group_name, client_data.get('status'), pin_number
+            )
+
+    logger.info("Extracted %d clients from CSV", len(clients))
     return clients
 
 
@@ -655,8 +662,10 @@ def seed_clients(connection, clients):
             
             inserted = cursor.fetchall()
             processed.extend(inserted)
-            logger.info(f"✓ Inserted {len(inserted)} new clients")
-        
+            for row in inserted:
+                logger.info("  SEEDED client INSERT id=%s name=%r lastname=%r", row['id'], row['name'], row['lastname'])
+            logger.info("Inserted %d new clients", len(inserted))
+
         # UPDATE existing clients
         for client, client_id in to_update:
             update_query = """
@@ -755,9 +764,10 @@ def seed_clients(connection, clients):
                     'name': client['name'],
                     'lastname': client['lastname'],
                 })
-        
+                logger.info("  SEEDED client UPDATE id=%s name=%r lastname=%r", client_id, client['name'], client['lastname'])
+
         if to_update:
-            logger.info(f"✓ Updated {len(to_update)} existing clients")
+            logger.info("Updated %d existing clients", len(to_update))
         
         # Deactivate clients that are in DB but not in the given file(s)
         if to_deactivate_ids:

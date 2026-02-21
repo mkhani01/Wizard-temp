@@ -5,10 +5,12 @@ Migrates user availability data from Excel file to database.
 
 Rules:
 - "Core" records: Recurring availability (Start Date - 28 days, occurs_every=4).
-- Other Types: Treated as Unavailability (is_temp=True) if they exist in DB.
-  - is_unavailability = True
+- Other Types (found in seeded availability_types): Treated as availability or unavailability
+  based on the type's classification in DB (search Type in availability_types).
+  - is_unavailability = from type (availability vs unavailability)
   - is_temp = True
-  - effective_date_from/to = Exact dates from Excel
+  - No recurrence: start_date/end_date/occurs_every = None
+  - effective_date_from = effective_date_to = that specific date only
   - Handles multi-day and overnight shifts by splitting into daily records.
 """
 
@@ -264,14 +266,23 @@ def process_xlsx_file(filepath: Path, users_map: Dict[str, int], types_map: Dict
         notes = row[COLUMN_NOTES] if len(row) > COLUMN_NOTES else None
         
         if not care_assistant_name:
+            logger.warning(
+                "Row %d: SKIPPED - empty Care Assistant name | Start=%r, End=%r, Type=%r, StartTime=%r, EndTime=%r",
+                row_num, start_date_val, end_date_val, type_val, start_time_val, end_time_val
+            )
             continue
-        
+
         type_str = str(type_val).strip() if type_val else ''
         type_key = type_str.lower()
-        
-        # Check if type is known
+
+        # Check if type is known (not in seeded availability_types) — log row info, do not seed
         if type_key not in types_map:
             skipped_types[type_str] += 1
+            logger.warning(
+                f"Row {row_num}: Skipped (Type not in DB) — Care Assistant: {care_assistant_name!r}, "
+                f"Type: {type_str!r}, Start: {start_date_val}, End: {end_date_val}, "
+                f"StartTime: {start_time_val}, EndTime: {end_time_val}, Notes: {notes!r}"
+            )
             continue
         
         # Match User
@@ -281,16 +292,23 @@ def process_xlsx_file(filepath: Path, users_map: Dict[str, int], types_map: Dict
         
         if not user_id:
             unmatched_users.add(str(care_assistant_name))
+            logger.warning(
+                "Row %d: SKIPPED - user not found | Care Assistant=%r, Type=%r, Start=%r, End=%r, StartTime=%r, EndTime=%r",
+                row_num, care_assistant_name, type_str, start_date_val, end_date_val, start_time_val, end_time_val
+            )
             continue
-          
+
         # Parse dates/times
         start_date = parse_date_value(start_date_val)
         end_date = parse_date_value(end_date_val)
         start_time = parse_time_value(start_time_val)
         end_time = parse_time_value(end_time_val)
-        
+
         if not start_date or not start_time or not end_time:
-            logger.warning(f"Row {row_num}: Missing date/time data for {care_assistant_name}")
+            logger.warning(
+                "Row %d: SKIPPED - missing date/time | Care Assistant=%r, Type=%r, Start=%r, End=%r, StartTime=%r, EndTime=%r",
+                row_num, care_assistant_name, type_str, start_date_val, end_date_val, start_time_val, end_time_val
+            )
             continue
         
         # If end_date is missing, assume same day
@@ -313,6 +331,11 @@ def process_xlsx_file(filepath: Path, users_map: Dict[str, int], types_map: Dict
             'notes': notes,
             'source_row': row_num,
         })
+        logger.info(
+            "Row %d: ADDED | user=%r (id=%s), type=%r, core=%s, start=%s end=%s, start_time=%s end_time=%s",
+            row_num, care_assistant_name, user_id, type_str, is_core,
+            start_date, end_date, start_time, end_time
+        )
 
     logger.info(f"\n{'='*60}")
     logger.info("EXCEL PROCESSING SUMMARY")
@@ -408,26 +431,25 @@ def generate_availability_records(records: List[Dict]) -> List[Dict]:
                     'note': rec['notes']
                 })
 
-        # --- UNAVAILABILITY LOGIC ---
+        # --- OTHER TYPES (availability or unavailability from seeded type) ---
         else:
-            # is_temp = True
-            # We must split multi-day unavailabilities into individual days 
-            # to satisfy the 'days' enum constraint and validation logic.
-            
+            # Look up Type in availability_types: use its classification (availability vs unavailability).
+            # is_temp = True, no recurrence; effective_date_from/to = that specific date only.
+            # Split multi-day into individual days to satisfy 'days' enum and validation.
             current_date = start_date
-            
+
             while current_date <= end_date:
                 is_first_day = (current_date == start_date)
                 is_last_day = (current_date == end_date)
-                
+
                 # Calculate chunk times
                 chunk_start = start_time if is_first_day else time(0, 0, 0)
                 chunk_end = end_time if is_last_day else time(23, 59, 59)
-                
+
                 # Adjust for exact overnight edge case (e.g. ends at 00:00 next day)
                 if is_last_day and end_time == time(0, 0, 0):
                     # 00:00 means end of previous day, so this day is empty or full?
-                    # If it's the ONLY day (start==end), 00:00 to 00:00 is invalid, treat as full day? 
+                    # If it's the ONLY day (start==end), 00:00 to 00:00 is invalid, treat as full day?
                     # Or ignore. Let's assume full day for 00:00-00:00 single day.
                     if start_date == end_date:
                         chunk_start = time(0,0,0)
@@ -449,7 +471,7 @@ def generate_availability_records(records: List[Dict]) -> List[Dict]:
                     'start_time': format_time_str(chunk_start),
                     'end_time': format_time_str(chunk_end),
                     'is_temp': True,
-                    'is_unavailability': True,
+                    'is_unavailability': is_unavailability,  # from seeded type (availability vs unavailability)
                     'type_id': type_id,
                     'start_date': None,
                     'end_date': None,
@@ -458,7 +480,7 @@ def generate_availability_records(records: List[Dict]) -> List[Dict]:
                     'effective_date_to': format_date_str(current_date),
                     'note': rec['notes']
                 })
-                
+
                 current_date += timedelta(days=1)
     
     logger.info(f"Generated {len(availabilities)} availability slots")
@@ -574,8 +596,7 @@ def seed_availabilities(connection, availabilities: List[Dict]) -> int:
         
         inserted = cursor.fetchall()
         connection.commit()
-        
-        logger.info(f"✓ Successfully inserted {len(inserted)} availability records")
+        logger.info("SEEDED %d availability records (see Excel row ADDED/SKIPPED logs above for which rows produced them)", len(inserted))
         return len(inserted)
         
     except Exception as e:
@@ -602,9 +623,9 @@ def generate_summary_report(
     report.append(f"   - Valid records extracted: {len(records)}")
     
     core_count = sum(1 for r in records if r['is_core'])
-    unavail_count = len(records) - core_count
+    other_count = len(records) - core_count
     report.append(f"   - Core Availabilities: {core_count}")
-    report.append(f"   - Unavailabilities: {unavail_count}")
+    report.append(f"   - Other types (temp, by seeded type): {other_count}")
     report.append(f"   - Unmatched users: {len(unmatched_users)}")
     
     if unmatched_users:
@@ -616,7 +637,11 @@ def generate_summary_report(
     
     report.append(f"\n📋 GENERATED RECORDS:")
     report.append(f"   - Total slots to insert: {len(availabilities)}")
-    
+    temp_avail = sum(1 for a in availabilities if a.get('is_temp') and not a.get('is_unavailability'))
+    temp_unavail = sum(1 for a in availabilities if a.get('is_temp') and a.get('is_unavailability'))
+    report.append(f"   - Temp availability: {temp_avail}")
+    report.append(f"   - Temp unavailability: {temp_unavail}")
+
     report.append(f"\n✅ DATABASE:")
     report.append(f"   - Records inserted: {inserted_count}")
     
@@ -630,7 +655,7 @@ def run(xlsx_path: Optional[str] = None) -> bool:
     ╔══════════════════════════════════════════════════════════════╗
     ║   USER AVAILABILITY MIGRATION                                ║
     ║   - Core: Recurring (Start Date - 28d)                       ║
-    ║   - Others: Temp Unavailability (Exact Date)                 ║
+    ║   - Others: Temp availability/unavailability by type (Exact Date) ║
     ╚══════════════════════════════════════════════════════════════╝
     """)
     

@@ -29,7 +29,8 @@ jobs:
 
       - name: Build executable
         run: |
-          pyinstaller --onefile --noconfirm --clean --name AOS-Migration-Wizard `
+          $addData = if (Test-Path favicon.png) { ' --add-data "favicon.png;."' } else { '' }
+          pyinstaller --onefile --noconfirm --clean --name AOS-Migration-Wizard $addData `
             --hidden-import=areaMigration --hidden-import=availabilityTypeMigration `
             --hidden-import=clientAvailabilityMigration --hidden-import=clientLocationsMigration `
             --hidden-import=clientsMigration --hidden-import=distance_migration `
@@ -38,11 +39,20 @@ jobs:
             --hidden-import=usersMigration --hidden-import=tests --hidden-import=tests.test_before_run --hidden-import=migration_support `
             wizard.py
 
+      - name: Create zip (exe + logo when present)
+        run: |
+          New-Item -ItemType Directory -Force -Path release_zip
+          Copy-Item dist/AOS-Migration-Wizard.exe release_zip/
+          if (Test-Path favicon.png) { Copy-Item favicon.png release_zip/ }
+          Compress-Archive -Path release_zip/* -DestinationPath dist/AOS-Migration-Wizard-windows.zip
+
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
         with:
           name: AOS-Migration-Wizard-windows
-          path: dist/AOS-Migration-Wizard.exe
+          path: |
+            dist/AOS-Migration-Wizard.exe
+            dist/AOS-Migration-Wizard-windows.zip
 
   build-macos:
     name: macOS (app + dmg)
@@ -65,7 +75,9 @@ jobs:
 
       - name: Build .app with PyInstaller
         run: |
-          pyinstaller --noconfirm --clean --onedir --windowed --name AOS-Migration-Wizard \
+          ADD_DATA=""
+          if [ -f favicon.png ]; then ADD_DATA=' --add-data "favicon.png:."'; fi
+          pyinstaller --noconfirm --clean --onedir --windowed --name AOS-Migration-Wizard $ADD_DATA \
             --hidden-import=areaMigration --hidden-import=availabilityTypeMigration \
             --hidden-import=clientAvailabilityMigration --hidden-import=clientLocationsMigration \
             --hidden-import=clientsMigration --hidden-import=distance_migration \
@@ -111,6 +123,14 @@ jobs:
             "dist/$DMG_NAME" \
             dmg_content
 
+      - name: Create zip (app + dmg + logo when present)
+        run: |
+          mkdir -p release_zip
+          cp -R dist/AOS-Migration-Wizard.app release_zip/
+          cp dist/AOS-Migration-Wizard-1.0.0.dmg release_zip/ 2>/dev/null || true
+          [ -f favicon.png ] && cp favicon.png release_zip/
+          cd release_zip && zip -r ../dist/AOS-Migration-Wizard-macos.zip . && cd ..
+
       - name: Upload macOS artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -118,6 +138,7 @@ jobs:
           path: |
             dist/AOS-Migration-Wizard.app
             dist/AOS-Migration-Wizard-1.0.0.dmg
+            dist/AOS-Migration-Wizard-macos.zip
 
   build-linux:
     name: Linux (binary)
@@ -140,7 +161,9 @@ jobs:
 
       - name: Build executable
         run: |
-          pyinstaller --onefile --noconfirm --clean --name AOS-Migration-Wizard \
+          ADD_DATA=""
+          [ -f favicon.png ] && ADD_DATA=' --add-data "favicon.png:."'
+          pyinstaller --onefile --noconfirm --clean --name AOS-Migration-Wizard $ADD_DATA \
             --hidden-import=areaMigration --hidden-import=availabilityTypeMigration \
             --hidden-import=clientAvailabilityMigration --hidden-import=clientLocationsMigration \
             --hidden-import=clientsMigration --hidden-import=distance_migration \
@@ -149,8 +172,17 @@ jobs:
             --hidden-import=usersMigration --hidden-import=tests --hidden-import=tests.test_before_run --hidden-import=migration_support \
             wizard.py
 
+      - name: Create zip (binary + logo when present)
+        run: |
+          mkdir -p release_zip
+          cp dist/AOS-Migration-Wizard release_zip/
+          [ -f favicon.png ] && cp favicon.png release_zip/
+          cd release_zip && zip -r ../dist/AOS-Migration-Wizard-linux.zip . && cd ..
+
       - name: Upload Linux artifact
         uses: actions/upload-artifact@v4
         with:
           name: AOS-Migration-Wizard-linux
-          path: dist/AOS-Migration-Wizard
+          path: |
+            dist/AOS-Migration-Wizard
+            dist/AOS-Migration-Wizard-linux.zip

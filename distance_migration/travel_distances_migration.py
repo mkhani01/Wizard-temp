@@ -189,8 +189,14 @@ def run():
 
         def add_rows(dist_map, dur_map, from_type, to_type, db_enum_method):
             nonlocal batch_data, processed_count
+            skipped_null = 0
             for (from_id, to_id), dist_km in dist_map.items():
                 if dist_km is None:
+                    skipped_null += 1
+                    logger.debug(
+                        "SKIPPED - null distance | from_type=%s from_id=%s to_type=%s to_id=%s method=%s",
+                        from_type, from_id, to_type, to_id, db_enum_method
+                    )
                     continue
                 dur_min = dur_map.get((from_id, to_id), 0)
                 distance_meters = int(round(dist_km * 1000))
@@ -213,6 +219,8 @@ def run():
                 processed_count += 1
                 if len(batch_data) >= DB_INSERT_BATCH_SIZE:
                     flush_batch()
+            if skipped_null:
+                logger.info("  Skipped %d pairs with null distance (%s→%s, %s)", skipped_null, from_type, to_type, db_enum_method)
 
         for osrm_method in OSRM_METHODS:
             db_enum_method = TRAVEL_METHOD_MAP[osrm_method]

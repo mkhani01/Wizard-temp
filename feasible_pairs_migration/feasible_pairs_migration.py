@@ -298,79 +298,95 @@ def extract_visit_frequencies_from_csv(csv_path, users_lookup, clients_lookup):
 
     with open(csv_path, 'r', encoding='utf-8') as file:
         reader = csv.DictReader(file)
-        
+        row_num = 0
+
         for row in reader:
+            row_num += 1
             stats['total_rows'] += 1
             processed += 1
-            
+
             # Filter: Only process Personal Care rows
             if not is_personal_care_row(row):
                 stats['skipped_non_personal_care'] += 1
+                logger.warning(
+                    "Row %d: SKIPPED - not Personal Care | Employee=%r, Location=%r, ServiceType=%r",
+                    row_num, row.get('Planned Employee Name'), row.get('Service Location Name'), row.get('Planned Service Type Description')
+                )
                 continue
-            
+
             stats['personal_care_rows'] += 1
-            
+
             # Get employee name (caregiver) from "Planned Employee Name"
             employee_name = get_employee_name(row)
-            
             # Get client name from "Service Location Name"
             service_location_name = get_service_location_name(row)
-            
+
             if not employee_name or not service_location_name:
+                logger.warning(
+                    "Row %d: SKIPPED - missing employee or client name | Employee=%r, Location=%r",
+                    row_num, employee_name, service_location_name
+                )
                 continue
-            
+
             # Parse employee name into first name and last name
-            # Format: "lastname, firstname"
             employee_first, employee_last = parse_full_name(employee_name)
-            
             # Parse service location name into first name and last name
-            # Format: "lastname, firstname"
             client_first, client_last = parse_full_name(service_location_name)
-            
+
             if not employee_first or not employee_last:
                 stats['unmatched_caregivers'].add(employee_name)
+                logger.warning(
+                    "Row %d: SKIPPED - could not parse caregiver name | Employee=%r, Location=%r",
+                    row_num, employee_name, service_location_name
+                )
                 continue
-            
+
             if not client_first or not client_last:
                 stats['unmatched_clients'].add(service_location_name)
+                logger.warning(
+                    "Row %d: SKIPPED - could not parse client name | Employee=%r, Location=%r",
+                    row_num, employee_name, service_location_name
+                )
                 continue
-            
+
             # Look up caregiver in users table
             caregiver_key = (employee_first.lower(), employee_last.lower())
             caregiver_id = users_lookup.get(caregiver_key)
-            
-            # If not found, try variations
             if not caregiver_id:
-                # Try with just the first part of first name
                 first_part = employee_first.split()[0] if employee_first else ''
                 alt_key = (first_part.lower(), employee_last.lower())
                 caregiver_id = users_lookup.get(alt_key)
-            
+
             # Look up client in clients table
             client_key = (client_first.lower(), client_last.lower())
             client_id = clients_lookup.get(client_key)
-            
-            # If not found, try variations
             if not client_id:
-                # Try with just the first part of first name
                 first_part = client_first.split()[0] if client_first else ''
                 alt_key = (first_part.lower(), client_last.lower())
                 client_id = clients_lookup.get(alt_key)
-            
+
             # Record the pair if both found
             if caregiver_id and client_id:
                 pair_key = (caregiver_id, client_id)
                 frequencies[pair_key] += 1
                 stats['valid_rows'] += 1
+                logger.info(
+                    "Row %d: ADDED | caregiver=%r (id=%s), client=%r (id=%s), frequency=%d",
+                    row_num, employee_name, caregiver_id, service_location_name, client_id, frequencies[pair_key]
+                )
             else:
                 if not caregiver_id:
                     stats['unmatched_caregivers'].add(employee_name)
                 if not client_id:
                     stats['unmatched_clients'].add(service_location_name)
-            
+                logger.warning(
+                    "Row %d: SKIPPED - unmatched | caregiver=%r (found=%s), client=%r (found=%s)",
+                    row_num, employee_name, caregiver_id is not None, service_location_name, client_id is not None
+                )
+
             # Log progress every batch
             if processed % batch_size == 0:
-                logger.info(f"  Processed {processed} rows...")
+                logger.info("  Processed %d rows...", processed)
     
     # Calculate total matched pairs (sum of all frequencies)
     stats['matched_pairs'] = len(frequencies)

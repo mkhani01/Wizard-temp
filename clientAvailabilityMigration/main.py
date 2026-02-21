@@ -281,32 +281,46 @@ def process_xlsx_file(filepath: Path, clients_map: Dict[str, int]) -> Tuple[Dict
             is_empty = not service_location_name
         
         if is_empty:
+            logger.warning(
+                "Row %d: SKIPPED - empty Service Location Name | Type=%r, ReqType=%r, Start=%r, End=%r",
+                row_num, service_type_desc, service_req_type_desc, start_datetime_val, end_datetime_val
+            )
             continue
-        
+
         service_type_str = str(service_type_desc).strip() if service_type_desc else ''
         service_req_type_str = str(service_req_type_desc).strip() if service_req_type_desc else ''
-        
+
         if service_type_str.lower() != 'personal care' or service_req_type_str.lower() != 'personal care':
             skipped_non_personal_care += 1
+            logger.warning(
+                "Row %d: SKIPPED - not Personal Care | Location=%r, Type=%r, ReqType=%r, Start=%r, End=%r",
+                row_num, service_location_name, service_type_str, service_req_type_str, start_datetime_val, end_datetime_val
+            )
             continue
-        
+
         client_key = str(service_location_name).strip().lower()
-        
+
         client_id = clients_map.get(client_key)
         if not client_id:
             unmatched_clients.add(str(service_location_name))
-            logger.warning(f"Row {row_num}: Client not found - '{service_location_name}'")
+            logger.warning(
+                "Row %d: SKIPPED - client not found | Location=%r, Type=%r, ReqType=%r, Start=%r, End=%r",
+                row_num, service_location_name, service_type_str, service_req_type_str, start_datetime_val, end_datetime_val
+            )
             continue
-        
+
         start_datetime = parse_datetime_value(start_datetime_val)
         end_datetime = parse_datetime_value(end_datetime_val)
-        
+
         # Extra safety check for None/NaT values
         if not start_datetime or not end_datetime:
             skipped_missing_data += 1
-            logger.warning(f"Row {row_num}: Missing datetime for '{service_location_name}'")
+            logger.warning(
+                "Row %d: SKIPPED - missing datetime | Location=%r, Start=%r, End=%r",
+                row_num, service_location_name, start_datetime_val, end_datetime_val
+            )
             continue
-        
+
         # Ensure we have actual datetime objects
         try:
             start_date_val = start_datetime.date()
@@ -314,9 +328,12 @@ def process_xlsx_file(filepath: Path, clients_map: Dict[str, int]) -> Tuple[Dict
             end_time_val = end_datetime.time()
         except (ValueError, AttributeError) as e:
             skipped_missing_data += 1
-            logger.warning(f"Row {row_num}: Invalid datetime for '{service_location_name}': {e}")
+            logger.warning(
+                "Row %d: SKIPPED - invalid datetime | Location=%r, Start=%r, End=%r, error=%s",
+                row_num, service_location_name, start_datetime_val, end_datetime_val, e
+            )
             continue
-        
+
         client_records[client_id].append({
             'client_id': client_id,
             'client_name': service_location_name,
@@ -328,7 +345,11 @@ def process_xlsx_file(filepath: Path, clients_map: Dict[str, int]) -> Tuple[Dict
             'day_of_week': get_day_of_week(start_date_val),
             'source_row': row_num,
         })
-    
+        logger.info(
+            "Row %d: ADDED | client=%r (id=%s), start=%s %s, end_time=%s, day=%s",
+            row_num, service_location_name, client_id, start_date_val, start_time_val, end_time_val, get_day_of_week(start_date_val)
+        )
+
     logger.info(f"\n{'='*60}")
     logger.info("EXCEL PROCESSING SUMMARY")
     logger.info(f"{'='*60}")

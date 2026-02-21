@@ -72,32 +72,38 @@ def load_user_locations_from_json(json_path):
     # Extract location data
     user_locations = []
     skipped = 0
-    
-    for user in users:
+
+    for idx, user in enumerate(users):
         name = user.get('name', '').strip()
         lastname = user.get('lastname', '').strip()
         latitude = user.get('latitude')
         longitude = user.get('longitude')
-        
-        # Skip if missing required fields
+
         if not name or not lastname:
             skipped += 1
+            logger.warning(
+                "Item %d: SKIPPED - missing name/lastname | name=%r, lastname=%r, lat=%r, long=%r",
+                idx + 1, name, lastname, latitude, longitude
+            )
             continue
-        
-        # Skip if no location data
+
         if latitude is None or longitude is None:
             skipped += 1
+            logger.warning(
+                "Item %d: SKIPPED - missing coordinates | name=%r, lastname=%r, lat=%r, long=%r",
+                idx + 1, name, lastname, latitude, longitude
+            )
             continue
-        
+
         user_locations.append({
             'name': name,
             'lastname': lastname,
             'latitude': latitude,
             'longitude': longitude
         })
-    
-    logger.info(f"Extracted {len(user_locations)} users with location data")
-    logger.info(f"Skipped {skipped} users (missing name/lastname or coordinates)")
+        logger.info("Item %d: ADDED | name=%r, lastname=%r, lat=%s, long=%s", idx + 1, name, lastname, latitude, longitude)
+
+    logger.info("Extracted %d users with location data; skipped %d", len(user_locations), skipped)
     
     return user_locations
 
@@ -137,7 +143,7 @@ def update_user_locations(connection, user_locations):
             
             if len(matches) == 0:
                 not_found_count += 1
-                logger.warning(f"User not found: {name} {lastname}")
+                logger.warning("SEED SKIP - user not found | name=%r, lastname=%r, lat=%s, long=%s", name, lastname, latitude, longitude)
                 failed_updates.append({
                     'name': name,
                     'lastname': lastname,
@@ -147,14 +153,14 @@ def update_user_locations(connection, user_locations):
             
             if len(matches) > 1:
                 multiple_matches_count += 1
-                logger.warning(f"Multiple users found for: {name} {lastname} ({len(matches)} matches)")
+                logger.warning("SEED SKIP - multiple users found | name=%r, lastname=%r, matches=%d", name, lastname, len(matches))
                 failed_updates.append({
                     'name': name,
                     'lastname': lastname,
-                    'reason': f'multiple_matches_{len(matches)}'
+                    'reason': 'multiple_matches_%d' % len(matches)
                 })
                 continue
-            
+
             # Update the user
             user_id = matches[0]['id']
             cursor.execute(
@@ -167,11 +173,8 @@ def update_user_locations(connection, user_locations):
                 """,
                 (latitude, longitude, user_id)
             )
-            
             updated_count += 1
-            
-            if updated_count <= 5:
-                logger.info(f"✓ Updated: {name} {lastname} (ID: {user_id}) -> ({latitude}, {longitude})")
+            logger.info("  SEEDED user location id=%s name=%r lastname=%r lat=%s long=%s", user_id, name, lastname, latitude, longitude)
         
         connection.commit()
         

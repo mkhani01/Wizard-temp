@@ -4,6 +4,7 @@ Seeds user table from CSV and links to groups
 """
 
 import os
+import re
 import csv
 import logging
 from pathlib import Path
@@ -178,10 +179,30 @@ def clean_excel_value(value):
     return value.strip()
 
 
+def make_unique_email_placeholder(first_name, last_name, used_emails):
+    """Generate unique placeholder email: firstname+lastname@AOSsystem.com (sanitized, unique)."""
+    # Sanitize for email: lowercase, only keep chars valid in local part
+    safe_first = re.sub(r'[^a-zA-Z0-9]', '', (first_name or ''))
+    safe_last = re.sub(r'[^a-zA-Z0-9]', '', (last_name or ''))
+    if not safe_first:
+        safe_first = 'user'
+    if not safe_last:
+        safe_last = 'unknown'
+    base = f"{safe_first}+{safe_last}@AOSsystem.com".lower()
+    candidate = base
+    suffix = 1
+    while candidate in used_emails:
+        suffix += 1
+        candidate = f"{safe_first}+{safe_last}{suffix}@AOSsystem.com".lower()
+    used_emails.add(candidate)
+    return candidate
+
+
 def extract_users_from_csv(csv_path, lookups):
     """Extract user data from CSV and map to database fields"""
     users = []
-    stats = {"skipped_no_email": 0, "skipped_no_name": 0, "warn_no_phone": 0}
+    used_emails = set()
+    stats = {"skipped_no_name": 0, "warn_no_phone": 0, "placeholder_email": 0}
     
     logger.info("Reading CSV: %s", csv_path)
     
@@ -192,21 +213,11 @@ def extract_users_from_csv(csv_path, lookups):
         for row in reader:
             row_num += 1
             
-            # Skip if no email (required field)
-            email = row.get('Email', '').strip().lower()
-            if not email:
-                stats["skipped_no_email"] += 1
-                logger.warning(
-                    "Row %d: Skipping - no email (First Name=%r, Last Name=%r)",
-                    row_num, row.get('First Name', '').strip(), row.get('Last Name', '').strip()
-                )
-                continue
-            
-            # Basic fields
+            # Basic fields first (need name for placeholder if email missing)
             first_name = row.get('First Name', '').strip()
             last_name = row.get('Last Name', '').strip()
             
-            # If Last Name is empty but First Name contains spaces, split: "Mary Scullion" or "Mrs Mary Scullion" -> Mary, Scullion
+            # If Last Name is empty but First Name contains spaces, split
             if not last_name and first_name and ' ' in first_name:
                 parts = first_name.split()
                 titles = {'Mr', 'Mrs', 'Miss', 'Ms', 'Dr', 'Prof', 'Mr.', 'Mrs.', 'Miss.', 'Ms.', 'Dr.', 'Prof.'}
@@ -223,10 +234,25 @@ def extract_users_from_csv(csv_path, lookups):
             if not first_name or not last_name:
                 stats["skipped_no_name"] += 1
                 logger.warning(
-                    "Row %d: Skipping - missing name (First Name=%r, Last Name=%r, Email=%r)",
-                    row_num, first_name, last_name, email
+                    "Row %d: SKIPPED - missing name | First Name=%r, Last Name=%r, Email=%r, Title=%r, Mobile=%r, Home=%r",
+                    row_num, first_name, last_name, row.get('Email', ''), row.get('Title', ''), row.get('Mobile', ''), row.get('Home', '')
                 )
                 continue
+            
+            # Email: use from CSV or unique placeholder when missing
+            email_raw = row.get('Email', '').strip().lower()
+            if email_raw:
+                email = email_raw
+                if email in used_emails:
+                    logger.warning("Row %d: Duplicate email %r; may conflict on insert.", row_num, email)
+                used_emails.add(email)
+            else:
+                email = make_unique_email_placeholder(first_name, last_name, used_emails)
+                stats["placeholder_email"] += 1
+                logger.info(
+                    "Row %d: No email - using placeholder | email=%r | name=%r, lastname=%r",
+                    row_num, email, first_name, last_name
+                )
             
             # Phone number (prefer Mobile, fallback to Home) - clean Excel formatting
             mobile = clean_excel_value(row.get('Mobile', ''))
@@ -307,10 +333,14 @@ def extract_users_from_csv(csv_path, lookups):
             }
             
             users.append(user_data)
+            logger.info(
+                "Row %d: ADDED | email=%r, name=%r, lastname=%r, phone=%r, status=%s",
+                row_num, email, first_name, last_name, phone or '(none)', user_data['status']
+            )
     
     logger.info(
-        "Extracted %d users from CSV. Skipped: %d (no email), %d (no name). Warnings: %d (no phone).",
-        len(users), stats["skipped_no_email"], stats["skipped_no_name"], stats["warn_no_phone"]
+        "Extracted %d users from CSV. Skipped: %d (no name). Placeholder email used: %d. Warnings (no phone): %d.",
+        len(users), stats["skipped_no_name"], stats["placeholder_email"], stats["warn_no_phone"]
     )
     return users
 
@@ -434,14 +464,9 @@ def seed_users(connection, users):
         
         connection.commit()
         
-        logger.info(f"\n✓ Successfully processed {len(processed)} users (inserted/updated)")
-        
-        # Show sample of processed users
-        logger.info("\nSample processed users:")
-        for i, row in enumerate(processed[:5]):
-            logger.info(f"  - {row['email']} (ID: {row['id']})")
-        if len(processed) > 5:
-            logger.info(f"  ... and {len(processed) - 5} more")
+        logger.info("Successfully processed %d users (inserted/updated)", len(processed))
+        for i, row in enumerate(processed):
+            logger.info("  SEEDED user id=%s email=%r", row['id'], row['email'])
         
         return True
         

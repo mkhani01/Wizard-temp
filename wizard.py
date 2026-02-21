@@ -173,9 +173,10 @@ class MigrationWizard:
         self.root.geometry("720x580")
 
         # Window icon (favicon) – keep reference so it persists, especially on Mac
+        # When frozen, logo is bundled via PyInstaller --add-data (in BUNDLE_ROOT); else next to exe/script
         self.icon_photo = None
         self.logo_photo = None
-        favicon = PROJECT_ROOT / "favicon.png"
+        favicon = (BUNDLE_ROOT / "favicon.png") if (getattr(sys, "frozen", False) and (BUNDLE_ROOT / "favicon.png").exists()) else (PROJECT_ROOT / "favicon.png")
         if favicon.exists():
             try:
                 from PIL import Image, ImageTk
@@ -262,10 +263,21 @@ class MigrationWizard:
         btn_frame.grid(row=2, column=0, columnspan=2, sticky=E, pady=(12, 0))
         self.btn_cancel = ttk.Button(btn_frame, text="Cancel", command=self._on_cancel)
         self.btn_cancel.pack(side="right", padx=4)
+        self.btn_continue_next = ttk.Button(btn_frame, text="Continue from next", command=self._on_continue_from_next)
+        self.btn_continue_next.pack(side="right", padx=4)
+        self.btn_continue_next.pack_forget()
+        self.btn_retry = ttk.Button(btn_frame, text="Retry failed step", command=self._on_retry_migration)
+        self.btn_retry.pack(side="right", padx=4)
+        self.btn_retry.pack_forget()
         self.btn_back = ttk.Button(btn_frame, text="Back", command=self._on_back)
         self.btn_back.pack(side="right", padx=4)
         self.btn_continue = ttk.Button(btn_frame, text="Continue", command=self._on_continue)
         self.btn_continue.pack(side="right", padx=4)
+        # Run state: cancel flag, order snapshot, failed index for retry/continue
+        self._run_cancelled = False
+        self._run_order = []
+        self._run_failed_index = None
+        self._run_log_path = None
 
     def _add_step_header(self, parent, start_row=0):
         """Add logo at top of step. Returns next row index. Keeps logo reference on parent."""
@@ -463,18 +475,56 @@ class MigrationWizard:
             wraplength=560, padding=(0, 4)
         ).grid(row=row, column=0, columnspan=3, sticky=W, pady=(0, 12))
         row += 1
-        self._files_start_row = row
+        row_for_scroll = row
+        # Scrollable area so file list is scrollable when many options are selected
+        canvas = Canvas(parent, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        scroll_frame = ttk.Frame(canvas)
+        scroll_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox(ALL)))
+        canvas_window = canvas.create_window((0, 0), window=scroll_frame, anchor=NW)
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        def _on_canvas_configure(event):
+            canvas.itemconfig(canvas_window, width=event.width)
+
+        def _on_mousewheel(event):
+            d = getattr(event, "delta", 0)
+            units = int(-d / 120) if abs(d) >= 100 else (-1 if d > 0 else 1)
+            canvas.yview_scroll(units, "units")
+
+        def _on_mousewheel_linux(event):
+            if event.num == 5:
+                canvas.yview_scroll(1, "units")
+            elif event.num == 4:
+                canvas.yview_scroll(-1, "units")
+
+        canvas.bind("<Configure>", _on_canvas_configure)
+        canvas.bind("<MouseWheel>", _on_mousewheel)
+        canvas.bind("<Button-4>", _on_mousewheel_linux)
+        canvas.bind("<Button-5>", _on_mousewheel_linux)
+        scroll_frame.bind("<MouseWheel>", _on_mousewheel)
+        scroll_frame.bind("<Button-4>", _on_mousewheel_linux)
+        scroll_frame.bind("<Button-5>", _on_mousewheel_linux)
+
+        canvas.grid(row=row_for_scroll, column=0, columnspan=3, sticky=(N, S, E, W))
+        scrollbar.grid(row=row_for_scroll, column=3, sticky=(N, S))
+        parent.columnconfigure(0, weight=1)
+        parent.columnconfigure(1, weight=1)
+        parent.rowconfigure(row_for_scroll, weight=1)
+        self._files_scroll_frame = scroll_frame
+        self._files_canvas = canvas
+        self._files_start_row = 0  # row inside scroll_frame
         self.file_rows = []
         self.file_widgets = []
-        parent.columnconfigure(1, weight=1)
+        scroll_frame.columnconfigure(1, weight=1)
 
     def _refresh_file_step(self):
         for w in self.file_rows:
             w.destroy()
         self.file_rows.clear()
         self.file_widgets.clear()
-        parent = self.frames[STEP_FILES]
-        row = getattr(self, "_files_start_row", 2)
+        parent = getattr(self, "_files_scroll_frame", self.frames[STEP_FILES])
+        row = getattr(self, "_files_start_row", 0)
         selected = [k for k, v in self.check_vars.items() if v.get()]
         # Geocode API: show IE.txt and optional API key
         if OPT_GEOCODE_API in selected:
@@ -520,6 +570,10 @@ class MigrationWizard:
             self.file_rows.extend([e, b])
             self.file_widgets.append((key, var, row))
             row += 1
+        # Ensure scroll region updates after content is built
+        if getattr(self, "_files_canvas", None):
+            self._files_canvas.update_idletasks()
+            self._files_canvas.configure(scrollregion=self._files_canvas.bbox(ALL))
 
     def _browse_file(self, var: StringVar, parent):
         path = filedialog.askopenfilename(parent=parent, title="Select file")
@@ -581,7 +635,7 @@ class MigrationWizard:
         row += 1
         ttk.Label(
             parent,
-            text="Do not close this window until the migration finishes. The log below shows progress; a full detailed log file (with every step and any warnings) will be saved to the project folder when done. If any step fails, check that log file for the cause.",
+            text="Do not close this window until the migration finishes. You can click Cancel to stop between steps. If a step fails (e.g. database connection lost), use \"Retry failed step\" after fixing the issue, or \"Continue from next\" to skip and run the rest. The log below shows progress; a full log file will be saved to the project folder.",
             wraplength=560, padding=(0, 4)
         ).grid(row=row, column=0, sticky=W, pady=(0, 10))
         row += 1
@@ -613,7 +667,9 @@ class MigrationWizard:
         if step == STEP_RUN:
             self.btn_continue.config(state="disabled")
             self.btn_back.config(state="disabled")
-            self.btn_cancel.config(state="disabled")
+            self.btn_cancel.config(state="normal")
+            self.btn_cancel.config(text="Cancel")
+            self._hide_retry_continue_buttons()
         else:
             self.btn_continue.config(state="normal")
             self.btn_cancel.config(state="normal")
@@ -622,10 +678,39 @@ class MigrationWizard:
             else:
                 self.btn_continue.config(text="Continue")
 
+    def _hide_retry_continue_buttons(self):
+        self.btn_retry.pack_forget()
+        self.btn_continue_next.pack_forget()
+
+    def _show_retry_continue_buttons(self):
+        self.btn_retry.pack(side="right", padx=4)
+        if self._run_failed_index is not None and self._run_order and self._run_failed_index + 1 < len(self._run_order):
+            self.btn_continue_next.pack(side="right", padx=4)
+
     def _on_cancel(self):
+        if self.current_step == STEP_RUN and getattr(self, "_run_in_progress", False):
+            if messagebox.askyesno("Cancel", "Stop the migration? You can retry or continue from the next step when it stops."):
+                self._run_cancelled = True
+            return
         if messagebox.askyesno("Cancel", "Are you sure you want to cancel the wizard?"):
             self.root.quit()
             self.root.destroy()
+
+    def _on_retry_migration(self):
+        if self._run_order and self._run_failed_index is not None:
+            self._run_migrations(start_from=self._run_failed_index)
+        else:
+            self._run_migrations(start_from=0)
+
+    def _on_continue_from_next(self):
+        if self._run_order and self._run_failed_index is not None:
+            next_idx = self._run_failed_index + 1
+            if next_idx >= len(self._run_order):
+                messagebox.showinfo("Continue", "No more steps to run.")
+                return
+            self._run_migrations(start_from=next_idx)
+        else:
+            messagebox.showinfo("Continue", "Nothing to continue. Start a new migration from the summary step.")
 
     def _on_back(self):
         if self.current_step > 0:
@@ -720,13 +805,27 @@ class MigrationWizard:
                     return False
         return True
 
-    def _run_migrations(self):
-        self.run_progress.start(10)
-        log_path = PROJECT_ROOT / ("migration_wizard_%s.log" % datetime.now().strftime("%Y%m%d_%H%M%S"))
-        self._append_log("Log file: %s\n" % log_path)
-        self._append_log("Setting environment and copying files...\n")
+    def _run_migrations(self, start_from=0):
+        self._run_cancelled = False
+        self._run_failed_index = None
+        self._run_in_progress = True
+        self._hide_retry_continue_buttons()
+        if start_from > 0 and self._run_order:
+            order = self._run_order
+        else:
+            order = self._migration_order()
+            self._run_order = order
+        if start_from > 0:
+            log_path = self._run_log_path or (PROJECT_ROOT / ("migration_wizard_%s.log" % datetime.now().strftime("%Y%m%d_%H%M%S")))
+            self._run_log_path = log_path
+            self._append_log("\n--- Resuming from step %d: %s ---\n" % (start_from + 1, order[start_from][0]))
+        else:
+            log_path = PROJECT_ROOT / ("migration_wizard_%s.log" % datetime.now().strftime("%Y%m%d_%H%M%S"))
+            self._run_log_path = log_path
+            self._append_log("Log file: %s\n" % log_path)
+            self._append_log("Setting environment and copying files...\n")
         self.root.update()
-        thread = threading.Thread(target=self._do_run, args=(log_path,), daemon=True)
+        thread = threading.Thread(target=self._do_run, args=(log_path, order, start_from), daemon=True)
         thread.start()
 
     def _append_log(self, msg: str):
@@ -736,8 +835,11 @@ class MigrationWizard:
         self.run_log.config(state="disabled")
         self.root.update_idletasks()
 
-    def _do_run(self, log_path: Path):
+    def _do_run(self, log_path: Path, order: list, start_from: int = 0):
         import io
+        had_failure = False
+        had_cancel = False
+        failed_index = None
         os.chdir(PROJECT_ROOT)
         if str(BUNDLE_ROOT) not in sys.path:
             sys.path.insert(0, str(BUNDLE_ROOT))
@@ -752,71 +854,95 @@ class MigrationWizard:
         root_logger.addHandler(handler)
         root_logger.addHandler(console_handler)
         try:
-            self.root.after(0, lambda: self._append_log("Running pre-run checks...\n"))
-            try:
-                from tests.test_before_run import run_all as run_pre_run_checks
-                old_stdout, sys.stdout = sys.stdout, buf
+            if start_from == 0:
+                self.root.after(0, lambda: self._append_log("Running pre-run checks...\n"))
                 try:
-                    checks_ok = run_pre_run_checks()
-                finally:
-                    sys.stdout = old_stdout
-                check_output = buf.getvalue()
-                if check_output:
-                    print(check_output, end="", flush=True)
-                for line in check_output.splitlines():
-                    self.root.after(0, lambda l=line: self._append_log(l + "\n"))
-                if not checks_ok:
-                    self.root.after(0, lambda: self._append_log("Pre-run checks failed. Fix the issues above and try again.\n"))
+                    from tests.test_before_run import run_all as run_pre_run_checks
+                    old_stdout, sys.stdout = sys.stdout, buf
+                    try:
+                        checks_ok = run_pre_run_checks()
+                    finally:
+                        sys.stdout = old_stdout
+                    check_output = buf.getvalue()
+                    if check_output:
+                        print(check_output, end="", flush=True)
+                    for line in check_output.splitlines():
+                        self.root.after(0, lambda l=line: self._append_log(l + "\n"))
+                    if not checks_ok:
+                        self.root.after(0, lambda: self._append_log("Pre-run checks failed. Fix the issues above and try again.\n"))
+                        log_content = buf.getvalue()
+                        log_path.write_text(log_content, encoding="utf-8")
+                        self.run_progress.stop()
+                        self.root.after(0, lambda: self._run_finished(log_path, log_content, True, False, None))
+                        return
+                except Exception as e:
+                    self.root.after(0, lambda err=str(e): self._append_log("Pre-run checks error: %s\n" % err))
+                    logging.exception("Pre-run checks failed")
                     log_content = buf.getvalue()
                     log_path.write_text(log_content, encoding="utf-8")
                     self.run_progress.stop()
-                    self.root.after(0, lambda: self._run_finished(log_path, log_content))
+                    self.root.after(0, lambda: self._run_finished(log_path, log_content, True, False, None))
                     return
-            except Exception as e:
-                self.root.after(0, lambda err=str(e): self._append_log("Pre-run checks error: %s\n" % err))
-                logging.exception("Pre-run checks failed")
-                log_content = buf.getvalue()
-                log_path.write_text(log_content, encoding="utf-8")
-                self.run_progress.stop()
-                self.root.after(0, lambda: self._run_finished(log_path, log_content))
-                return
             self._apply_env()
-            self._copy_files()
-            order = self._migration_order()
-            for i, (name, fn) in enumerate(order):
+            if start_from == 0:
+                self._copy_files()
+            for i in range(start_from, len(order)):
+                if getattr(self, "_run_cancelled", False):
+                    had_cancel = True
+                    failed_index = i
+                    self.root.after(0, lambda: self._append_log("\nMigration cancelled by user.\n"))
+                    break
+                name, fn = order[i]
                 self.root.after(0, lambda n=name: self._append_log("Running: %s\n" % n))
                 try:
                     success = fn()
                     self.root.after(0, lambda n=name, s=success: self._append_log("  %s: %s\n" % (n, "OK" if s else "FAILED")))
                     if not success:
-                        self.root.after(0, lambda: self._append_log("\nMigration stopped due to failure.\n"))
+                        had_failure = True
+                        failed_index = i
+                        self.root.after(0, lambda: self._append_log("\nMigration stopped due to failure. You can Retry this step or Continue from the next.\n"))
                         break
                 except (ImportError, ModuleNotFoundError, AttributeError) as e:
                     self.root.after(0, lambda n=name: self._append_log("  %s: Not available yet (add your migration script later).\n" % n))
                     logging.info("Migration %s not available: %s", name, e)
                 except Exception as e:
+                    had_failure = True
+                    failed_index = i
                     self.root.after(0, lambda n=name, err=str(e): self._append_log("  %s: ERROR %s\n" % (n, err)))
                     logging.exception("Migration %s failed", name)
+                    self.root.after(0, lambda: self._append_log("\nYou can Retry this step (e.g. after fixing DB connection) or Continue from the next.\n"))
                     break
             else:
-                self.root.after(0, lambda: self._append_log("\nAll selected steps completed.\n"))
+                if not getattr(self, "_run_cancelled", False):
+                    self.root.after(0, lambda: self._append_log("\nAll selected steps completed.\n"))
         finally:
             root_logger.removeHandler(handler)
             root_logger.removeHandler(console_handler)
             log_content = buf.getvalue()
             try:
-                log_path.write_text(log_content, encoding="utf-8")
+                if start_from > 0:
+                    with open(log_path, "a", encoding="utf-8") as f:
+                        f.write(log_content)
+                else:
+                    log_path.write_text(log_content, encoding="utf-8")
             except Exception:
                 pass
             self.run_progress.stop()
-            self.root.after(0, lambda: self._run_finished(log_path, log_content))
+            self.root.after(0, lambda: self._run_finished(log_path, log_content, had_failure, had_cancel, failed_index))
 
-    def _run_finished(self, log_path: Path, log_content: str):
+    def _run_finished(self, log_path: Path, log_content: str, had_failure: bool = False, had_cancel: bool = False, failed_index: int = None):
+        self._run_in_progress = False
+        self._run_failed_index = failed_index
         self._append_log("\nDetailed log saved to: %s\n" % log_path)
-        if "ERROR" in log_content or "FAILED" in log_content:
-            self._append_log("\nMigration finished with errors. Please check the log file.\n")
-            messagebox.showerror("Migration", "Migration finished with errors. See the log: %s" % log_path)
+        if had_failure or had_cancel:
+            self._append_log("\nYou can \"Retry failed step\" (e.g. after reconnecting the database) or \"Continue from next\" to skip and run the rest.\n")
+            self._show_retry_continue_buttons()
+            if had_cancel:
+                messagebox.showinfo("Migration cancelled", "Migration was cancelled. You can Retry the current step or Continue from the next step.")
+            else:
+                messagebox.showerror("Migration", "Migration finished with errors. See the log: %s\n\nYou can Retry the failed step or Continue from the next." % log_path)
         else:
+            self._hide_retry_continue_buttons()
             self._append_log("\nDone successfully.\n")
             messagebox.showinfo("Migration", "Migration completed successfully.\n\nLog saved to:\n%s" % log_path)
         self.btn_cancel.config(state="normal")
