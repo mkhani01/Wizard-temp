@@ -49,7 +49,8 @@ def connect_to_database(config):
             database=config['database'],
             user=config['user'],
             password=config['password'],
-            cursor_factory=RealDictCursor
+            cursor_factory=RealDictCursor,
+            connect_timeout=10,
         )
         connection.autocommit = False
         logger.info("✓ Connected to database")

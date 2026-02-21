@@ -29,7 +29,7 @@ jobs:
 
       - name: Build executable
         run: |
-          $addData = if (Test-Path favicon.png) { ' --add-data "favicon.png;."' } else { '' }
+          $addData = if (Test-Path favicon.png) { ' --add-data favicon.png;.' } else { '' }
           pyinstaller --onefile --noconfirm --clean --name AOS-Migration-Wizard $addData `
             --hidden-import=areaMigration --hidden-import=availabilityTypeMigration `
             --hidden-import=clientAvailabilityMigration --hidden-import=clientLocationsMigration `
@@ -76,7 +76,7 @@ jobs:
       - name: Build .app with PyInstaller
         run: |
           ADD_DATA=""
-          if [ -f favicon.png ]; then ADD_DATA=' --add-data "favicon.png:."'; fi
+          if [ -f favicon.png ]; then ADD_DATA=' --add-data favicon.png:.'; fi
           pyinstaller --noconfirm --clean --onedir --windowed --name AOS-Migration-Wizard $ADD_DATA \
             --hidden-import=areaMigration --hidden-import=availabilityTypeMigration \
             --hidden-import=clientAvailabilityMigration --hidden-import=clientLocationsMigration \
@@ -162,7 +162,7 @@ jobs:
       - name: Build executable
         run: |
           ADD_DATA=""
-          [ -f favicon.png ] && ADD_DATA=' --add-data "favicon.png:."'
+          [ -f favicon.png ] && ADD_DATA=' --add-data favicon.png:.'
           pyinstaller --onefile --noconfirm --clean --name AOS-Migration-Wizard $ADD_DATA \
             --hidden-import=areaMigration --hidden-import=availabilityTypeMigration \
             --hidden-import=clientAvailabilityMigration --hidden-import=clientLocationsMigration \

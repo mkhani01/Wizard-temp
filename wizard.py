@@ -712,9 +712,30 @@ class MigrationWizard:
         else:
             messagebox.showinfo("Continue", "Nothing to continue. Start a new migration from the summary step.")
 
+    def _clear_step_inputs(self, step: int):
+        """Clear user inputs for the given step (used when navigating Back)."""
+        if step == STEP_DB:
+            defaults = {"host": ("DB_HOST", "localhost"), "port": ("DB_PORT", "5432"), "database": ("DB_NAME", "appDB"), "user": ("DB_USER", "root"), "password": ("DB_PASSWORD", "root")}
+            for key in self.db_config:
+                env_key, default = defaults.get(key, ("", ""))
+                self.db_config[key].set(os.getenv(env_key, default))
+        elif step == STEP_CHECKBOXES:
+            for var in self.check_vars.values():
+                var.set(False)
+        elif step == STEP_FILES:
+            self.geocode_ie_txt_path.set("")
+            self.geocode_api_key.set(os.getenv("GOOGLE_MAPS_API_KEY", ""))
+            for key in list(self.file_paths.keys()):
+                path_var = self.file_paths.get(key)
+                if path_var is not None and hasattr(path_var, "set"):
+                    path_var.set("")
+            self.file_paths.clear()
+
     def _on_back(self):
         if self.current_step > 0:
-            self._show_step(self.current_step - 1)
+            prev_step = self.current_step - 1
+            self._clear_step_inputs(prev_step)
+            self._show_step(prev_step)
 
     def _on_continue(self):
         if self.current_step == STEP_WELCOME:

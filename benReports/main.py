@@ -20,7 +20,8 @@ DB_CONFIG = {
     'port': 6969,
     'database': 'appDB',
     'user': 'root',
-    'password': 'root'
+    'password': 'root',
+    'connect_timeout': 10,
 }
 
 # Excel file configuration

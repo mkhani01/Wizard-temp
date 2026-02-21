@@ -5,10 +5,13 @@ Loads users and clients, computes distances via OSRM, then performs a BULK INSER
 - Computes: user→user, client→client, user→client, client→user (separate requests).
 - Uses execute_values for massive speedup (100x faster than row-by-row).
 - Maps OSRM profiles (driving-car) to DB enums (car).
+- Resume: on retry after an insert failure, completed segments are skipped and the
+  failed segment is re-inserted from cached API results (no repeat OSRM calls).
 """
 
 import os
 import sys
+import json
 import logging
 from pathlib import Path
 from datetime import datetime
@@ -53,6 +56,103 @@ DEFAULT_STEP_SIZE = 25
 # Batch size for Database Bulk Insert (number of rows per INSERT)
 DB_INSERT_BATCH_SIZE = 5000
 
+# Resume state: checkpoint + per-segment cache so retry continues from insert without re-calling OSRM
+RESUME_DIR_NAME = "travel_distances_resume"
+CHECKPOINT_FILENAME = "checkpoint.json"
+
+
+def _get_resume_dir():
+    """Directory for checkpoint and segment cache (under project root .cache)."""
+    root = os.getenv("AOS_MIGRATION_PROJECT_ROOT", os.getcwd())
+    d = Path(root) / ".cache" / RESUME_DIR_NAME
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _segment_key(osrm_method: str, from_type: str, to_type: str) -> str:
+    return f"{osrm_method}:{from_type}:{to_type}"
+
+
+def _serialize_map(m):
+    """Convert dict with (id1, id2) keys to JSON-serializable dict with 'id1,id2' keys."""
+    return {f"{a},{b}": v for (a, b), v in m.items()}
+
+
+def _deserialize_map(j):
+    """Convert back to dict with (id1, id2) tuple keys."""
+    if not j:
+        return {}
+    return {tuple(int(x) for x in k.split(",", 1)): v for k, v in j.items()}
+
+
+def get_checkpoint() -> set:
+    """Return set of completed segment keys from previous run (empty if none)."""
+    path = _get_resume_dir() / CHECKPOINT_FILENAME
+    if not path.exists():
+        return set()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return set(data.get("completed", []))
+    except Exception as e:
+        logger.warning("Could not load checkpoint %s: %s", path, e)
+        return set()
+
+
+def save_checkpoint(completed: set):
+    """Persist list of completed segment keys."""
+    path = _get_resume_dir() / CHECKPOINT_FILENAME
+    path.write_text(json.dumps({"completed": sorted(completed)}, indent=2), encoding="utf-8")
+
+
+def save_segment_cache(segment_key: str, distance: dict, duration: dict):
+    """Cache API result for a segment so retry can skip OSRM and only insert."""
+    d = _get_resume_dir()
+    path = d / f"{segment_key.replace(':', '_')}.json"
+    path.write_text(
+        json.dumps({
+            "distance": _serialize_map(distance),
+            "duration": _serialize_map(duration),
+        }, indent=0),
+        encoding="utf-8",
+    )
+
+
+def load_segment_cache(segment_key: str):
+    """Load cached distance/duration for a segment; returns None if not found."""
+    d = _get_resume_dir()
+    path = d / f"{segment_key.replace(':', '_')}.json"
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return {
+            "distance": _deserialize_map(data.get("distance", {})),
+            "duration": _deserialize_map(data.get("duration", {})),
+        }
+    except Exception as e:
+        logger.warning("Could not load segment cache %s: %s", path, e)
+        return None
+
+
+def clear_segment_cache(segment_key: str):
+    """Remove cache file for one segment after successful insert."""
+    path = _get_resume_dir() / f"{segment_key.replace(':', '_')}.json"
+    if path.exists():
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def clear_resume_state():
+    """Remove checkpoint and all segment caches after successful full run."""
+    d = _get_resume_dir()
+    for f in d.iterdir():
+        try:
+            f.unlink()
+        except OSError:
+            pass
+
 
 def get_db_config():
     """Get database configuration from environment variables."""
@@ -76,6 +176,7 @@ def connect_to_database(config):
             user=config["user"],
             password=config["password"],
             cursor_factory=RealDictCursor,
+            connect_timeout=10,
         )
         connection.autocommit = False
         logger.info("✓ Connected to database")
@@ -161,11 +262,18 @@ def run():
         cursor = connection.cursor()
         now = datetime.utcnow()
 
-        # --- STEP 1: WIPE OLD DATA ---
-        logger.warning("Clearing existing travel_distances table...")
-        cursor.execute("TRUNCATE TABLE travel_distances RESTART IDENTITY;")
-        connection.commit()
-        logger.info("✓ Table cleared.")
+        # --- RESUME: checkpoint + cache so retry continues from insert without re-calling OSRM ---
+        completed_segments = get_checkpoint()
+        is_resume = len(completed_segments) > 0
+        if is_resume:
+            logger.warning("Resuming from previous run: skipping %d completed segment(s), retrying insert from cache where available.", len(completed_segments))
+
+        # --- STEP 1: WIPE OLD DATA (only on fresh run; on resume keep existing rows) ---
+        if not is_resume:
+            logger.warning("Clearing existing travel_distances table...")
+            cursor.execute("TRUNCATE TABLE travel_distances RESTART IDENTITY;")
+            connection.commit()
+            logger.info("✓ Table cleared.")
 
         total_expected = (
             len(users) ** 2 * len(OSRM_METHODS)
@@ -222,6 +330,30 @@ def run():
             if skipped_null:
                 logger.info("  Skipped %d pairs with null distance (%s→%s, %s)", skipped_null, from_type, to_type, db_enum_method)
 
+        def run_segment(segment_key, from_type, to_type, db_enum_method, get_matrix_fn, label):
+            """Run one segment: skip if completed, else load from cache or call API, then insert."""
+            if segment_key in completed_segments:
+                logger.info("  [skip] %s (already completed)", label)
+                return
+            cached = load_segment_cache(segment_key)
+            if cached:
+                logger.info("  %s (insert only, from cache – retry after previous insert failure)", label)
+                matrix_result = cached
+            else:
+                matrix_result = get_matrix_fn()
+                save_segment_cache(segment_key, matrix_result["distance"], matrix_result["duration"])
+            add_rows(
+                matrix_result["distance"],
+                matrix_result["duration"],
+                from_type,
+                to_type,
+                db_enum_method,
+            )
+            completed_segments.add(segment_key)
+            save_checkpoint(completed_segments)
+            clear_segment_cache(segment_key)
+            logger.info("  ✓ %s", label)
+
         for osrm_method in OSRM_METHODS:
             db_enum_method = TRAVEL_METHOD_MAP[osrm_method]
             logger.info("")
@@ -231,86 +363,89 @@ def run():
 
             # 1. User → User
             if users:
+                seg_key = _segment_key(osrm_method, ENTITY_TYPE_USER, ENTITY_TYPE_USER)
                 try:
-                    matrix_result = get_distance_matrix(
-                        entities_info1=users,
-                        entities_info2=users,
-                        travel_method=osrm_method,
-                        step_size=DEFAULT_STEP_SIZE,
-                    )
-                    add_rows(
-                        matrix_result["distance"],
-                        matrix_result["duration"],
+                    run_segment(
+                        seg_key,
                         ENTITY_TYPE_USER,
                         ENTITY_TYPE_USER,
                         db_enum_method,
+                        lambda: get_distance_matrix(
+                            entities_info1=users,
+                            entities_info2=users,
+                            travel_method=osrm_method,
+                            step_size=DEFAULT_STEP_SIZE,
+                        ),
+                        "User → User",
                     )
-                    logger.info("  ✓ User → User")
                 except Exception as e:
-                    logger.exception("OSRM user→user failed for %s: %s", osrm_method, e)
+                    logger.exception("User→User failed for %s: %s", osrm_method, e)
 
             # 2. Client → Client
             if clients:
+                seg_key = _segment_key(osrm_method, ENTITY_TYPE_CLIENT, ENTITY_TYPE_CLIENT)
                 try:
-                    matrix_result = get_distance_matrix(
-                        entities_info1=clients,
-                        entities_info2=clients,
-                        travel_method=osrm_method,
-                        step_size=DEFAULT_STEP_SIZE,
-                    )
-                    add_rows(
-                        matrix_result["distance"],
-                        matrix_result["duration"],
+                    run_segment(
+                        seg_key,
                         ENTITY_TYPE_CLIENT,
                         ENTITY_TYPE_CLIENT,
                         db_enum_method,
+                        lambda: get_distance_matrix(
+                            entities_info1=clients,
+                            entities_info2=clients,
+                            travel_method=osrm_method,
+                            step_size=DEFAULT_STEP_SIZE,
+                        ),
+                        "Client → Client",
                     )
-                    logger.info("  ✓ Client → Client")
                 except Exception as e:
-                    logger.exception("OSRM client→client failed for %s: %s", osrm_method, e)
+                    logger.exception("Client→Client failed for %s: %s", osrm_method, e)
 
             # 3. User → Client
             if users and clients:
+                seg_key = _segment_key(osrm_method, ENTITY_TYPE_USER, ENTITY_TYPE_CLIENT)
                 try:
-                    matrix_result = get_distance_matrix(
-                        entities_info1=users,
-                        entities_info2=clients,
-                        travel_method=osrm_method,
-                        step_size=DEFAULT_STEP_SIZE,
-                    )
-                    add_rows(
-                        matrix_result["distance"],
-                        matrix_result["duration"],
+                    run_segment(
+                        seg_key,
                         ENTITY_TYPE_USER,
                         ENTITY_TYPE_CLIENT,
                         db_enum_method,
+                        lambda: get_distance_matrix(
+                            entities_info1=users,
+                            entities_info2=clients,
+                            travel_method=osrm_method,
+                            step_size=DEFAULT_STEP_SIZE,
+                        ),
+                        "User → Client",
                     )
-                    logger.info("  ✓ User → Client")
                 except Exception as e:
-                    logger.exception("OSRM user→client failed for %s: %s", osrm_method, e)
+                    logger.exception("User→Client failed for %s: %s", osrm_method, e)
 
             # 4. Client → User (separate request; direction matters)
             if users and clients:
+                seg_key = _segment_key(osrm_method, ENTITY_TYPE_CLIENT, ENTITY_TYPE_USER)
                 try:
-                    matrix_result = get_distance_matrix(
-                        entities_info1=clients,
-                        entities_info2=users,
-                        travel_method=osrm_method,
-                        step_size=DEFAULT_STEP_SIZE,
-                    )
-                    add_rows(
-                        matrix_result["distance"],
-                        matrix_result["duration"],
+                    run_segment(
+                        seg_key,
                         ENTITY_TYPE_CLIENT,
                         ENTITY_TYPE_USER,
                         db_enum_method,
+                        lambda: get_distance_matrix(
+                            entities_info1=clients,
+                            entities_info2=users,
+                            travel_method=osrm_method,
+                            step_size=DEFAULT_STEP_SIZE,
+                        ),
+                        "Client → User",
                     )
-                    logger.info("  ✓ Client → User")
                 except Exception as e:
-                    logger.exception("OSRM client→user failed for %s: %s", osrm_method, e)
+                    logger.exception("Client→User failed for %s: %s", osrm_method, e)
 
         # Insert any remaining rows
         flush_batch()
+
+        # Clear resume state only after full success so next run is fresh
+        clear_resume_state()
 
         logger.info("")
         logger.info("✓ Migration completed successfully.")
