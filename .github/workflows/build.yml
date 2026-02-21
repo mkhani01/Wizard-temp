@@ -39,7 +39,7 @@ jobs:
             --hidden-import=usersMigration --hidden-import=tests --hidden-import=tests.test_before_run --hidden-import=migration_support `
             wizard.py
 
-      - name: Create zip (single archive: exe + favicon only)
+      - name: "Create zip (single archive: exe + favicon only)"
         run: |
           New-Item -ItemType Directory -Force -Path release_zip
           Copy-Item dist/AOS-Migration-Wizard.exe release_zip/
