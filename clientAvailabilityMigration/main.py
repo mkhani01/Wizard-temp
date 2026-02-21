@@ -380,11 +380,13 @@ def analyze_client_schedule(records: List[Dict]) -> Dict[str, Any]:
     logger.info(f"  Analyzing schedule - min_date: {min_date}, total records: {len(records)}")
     
     # Group by (day_of_week, start_time, end_time)
-    # Track which weeks each slot appears in
+    # Track which weeks each slot appears in and how many source rows (caregivers) per slot
     slot_weeks = defaultdict(set)
+    slot_record_count = defaultdict(int)
     
     for record in records:
         key = (record['day_of_week'], record['start_time'], record['end_time'])
+        slot_record_count[key] += 1
         week_num = get_week_number(record['start_date'], min_date)
         # Only consider weeks 1 and 2 for comparison
         if 1 <= week_num <= 2:
@@ -392,12 +394,13 @@ def analyze_client_schedule(records: List[Dict]) -> Dict[str, Any]:
     
     logger.info(f"  Found {len(slot_weeks)} unique slot types")
     
-    # Classify slots
+    # Classify slots; number_of_care_givers = count of source rows for that slot (same time = multiple caregivers)
     both_weeks = []  # Same slot in both week 1 and week 2
     week1_only = []  # Slot only in week 1
     week2_only = []  # Slot only in week 2
     
     for (day, start_time, end_time), weeks in slot_weeks.items():
+        num_care_givers = max(1, slot_record_count[(day, start_time, end_time)])
         has_week1 = 1 in weeks
         has_week2 = 2 in weeks
         
@@ -406,22 +409,25 @@ def analyze_client_schedule(records: List[Dict]) -> Dict[str, Any]:
                 'day': day,
                 'start_time': start_time,
                 'end_time': end_time,
+                'number_of_care_givers': num_care_givers,
             })
-            logger.debug(f"    Slot {day} {format_time_str(start_time)}-{format_time_str(end_time)}: BOTH weeks")
+            logger.debug(f"    Slot {day} {format_time_str(start_time)}-{format_time_str(end_time)}: BOTH weeks, caregivers={num_care_givers}")
         elif has_week1:
             week1_only.append({
                 'day': day,
                 'start_time': start_time,
                 'end_time': end_time,
+                'number_of_care_givers': num_care_givers,
             })
-            logger.debug(f"    Slot {day} {format_time_str(start_time)}-{format_time_str(end_time)}: WEEK 1 only")
+            logger.debug(f"    Slot {day} {format_time_str(start_time)}-{format_time_str(end_time)}: WEEK 1 only, caregivers={num_care_givers}")
         elif has_week2:
             week2_only.append({
                 'day': day,
                 'start_time': start_time,
                 'end_time': end_time,
+                'number_of_care_givers': num_care_givers,
             })
-            logger.debug(f"    Slot {day} {format_time_str(start_time)}-{format_time_str(end_time)}: WEEK 2 only")
+            logger.debug(f"    Slot {day} {format_time_str(start_time)}-{format_time_str(end_time)}: WEEK 2 only, caregivers={num_care_givers}")
     
     logger.info(f"  Slot analysis: both_weeks={len(both_weeks)}, week1_only={len(week1_only)}, week2_only={len(week2_only)}")
     
@@ -451,6 +457,7 @@ def analyze_client_schedule(records: List[Dict]) -> Dict[str, Any]:
                 'end_time': item['end_time'],
                 'start_date': min_date,
                 'occurs_every': 1,
+                'number_of_care_givers': item.get('number_of_care_givers', 1),
             })
         # Also include week1_only and week2_only if any (they become weekly too)
         for item in week1_only + week2_only:
@@ -460,6 +467,7 @@ def analyze_client_schedule(records: List[Dict]) -> Dict[str, Any]:
                 'end_time': item['end_time'],
                 'start_date': min_date,
                 'occurs_every': 1,
+                'number_of_care_givers': item.get('number_of_care_givers', 1),
             })
     else:
         # Bi-weekly: Create records based on which week they appear
@@ -471,6 +479,7 @@ def analyze_client_schedule(records: List[Dict]) -> Dict[str, Any]:
                 'end_time': item['end_time'],
                 'start_date': min_date,
                 'occurs_every': 2,
+                'number_of_care_givers': item.get('number_of_care_givers', 1),
             })
         
         for item in week1_only:
@@ -480,6 +489,7 @@ def analyze_client_schedule(records: List[Dict]) -> Dict[str, Any]:
                 'end_time': item['end_time'],
                 'start_date': min_date,
                 'occurs_every': 2,
+                'number_of_care_givers': item.get('number_of_care_givers', 1),
             })
         
         for item in week2_only:
@@ -490,6 +500,7 @@ def analyze_client_schedule(records: List[Dict]) -> Dict[str, Any]:
                 'end_time': item['end_time'],
                 'start_date': week2_start,
                 'occurs_every': 2,
+                'number_of_care_givers': item.get('number_of_care_givers', 1),
             })
     
     return {
@@ -529,6 +540,7 @@ def generate_availability_records(
         logger.info(f"  First service: {min_date}, Start date (-14 days): {target_start_date}")
         
         for schedule in schedules:
+            num_care_givers = schedule.get('number_of_care_givers', DEFAULT_NUMBER_OF_CARE_GIVERS)
             availabilities.append({
                 'client_id': client_id,
                 'days': [schedule['day']],
@@ -539,7 +551,7 @@ def generate_availability_records(
                 'is_temp': False,
                 'is_unavailability': is_unavailability,
                 'type_id': type_id,
-                'number_of_care_givers': DEFAULT_NUMBER_OF_CARE_GIVERS,
+                'number_of_care_givers': num_care_givers,
                 'flex_start': DEFAULT_FLEX_START,
                 'flex_end': DEFAULT_FLEX_END,
                 'fix_window': DEFAULT_FIX_WINDOW,
@@ -554,7 +566,8 @@ def generate_availability_records(
             })
             
             logger.info(f"  → {schedule['day']} {format_time_str(schedule['start_time'])}-{format_time_str(schedule['end_time'])}, "
-                       f"start={format_date_str(schedule['start_date'])}, occurs_every={schedule['occurs_every']}")
+                       f"start={format_date_str(schedule['start_date'])}, occurs_every={schedule['occurs_every']}, "
+                       f"number_of_care_givers={num_care_givers}")
     
     logger.info(f"\nGenerated {len(availabilities)} total availability records")
     return availabilities

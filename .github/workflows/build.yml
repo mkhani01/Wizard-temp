@@ -39,20 +39,19 @@ jobs:
             --hidden-import=usersMigration --hidden-import=tests --hidden-import=tests.test_before_run --hidden-import=migration_support `
             wizard.py
 
-      - name: Create zip (exe + logo when present)
+      - name: Create zip (single archive: exe + favicon only)
         run: |
           New-Item -ItemType Directory -Force -Path release_zip
           Copy-Item dist/AOS-Migration-Wizard.exe release_zip/
           if (Test-Path favicon.png) { Copy-Item favicon.png release_zip/ }
-          Compress-Archive -Path release_zip/* -DestinationPath dist/AOS-Migration-Wizard-windows.zip
+          if (Test-Path fav.ico) { Copy-Item fav.ico release_zip/ }
+          Compress-Archive -Path (Get-ChildItem release_zip -File) -DestinationPath dist/AOS-Migration-Wizard-windows.zip -Force
 
-      - name: Upload Windows artifact
+      - name: Upload Windows artifact (single zip: exe + favicon)
         uses: actions/upload-artifact@v4
         with:
           name: AOS-Migration-Wizard-windows
-          path: |
-            dist/AOS-Migration-Wizard.exe
-            dist/AOS-Migration-Wizard-windows.zip
+          path: dist/AOS-Migration-Wizard-windows.zip
 
   build-macos:
     name: macOS (app + dmg)
