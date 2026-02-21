@@ -29,8 +29,8 @@ jobs:
 
       - name: Build executable
         run: |
-          $addData = if (Test-Path favicon.png) { ' --add-data favicon.png;.' } else { '' }
-          pyinstaller --onefile --noconfirm --clean --name AOS-Migration-Wizard $addData `
+          $addData = if (Test-Path favicon.png) { @('--add-data', 'favicon.png;.') } else { @() }
+          pyinstaller --onefile --noconfirm --clean --name AOS-Migration-Wizard @addData `
             --hidden-import=areaMigration --hidden-import=availabilityTypeMigration `
             --hidden-import=clientAvailabilityMigration --hidden-import=clientLocationsMigration `
             --hidden-import=clientsMigration --hidden-import=distance_migration `
