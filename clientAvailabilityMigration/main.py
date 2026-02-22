@@ -17,6 +17,12 @@ Rules:
 - Recurrence: Based on WEEK_ROTATION or auto-detected from comparing both weeks
   - If both weeks have SAME schedule → occurs_every=1 (weekly)
   - If weeks are DIFFERENT → occurs_every=2 (bi-weekly)
+
+Record rules (Personal Care only):
+- Each distinct (start_time, end_time) becomes one availability record.
+  E.g. 08:00-08:30 and 08:00-09:00 → two separate records.
+- When X source rows have the exact same (start_time, end_time) on a date,
+  one record is emitted with number_of_care_givers = X (max per date across dates).
 """
 
 import os
@@ -367,7 +373,13 @@ def analyze_client_schedule(records: List[Dict]) -> Dict[str, Any]:
     """
     Analyze a client's schedule to determine recurrence pattern.
     
-    Logic:
+    Record semantics:
+    - Each distinct (day_of_week, start_time, end_time) → one schedule record.
+      E.g. 08:00-08:30 and 08:00-09:00 produce two separate records.
+    - When X source rows have the exact same (start_time, end_time), one record
+      is produced with number_of_care_givers = X (max over dates for that slot).
+    
+    Recurrence logic:
     - Group records by (day_of_week, start_time, end_time)
     - Check if each slot appears in week 1, week 2, or both
     - If ALL slots appear in BOTH weeks → weekly (occurs_every=1)
@@ -380,13 +392,14 @@ def analyze_client_schedule(records: List[Dict]) -> Dict[str, Any]:
     logger.info(f"  Analyzing schedule - min_date: {min_date}, total records: {len(records)}")
     
     # Group by (day_of_week, start_time, end_time)
-    # Track which weeks each slot appears in and how many source rows (caregivers) per slot
+    # Track which weeks each slot appears in
+    # Count source rows (caregivers) PER DATE so we get "caregivers per occurrence", not total across all dates
     slot_weeks = defaultdict(set)
-    slot_record_count = defaultdict(int)
+    slot_record_count_per_date = defaultdict(lambda: defaultdict(int))
     
     for record in records:
         key = (record['day_of_week'], record['start_time'], record['end_time'])
-        slot_record_count[key] += 1
+        slot_record_count_per_date[key][record['start_date']] += 1
         week_num = get_week_number(record['start_date'], min_date)
         # Only consider weeks 1 and 2 for comparison
         if 1 <= week_num <= 2:
@@ -394,13 +407,19 @@ def analyze_client_schedule(records: List[Dict]) -> Dict[str, Any]:
     
     logger.info(f"  Found {len(slot_weeks)} unique slot types")
     
-    # Classify slots; number_of_care_givers = count of source rows for that slot (same time = multiple caregivers)
+    # number_of_care_givers = max over all dates of (rows for that slot on that date) = caregivers per occurrence
+    def _caregivers_for_slot(slot_key):
+        counts = slot_record_count_per_date.get(slot_key, {})
+        return max(1, max(counts.values())) if counts else 1
+    
+    # Classify slots; number_of_care_givers = count of source rows for that slot on a single date (same time = multiple caregivers)
     both_weeks = []  # Same slot in both week 1 and week 2
     week1_only = []  # Slot only in week 1
     week2_only = []  # Slot only in week 2
     
     for (day, start_time, end_time), weeks in slot_weeks.items():
-        num_care_givers = max(1, slot_record_count[(day, start_time, end_time)])
+        slot_key = (day, start_time, end_time)
+        num_care_givers = _caregivers_for_slot(slot_key)
         has_week1 = 1 in weeks
         has_week2 = 2 in weeks
         

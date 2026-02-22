@@ -130,14 +130,11 @@ jobs:
           [ -f favicon.png ] && cp favicon.png release_zip/
           cd release_zip && zip -r ../dist/AOS-Migration-Wizard-macos.zip . && cd ..
 
-      - name: Upload macOS artifacts
+      - name: Upload macOS artifact (single zip)
         uses: actions/upload-artifact@v4
         with:
           name: AOS-Migration-Wizard-macos
-          path: |
-            dist/AOS-Migration-Wizard.app
-            dist/AOS-Migration-Wizard-1.0.0.dmg
-            dist/AOS-Migration-Wizard-macos.zip
+          path: dist/AOS-Migration-Wizard-macos.zip
 
   build-linux:
     name: Linux (binary)
@@ -178,10 +175,8 @@ jobs:
           [ -f favicon.png ] && cp favicon.png release_zip/
           cd release_zip && zip -r ../dist/AOS-Migration-Wizard-linux.zip . && cd ..
 
-      - name: Upload Linux artifact
+      - name: Upload Linux artifact (single zip)
         uses: actions/upload-artifact@v4
         with:
           name: AOS-Migration-Wizard-linux
-          path: |
-            dist/AOS-Migration-Wizard
-            dist/AOS-Migration-Wizard-linux.zip
+          path: dist/AOS-Migration-Wizard-linux.zip
