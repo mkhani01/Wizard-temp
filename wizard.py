@@ -844,7 +844,7 @@ class MigrationWizard:
             log_path = PROJECT_ROOT / ("migration_wizard_%s.log" % datetime.now().strftime("%Y%m%d_%H%M%S"))
             self._run_log_path = log_path
             self._append_log("Log file: %s\n" % log_path)
-            self._append_log("Setting environment and copying files...\n")
+            self._append_log("Emptying assets and copying files...\n")
         self.root.update()
         thread = threading.Thread(target=self._do_run, args=(log_path, order, start_from), daemon=True)
         thread.start()
@@ -979,7 +979,21 @@ class MigrationWizard:
         if api_key:
             os.environ["GOOGLE_MAPS_API_KEY"] = api_key
 
+    def _empty_assets(self):
+        """Remove all contents of assets so each run starts with a clean slate."""
+        if not ASSETS.exists() or not ASSETS.is_dir():
+            return
+        for item in ASSETS.iterdir():
+            try:
+                if item.is_file():
+                    item.unlink()
+                elif item.is_dir():
+                    shutil.rmtree(item)
+            except OSError as e:
+                logging.warning("Could not remove %s: %s", item, e)
+
     def _copy_files(self):
+        self._empty_assets()
         ASSETS.mkdir(parents=True, exist_ok=True)
         (ASSETS / "userAvailabilities").mkdir(parents=True, exist_ok=True)
         (ASSETS / "availabilitytypes").mkdir(parents=True, exist_ok=True)

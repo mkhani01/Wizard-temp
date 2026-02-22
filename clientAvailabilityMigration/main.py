@@ -171,12 +171,19 @@ def parse_datetime_value(datetime_val) -> Optional[datetime]:
         return datetime_val
     if isinstance(datetime_val, str):
         datetime_str = datetime_val.strip()
-        for fmt in ['%d-%m-%Y %H:%M:%S', '%Y-%m-%d %H:%M:%S', '%d/%m/%Y %H:%M:%S', 
+        for fmt in ['%d-%m-%Y %H:%M:%S', '%Y-%m-%d %H:%M:%S', '%d/%m/%Y %H:%M:%S',
                     '%d-%m-%Y %H:%M', '%Y-%m-%d %H:%M', '%d/%m/%Y %H:%M']:
             try:
                 return datetime.strptime(datetime_str, fmt)
             except ValueError:
                 continue
+    # Excel serial: days since 1899-12-30 (with fractional day = time)
+    if isinstance(datetime_val, (int, float)):
+        try:
+            base = datetime(1899, 12, 30)
+            return base + timedelta(days=float(datetime_val))
+        except (OverflowError, ValueError):
+            pass
     return None
 
 
@@ -186,6 +193,14 @@ def get_day_of_week(date_obj: date) -> str:
 
 def format_time_str(t: time) -> str:
     return t.strftime('%H:%M:%S')
+
+
+def normalize_time_for_slot(t: time) -> time:
+    """Normalize time so same logical slot groups together.
+    Floors to 10-minute boundary so e.g. 20:00 (string) and 20:05 (Excel serial) both become 20:00."""
+    minute_floor = (t.minute // 10) * 10
+
+    return time(t.hour, minute_floor, 0)
 
 
 def format_date_str(d: date) -> str:
@@ -398,7 +413,10 @@ def analyze_client_schedule(records: List[Dict]) -> Dict[str, Any]:
     slot_record_count_per_date = defaultdict(lambda: defaultdict(int))
     
     for record in records:
-        key = (record['day_of_week'], record['start_time'], record['end_time'])
+        # Normalize times so "same" slot (e.g. 20:00-20:30) groups together even if Excel had microsecond variance
+        start_n = normalize_time_for_slot(record['start_time'])
+        end_n = normalize_time_for_slot(record['end_time'])
+        key = (record['day_of_week'], start_n, end_n)
         slot_record_count_per_date[key][record['start_date']] += 1
         week_num = get_week_number(record['start_date'], min_date)
         # Only consider weeks 1 and 2 for comparison
@@ -608,6 +626,9 @@ def deduplicate_availabilities(availabilities: List[Dict]) -> List[Dict]:
         
         if key in unique_map:
             duplicates += 1
+            # Keep the one with higher number_of_care_givers (same slot, multiple caregivers)
+            if avail.get('number_of_care_givers', 1) > unique_map[key].get('number_of_care_givers', 1):
+                unique_map[key] = avail
         else:
             unique_map[key] = avail
     
