@@ -592,7 +592,14 @@ class MigrationWizard:
             self._files_canvas.configure(scrollregion=self._files_canvas.bbox(ALL))
 
     def _browse_file(self, var: StringVar, parent):
-        path = filedialog.askopenfilename(parent=parent, title="Select file")
+        # Show "All files" first so xlsx, csv, json, etc. are visible on Windows and all OSes
+        filetypes = [
+            ("All files", "*"),
+            ("Excel workbooks", "*.xlsx"),
+            ("CSV files", "*.csv"),
+            ("JSON files", "*.json"),
+        ]
+        path = filedialog.askopenfilename(parent=parent, title="Select file", filetypes=filetypes)
         if path:
             var.set(path)
 
