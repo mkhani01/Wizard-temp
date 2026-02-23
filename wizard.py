@@ -80,6 +80,7 @@ OPT_GEOCODE_CLIENT_FILE = "geocode_client_file"
 OPT_GEOCODE_CAREGIVER_FILE = "geocode_caregiver_file"
 OPT_CALCULATE_DISTANCES = "calculate_distances"
 OPT_FVISIT_HISTORY = "fvisit_history"
+OPT_CLIENT_WINDOWS = "client_windows"
 
 # Options that require a file in step 4 (excluding geocode_api and calculate_distances)
 FILE_OPTIONS = [
@@ -91,6 +92,7 @@ FILE_OPTIONS = [
     OPT_GEOCODE_CLIENT_FILE,
     OPT_GEOCODE_CAREGIVER_FILE,
     OPT_FVISIT_HISTORY,
+    OPT_CLIENT_WINDOWS,
 ]
 # Geocode API needs IE.txt (and optional API key in env)
 GEOCODE_API_FILES = ["geocode_ie_txt", "geocode_api_key"]
@@ -105,6 +107,7 @@ OPT_FILE_TYPE = {
     OPT_GEOCODE_CLIENT_FILE: "file",
     OPT_GEOCODE_CAREGIVER_FILE: "file",
     OPT_FVISIT_HISTORY: "file",
+    OPT_CLIENT_WINDOWS: "file",
 }
 
 # Where to copy each option's file(s) (relative to ASSETS)
@@ -117,6 +120,7 @@ OPT_ASSET_PATH = {
     OPT_GEOCODE_CLIENT_FILE: "clientbackup.json",
     OPT_GEOCODE_CAREGIVER_FILE: "usersBackup.json",
     OPT_FVISIT_HISTORY: "visit_data.csv",
+    OPT_CLIENT_WINDOWS: "client_windows_data.csv",
 }
 
 AOS_URL = "https://aossystem.com/"
@@ -203,7 +207,7 @@ class MigrationWizard:
             OPT_CAREGIVERS, OPT_AVAILABILITY_TYPES, OPT_CAREGIVERS_AVAILABILITY,
             OPT_CLIENTS, OPT_CLIENTS_AVAILABILITY, OPT_GEOCODE_API,
             OPT_GEOCODE_CLIENT_FILE, OPT_GEOCODE_CAREGIVER_FILE,
-            OPT_CALCULATE_DISTANCES, OPT_FVISIT_HISTORY,
+            OPT_CALCULATE_DISTANCES, OPT_FVISIT_HISTORY, OPT_CLIENT_WINDOWS,
         ]}
         self.file_paths = {}  # option -> path string (file or folder)
         self.geocode_api_key = StringVar(value=os.getenv("GOOGLE_MAPS_API_KEY", ""))
@@ -269,6 +273,9 @@ class MigrationWizard:
         self.btn_retry = ttk.Button(btn_frame, text="Retry failed step", command=self._on_retry_migration)
         self.btn_retry.pack(side="right", padx=4)
         self.btn_retry.pack_forget()
+        self.btn_run_again = ttk.Button(btn_frame, text="Run again", command=self._on_run_again)
+        self.btn_run_again.pack(side="right", padx=4)
+        self.btn_run_again.pack_forget()
         self.btn_back = ttk.Button(btn_frame, text="Back", command=self._on_back)
         self.btn_back.pack(side="right", padx=4)
         self.btn_continue = ttk.Button(btn_frame, text="Continue", command=self._on_continue)
@@ -420,6 +427,7 @@ class MigrationWizard:
             (OPT_GEOCODE_API, "Calculated Geocode (Google API)", "Use Google Maps API to fill in latitude/longitude from postcodes for users and clients that have NULL coordinates. This runs AFTER file-based location imports (if selected), only geocoding records with postcodes but missing lat/long. You need a Google Maps API key and the Irish cities file (IE.txt). Can be combined with file-based options."),
             (OPT_CALCULATE_DISTANCES, "Calculate distances", "Compute travel distances between caregivers and clients using OSRM. Reads user and client lat/long from the database, calls OSRM for each pair and travel method (driving, cycling, walking), then inserts or updates the travel_distances table. Runs a verification step when done. Requires network access to OSRM."),
             (OPT_FVISIT_HISTORY, "Feasible pairs (visit history)", "Seed feasible_pairs from visit data CSV (Assignee = caregiver, Customer = client). Pick a CSV with columns Assignee and Customer in the next step."),
+            (OPT_CLIENT_WINDOWS, "Client windows analyzer", "Update existing client availability records with optimized start/end windows and minDuration from historical visit data (VisitExport-style CSV). Requires Clients Availability. Pick the visit export CSV in the next step."),
         ]
         row = 0
         for key, title, hint in opts:
@@ -431,7 +439,7 @@ class MigrationWizard:
             cb.grid(row=0, column=0, sticky=W)
             if key in (OPT_GEOCODE_CLIENT_FILE, OPT_GEOCODE_CAREGIVER_FILE):
                 setattr(self, "_cb_%s" % key, cb)
-            if key in (OPT_CAREGIVERS_AVAILABILITY, OPT_CLIENTS_AVAILABILITY):
+            if key in (OPT_CAREGIVERS_AVAILABILITY, OPT_CLIENTS_AVAILABILITY, OPT_CLIENT_WINDOWS):
                 setattr(self, "_cb_%s" % key, cb)
             desc = ttk.Label(block, text=hint, wraplength=wrap, padding=(28, 4, 8, 4))
             desc.grid(row=1, column=0, sticky=W)
@@ -452,7 +460,7 @@ class MigrationWizard:
         )
 
     def _sync_checkbox_dependencies(self):
-        """Apply dependencies: Caregivers/Clients availability only when Availability types selected."""
+        """Apply dependencies: Caregivers/Clients availability only when Availability types selected; Client windows only when Clients Availability selected."""
         # Availability: enable Caregivers/Clients availability only when Availability types is selected
         has_availability_types = self.check_vars[OPT_AVAILABILITY_TYPES].get()
         for opt in (OPT_CAREGIVERS_AVAILABILITY, OPT_CLIENTS_AVAILABILITY):
@@ -461,6 +469,13 @@ class MigrationWizard:
                 cb.config(state="normal" if has_availability_types else "disabled")
                 if not has_availability_types:
                     self.check_vars[opt].set(False)
+        # Client windows analyzer: only when Clients Availability is selected
+        has_clients_availability = self.check_vars[OPT_CLIENTS_AVAILABILITY].get()
+        cb_cw = getattr(self, "_cb_%s" % OPT_CLIENT_WINDOWS, None)
+        if cb_cw is not None:
+            cb_cw.config(state="normal" if has_clients_availability else "disabled")
+            if not has_clients_availability:
+                self.check_vars[OPT_CLIENT_WINDOWS].set(False)
 
     def _build_step_files(self, parent):
         parent.columnconfigure(0, weight=1)
@@ -552,6 +567,7 @@ class MigrationWizard:
                 OPT_GEOCODE_CLIENT_FILE: "Client geocode JSON:",
                 OPT_GEOCODE_CAREGIVER_FILE: "Caregiver geocode JSON:",
                 OPT_FVISIT_HISTORY: "Feasible pairs (visit data) CSV:",
+                OPT_CLIENT_WINDOWS: "Client windows analyzer CSV:",
             }.get(key, key)
             existing = self.file_paths.get(key)
             if hasattr(existing, "get"):
@@ -958,6 +974,7 @@ class MigrationWizard:
         if had_failure or had_cancel:
             self._append_log("\nYou can \"Retry failed step\" (e.g. after reconnecting the database) or \"Continue from next\" to skip and run the rest.\n")
             self._show_retry_continue_buttons()
+            self.btn_run_again.pack_forget()
             if had_cancel:
                 messagebox.showinfo("Migration cancelled", "Migration was cancelled. You can Retry the current step or Continue from the next step.")
             else:
@@ -966,8 +983,18 @@ class MigrationWizard:
             self._hide_retry_continue_buttons()
             self._append_log("\nDone successfully.\n")
             messagebox.showinfo("Migration", "Migration completed successfully.\n\nLog saved to:\n%s" % log_path)
+            self.btn_run_again.pack(side="right", padx=4)
         self.btn_cancel.config(state="normal")
         self.btn_cancel.config(text="Close")
+
+    def _on_run_again(self):
+        """Re-run the full migration from the beginning (same options and files)."""
+        self.btn_run_again.pack_forget()
+        self.btn_cancel.config(text="Cancel")
+        self.run_log.config(state="normal")
+        self.run_log.delete("1.0", "end")
+        self.run_log.config(state="disabled")
+        self._run_migrations(start_from=0)
 
     def _apply_env(self):
         os.environ["DB_HOST"] = self.db_config["host"].get().strip()
@@ -1037,6 +1064,8 @@ class MigrationWizard:
             order.append(("Clients", self._run_clients))
         if self.check_vars[OPT_CLIENTS_AVAILABILITY].get():
             order.append(("Clients Availability", self._run_client_availability))
+        if self.check_vars[OPT_CLIENT_WINDOWS].get():
+            order.append(("Client windows analyzer", self._run_client_windows))
         # File-based geocoding runs first (manual seeding)
         if self.check_vars[OPT_GEOCODE_CLIENT_FILE].get():
             order.append(("Client Geocode (file)", self._run_client_locations))
@@ -1102,6 +1131,12 @@ class MigrationWizard:
         from feasible_pairs_migration.feasible_pairs_migration import run as run_feasible_pairs
         csv_path = ASSETS / "visit_data.csv"
         return run_feasible_pairs(csv_path=str(csv_path))
+
+    def _run_client_windows(self):
+        sys.path.insert(0, str(BUNDLE_ROOT))
+        from clientWindowsAnalyzer.main import run as run_client_windows
+        csv_path = ASSETS / OPT_ASSET_PATH[OPT_CLIENT_WINDOWS]
+        return run_client_windows(csv_path=str(csv_path))
 
     def run(self):
         self.root.mainloop()

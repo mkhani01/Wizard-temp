@@ -43,6 +43,7 @@ def print_usage():
         clientlocations      Update client lat/lng from JSON backup
         travel-distances     Compute user<->client distances via OSRM, upsert travel_distances, then verify
         feasible-pairs [path]   Seed feasible_pairs from visit data CSV (default: assets/visit_data.csv)
+        client-windows [path]   Update client_availabilities start/end/minDuration from visit CSV (default: assets/client_windows_data.csv)
         test                 Run pre-run checks and optional distance test (run before migrating)
         all                  Run all migrations (TODO)
     
@@ -142,6 +143,11 @@ def main():
         csv_path = sys.argv[2] if len(sys.argv) > 2 else None
         from feasible_pairs_migration.feasible_pairs_migration import run as run_feasible_pairs
         success = run_feasible_pairs(csv_path=csv_path)
+        sys.exit(0 if success else 1)
+    elif command == 'client-windows':
+        csv_path = sys.argv[2] if len(sys.argv) > 2 else None
+        from clientWindowsAnalyzer.main import run as run_client_windows
+        success = run_client_windows(csv_path=csv_path)
         sys.exit(0 if success else 1)
     elif command == 'test':
         sys.path.insert(0, str(Path(__file__).resolve().parent))

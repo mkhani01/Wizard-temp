@@ -69,6 +69,7 @@ def check_migration_imports():
         ("geocodeCalculation.main", "Geocode calculation"),
         ("areaMigration.main", "Area migration"),
         ("feasible_pairs_migration.feasible_pairs_migration", "Feasible pairs"),
+        ("clientWindowsAnalyzer.main", "Client windows analyzer"),
         ("distance_migration.travel_distances_migration", "Travel distances"),
     ]
     failed = []
