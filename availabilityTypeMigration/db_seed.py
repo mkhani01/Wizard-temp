@@ -20,50 +20,85 @@ from .csv_parser import deduplicate
 logger = logging.getLogger(__name__)
 
 
+def _normalize_name(name):
+    return (name or "").strip().lower()
+
+
 def _seed_with_upsert(cursor, connection, unique_types, now):
-    """Use ON CONFLICT upsert when table has UNIQUE (name, type, category)."""
-    insert_query = """
-        INSERT INTO availability_types (
-            name, type, category, description, color, icon, is_paid,
-            created_date, last_modified_date
-        ) VALUES %s
-        ON CONFLICT (name, type, category) DO UPDATE SET
-            description = EXCLUDED.description,
-            color = EXCLUDED.color,
-            icon = EXCLUDED.icon,
-            is_paid = EXCLUDED.is_paid,
-            last_modified_date = NOW()
-        RETURNING id, name, type, category, is_paid
-    """
-    type_tuples = [
-        (
-            t["name"], t["type"], t["category"], t["description"],
-            t["color"], t["icon"], t["is_paid"], now, now,
-        )
-        for t in unique_types
-    ]
-    execute_values(
-        cursor, insert_query, type_tuples,
-        template="(%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+    """Use case-insensitive name matching: update existing row if (name_lower, type, category) exists, else insert."""
+    cursor.execute(
+        "SELECT id, name, type, category FROM availability_types WHERE deleted_at IS NULL"
     )
-    return cursor.fetchall()
+    existing = {
+        (_normalize_name(r["name"]), r["type"], r["category"]): r["id"]
+        for r in cursor.fetchall()
+    }
+    to_insert = []
+    to_update = []
+    for t in unique_types:
+        key_lower = (_normalize_name(t["name"]), t["type"], t["category"])
+        if key_lower in existing:
+            to_update.append((t, existing[key_lower]))
+        else:
+            to_insert.append(t)
+
+    processed = []
+    if to_insert:
+        insert_query = """
+            INSERT INTO availability_types (
+                name, type, category, description, color, icon, is_paid,
+                created_date, last_modified_date
+            ) VALUES %s
+            RETURNING id, name, type, category, is_paid
+        """
+        type_tuples = [
+            (
+                t["name"], t["type"], t["category"], t["description"],
+                t["color"], t["icon"], t["is_paid"], now, now,
+            )
+            for t in to_insert
+        ]
+        execute_values(
+            cursor, insert_query, type_tuples,
+            template="(%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+        )
+        processed.extend(cursor.fetchall())
+
+    for t, pk in to_update:
+        cursor.execute(
+            """
+            UPDATE availability_types SET
+                description = %s, color = %s, icon = %s, is_paid = %s,
+                last_modified_date = %s
+            WHERE id = %s
+            """,
+            (t["description"], t["color"], t["icon"], t["is_paid"], now, pk),
+        )
+        if cursor.rowcount:
+            processed.append({
+                "id": pk, "name": t["name"], "type": t["type"],
+                "category": t["category"], "is_paid": t["is_paid"],
+            })
+    return processed
 
 
 def _seed_without_upsert(cursor, connection, unique_types, now):
     """
-    Insert new rows and update existing by (name, type, category)
-    when the table has no UNIQUE constraint on those columns.
+    Insert new rows and update existing by (name, type, category).
+    Name comparison is case-insensitive (Core and core are the same).
     """
-    # Load existing (name, type, category) -> id
     cursor.execute(
         "SELECT id, name, type, category FROM availability_types WHERE deleted_at IS NULL"
     )
-    existing = {(r["name"], r["type"], r["category"]): r["id"] for r in cursor.fetchall()}
+    existing = {
+        (_normalize_name(r["name"]), r["type"], r["category"]): r["id"]
+        for r in cursor.fetchall()
+    }
 
     to_insert = []
     to_update = []
     for t in unique_types:
-        key = (t["name"], t["type"], t["category"])
+        key = (_normalize_name(t["name"]), t["type"], t["category"])
         if key in existing:
             to_update.append((t, existing[key]))
         else:
@@ -112,12 +147,14 @@ def _seed_without_upsert(cursor, connection, unique_types, now):
 
 
 def _deduplicate_by_name(types):
-    """Keep first occurrence per name (for DBs with UNIQUE on name only)."""
+    """Keep first occurrence per name (case-insensitive; for DBs with UNIQUE on name only)."""
     seen = {}
     for t in types:
         name = t.get("name")
-        if name is not None and name not in seen:
-            seen[name] = t
+        if name is not None:
+            key = _normalize_name(name)
+            if key not in seen:
+                seen[key] = t
     return list(seen.values())
 
 
@@ -136,10 +173,10 @@ def _seed_by_name_only(cursor, connection, unique_types, now):
     cursor.execute(
         "SELECT id, name FROM availability_types WHERE deleted_at IS NULL"
     )
-    existing_by_name = {r["name"]: r["id"] for r in cursor.fetchall()}
+    existing_by_name = {_normalize_name(r["name"]): r["id"] for r in cursor.fetchall()}
 
-    to_insert = [t for t in types_by_name if t["name"] not in existing_by_name]
-    to_update = [(t, existing_by_name[t["name"]]) for t in types_by_name if t["name"] in existing_by_name]
+    to_insert = [t for t in types_by_name if _normalize_name(t["name"]) not in existing_by_name]
+    to_update = [(t, existing_by_name[_normalize_name(t["name"])]) for t in types_by_name if _normalize_name(t["name"]) in existing_by_name]
 
     processed = []
 

@@ -57,7 +57,7 @@ OSRM_METHODS = list(TRAVEL_METHOD_MAP.keys())
 
 # Batch sizes
 DEFAULT_STEP_SIZE = 25
-DB_INSERT_BATCH_SIZE = 1000
+DB_INSERT_BATCH_SIZE = 10000
 
 # Cache Directory for Resume capability
 SCRIPT_DIR = Path(__file__).parent.resolve()
@@ -160,6 +160,20 @@ def get_existing_pair_counts(connection, from_type, to_type, method):
         cursor.close()
 
 
+def get_existing_pairs(connection, from_type, to_type, method):
+    """Return set of (from_id, to_id) already in DB for this segment (for smart retry insert skip)."""
+    cursor = connection.cursor()
+    try:
+        cursor.execute("""
+            SELECT from_id, to_id
+            FROM travel_distances
+            WHERE from_type = %s AND to_type = %s AND travel_method = %s
+        """, (from_type, to_type, method))
+        return {(row["from_id"], row["to_id"]) for row in cursor.fetchall()}
+    finally:
+        cursor.close()
+
+
 def find_missing_source_ids(all_source_ids, existing_counts, expected_target_count):
     missing_ids = set()
     for sid in all_source_ids:
@@ -181,66 +195,127 @@ def insert_batch(cursor, data):
         ON CONFLICT DO NOTHING
     """
     template = "(%s, %s, NULL, %s, %s, NULL, %s, %s, %s, %s, %s, %s, %s, %s)"
-    execute_values(cursor, sql, data, template=template)
+    execute_values(cursor, sql, data, template=template, page_size=5000)
 
 
-# --- Cache Helpers ---
+# --- Cache Helpers (msgpack for speed, JSON fallback for backward compatibility) ---
 
-def _get_cache_path(method, from_type, to_type):
-    """Generate a unique filename for a specific segment."""
-    # Ensure directory exists
+try:
+    import msgpack
+except ImportError:
+    msgpack = None
+
+
+def _get_cache_base(method, from_type, to_type):
+    """Base path for segment cache (no extension)."""
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    return CACHE_DIR / f"{method}_{from_type}_{to_type}.json"
+    return CACHE_DIR / f"{method}_{from_type}_{to_type}"
+
 
 def _serialize_map(m):
     return {f"{a},{b}": v for (a, b), v in m.items()}
+
 
 def _deserialize_map(j):
     if not j:
         return {}
     return {tuple(int(x) for x in k.split(",", 1)): v for k, v in j.items()}
 
+
 def save_cache(method, from_type, to_type, distance, duration):
-    path = _get_cache_path(method, from_type, to_type)
-    logger.info(f"    Saving API results to cache: {path.name}")
-    try:
-        data = {
-            "distance": _serialize_map(distance),
-            "duration": _serialize_map(duration)
-        }
-        path.write_text(json.dumps(data), encoding="utf-8")
-        # Verify file exists immediately
-        if not path.exists():
-            logger.error(f"    CRITICAL: Saved cache but file does not exist at {path}")
-        else:
+    base = _get_cache_base(method, from_type, to_type)
+    if msgpack:
+        path = base.with_suffix(".msgpack")
+        logger.info(f"    Saving API results to cache: {path.name}")
+        try:
+            rows = []
+            for (src_id, tgt_id), dist_km in distance.items():
+                if dist_km is None:
+                    continue
+                dur_min = duration.get((src_id, tgt_id), 0)
+                rows.append([src_id, tgt_id, dist_km, dur_min])
+            path.write_bytes(msgpack.packb({"rows": rows}))
             logger.info(f"    Cache saved successfully ({path.stat().st_size} bytes)")
-    except Exception as e:
-        logger.error(f"    Failed to save cache: {e}")
+        except Exception as e:
+            logger.error(f"    Failed to save cache: {e}")
+    else:
+        path = base.with_suffix(".json")
+        logger.info(f"    Saving API results to cache: {path.name}")
+        try:
+            data = {
+                "distance": _serialize_map(distance),
+                "duration": _serialize_map(duration),
+            }
+            path.write_text(json.dumps(data), encoding="utf-8")
+            logger.info(f"    Cache saved successfully ({path.stat().st_size} bytes)")
+        except Exception as e:
+            logger.error(f"    Failed to save cache: {e}")
+
+
+def _load_cache_msgpack(path):
+    """Load cache from msgpack format; returns None on failure."""
+    if not path.exists() or not msgpack:
+        return None
+    try:
+        raw = msgpack.unpackb(path.read_bytes(), strict_map_key=False)
+        rows = raw.get("rows", [])
+        distance = {}
+        duration = {}
+        for r in rows:
+            src_id, tgt_id, dist_km, dur_min = r[0], r[1], r[2], r[3]
+            key = (int(src_id), int(tgt_id))
+            distance[key] = dist_km
+            duration[key] = dur_min
+        return {"distance": distance, "duration": duration}
+    except Exception:
+        return None
+
+
+def _load_cache_json(path):
+    """Load cache from legacy JSON format; returns None on failure."""
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return {
+            "distance": _deserialize_map(data.get("distance", {})),
+            "duration": _deserialize_map(data.get("duration", {})),
+        }
+    except Exception:
+        return None
+
 
 def load_cache(method, from_type, to_type):
-    path = _get_cache_path(method, from_type, to_type)
-    if path.exists():
-        logger.info(f"    >>> CACHE FOUND: {path.name} (Resuming from previous attempt)")
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            return {
-                "distance": _deserialize_map(data.get("distance", {})),
-                "duration": _deserialize_map(data.get("duration", {}))
-            }
-        except Exception as e:
-            logger.warning(f"    Failed to read cache: {e}")
-    else:
-        logger.info(f"    Cache not found at {path.name}")
+    base = _get_cache_base(method, from_type, to_type)
+    path_mp = base.with_suffix(".msgpack")
+    path_json = base.with_suffix(".json")
+    if path_mp.exists():
+        logger.info(f"    >>> CACHE FOUND: {path_mp.name} (Resuming from previous attempt)")
+        matrix = _load_cache_msgpack(path_mp)
+        if matrix:
+            return matrix
+    if path_json.exists():
+        logger.info(f"    >>> CACHE FOUND: {path_json.name} (Resuming from previous attempt)")
+        matrix = _load_cache_json(path_json)
+        if matrix:
+            return matrix
+    logger.info(f"    Cache not found at {base.name}[.msgpack|.json]")
     return None
 
+
 def clear_cache(method, from_type, to_type):
-    path = _get_cache_path(method, from_type, to_type)
-    if path.exists():
-        try:
-            path.unlink()
-            logger.info(f"    Cleared cache file: {path.name}")
-        except OSError:
-            pass
+    base = _get_cache_base(method, from_type, to_type)
+    cleared = []
+    for ext in (".msgpack", ".json"):
+        path = base.with_suffix(ext)
+        if path.exists():
+            try:
+                path.unlink()
+                cleared.append(path.name)
+            except OSError:
+                pass
+    if cleared:
+        logger.info(f"    Cleared cache file(s): {', '.join(cleared)}")
 
 
 def _segment_key(osrm_method, from_type, to_type):
@@ -302,10 +377,21 @@ def process_missing_segment(
         save_cache(osrm_method, from_type, to_type, matrix["distance"], matrix["duration"])
     else:
         logger.info("    Using cached data (Skipping OSRM API call).")
+    # Smart retry: only insert pairs that are not already in DB (avoids millions of conflict checks)
+    try:
+        existing_pairs = get_existing_pairs(connection, from_type, to_type, db_enum_method)
+    except (OperationalError, InterfaceError) as e:
+        if ConnectionLostError:
+            completed = state.get_step("distance_migration").get("completed_segments") or [] if state else []
+            raise ConnectionLostError("distance_migration", dict(completed_segments=completed, current_segment=segment_key)) from e
+        raise
+    total_cached = len(matrix["distance"])
     now = datetime.utcnow()
     batch_data = []
     for (src_id, tgt_id), dist_km in matrix["distance"].items():
         if dist_km is None:
+            continue
+        if (src_id, tgt_id) in existing_pairs:
             continue
         dur_min = matrix["duration"].get((src_id, tgt_id), 0)
         batch_data.append((
@@ -313,30 +399,32 @@ def process_missing_segment(
             int(round(dist_km * 1000)), int(dur_min) if dur_min else 0,
             CALCULATION_STATUS_COMPLETED, None, now, now, now,
         ))
-    batches_committed = 0
-    if state and segment_key and state.get("distance_migration", "current_segment") == segment_key:
-        batches_committed = state.get("distance_migration", "current_segment_batches_committed", 0)
-    start_index = batches_committed * DB_INSERT_BATCH_SIZE
-    if start_index >= len(batch_data):
-        logger.info("    No remaining rows to insert (resumed after commit).")
+    skipped = total_cached - len(batch_data)
+    if skipped:
+        logger.info("    Skipping %d pairs already in DB (inserting only %d missing).", skipped, len(batch_data))
+    if not batch_data:
+        logger.info("    No missing pairs to insert.")
         clear_cache(osrm_method, from_type, to_type)
         return
-    batch_data = batch_data[start_index:]
+    total_batches = (len(batch_data) + DB_INSERT_BATCH_SIZE - 1) // DB_INSERT_BATCH_SIZE
+    logger.info("    Inserting %d rows in %d batches (batch size %d)...", len(batch_data), total_batches, DB_INSERT_BATCH_SIZE)
+    batches_committed = 0
     for i in range(0, len(batch_data), DB_INSERT_BATCH_SIZE):
         chunk = batch_data[i:i + DB_INSERT_BATCH_SIZE]
         try:
             insert_batch(cursor, chunk)
             connection.commit()
             batches_committed += 1
+            if batches_committed % 10 == 0 or batches_committed == total_batches:
+                logger.info("    Insert progress: %d / %d batches", batches_committed, total_batches)
             if state and segment_key:
-                state.update("distance_migration", current_segment=segment_key, current_segment_batches_committed=batches_committed)
+                state.update("distance_migration", current_segment=segment_key)
         except (OperationalError, InterfaceError) as e:
             if ConnectionLostError:
                 completed = state.get_step("distance_migration").get("completed_segments") or [] if state else []
                 raise ConnectionLostError("distance_migration", dict(
                     completed_segments=completed,
                     current_segment=segment_key,
-                    current_segment_batches_committed=batches_committed,
                 )) from e
             raise
     logger.info("    Inserted/Updated records (batches committed: %d).", batches_committed)

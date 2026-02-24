@@ -6,6 +6,7 @@ import os
 import sys
 from typing import List, Dict, Literal, Tuple
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import argparse
 import json
 import requests
@@ -154,6 +155,10 @@ def get_cross_distance_matrix(
     }
 
 
+# Max concurrent OSRM block requests (avoid overwhelming server)
+OSRM_MAX_WORKERS = 6
+
+
 def get_distance_matrix(
     entities_info1: Dict,
     entities_info2: Dict,
@@ -162,45 +167,53 @@ def get_distance_matrix(
 ) -> Dict:
     """
     Computes distance matrix between two sets of entities with batching.
+    Block pairs are requested in parallel via ThreadPoolExecutor.
     """
     entity_ids1 = list(entities_info1.keys())
     num_entity1 = len(entities_info1)
     entity_ids2 = list(entities_info2.keys())
     num_entity2 = len(entities_info2)
 
-    blocks1 = [(i, i+step_size) for i in range(0, num_entity1, step_size)]
-    blocks2 = [(i, i+step_size) for i in range(0, num_entity2, step_size)]
+    blocks1 = [(i, i + step_size) for i in range(0, num_entity1, step_size)]
+    blocks2 = [(i, i + step_size) for i in range(0, num_entity2, step_size)]
 
     distance_info = {'distance': {}, 'duration': {}}
 
-    # Check if this is a self-matrix (User->User or Client->Client)
     is_self_matrix = (entities_info1 is entities_info2)
 
-    print(f"Processing {num_entity1} x {num_entity2} matrix with {travel_method}...")
     total_blocks = len(blocks1) * len(blocks2)
-    current_block = 0
+    print(f"Processing {num_entity1} x {num_entity2} matrix with {travel_method} ({total_blocks} blocks, {OSRM_MAX_WORKERS} workers)...")
 
-    for blk1 in blocks1:
+    def run_block(blk1, blk2):
         src_entities = {
             entity_ids1[i]: entities_info1[entity_ids1[i]]
             for i in range(blk1[0], min(blk1[1], num_entity1))
         }
-        for blk2 in blocks2:
-            dst_entities = {
-                entity_ids2[j]: entities_info2[entity_ids2[j]]
-                for j in range(blk2[0], min(blk2[1], num_entity2))
-            }
-            current_block += 1
-            print(f"  Processing block {current_block}/{total_blocks}...")
+        dst_entities = {
+            entity_ids2[j]: entities_info2[entity_ids2[j]]
+            for j in range(blk2[0], min(blk2[1], num_entity2))
+        }
+        return get_cross_distance_matrix(
+            ent1=src_entities,
+            ent2=dst_entities,
+            travel_method=travel_method,
+            is_self_matrix=is_self_matrix
+        )
 
-            blk_distance = get_cross_distance_matrix(
-                ent1=src_entities,
-                ent2=dst_entities,
-                travel_method=travel_method,
-                is_self_matrix=is_self_matrix
-            )
+    completed = 0
+    with ThreadPoolExecutor(max_workers=OSRM_MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(run_block, blk1, blk2): (blk1, blk2)
+            for blk1 in blocks1
+            for blk2 in blocks2
+        }
+        for future in as_completed(futures):
+            blk_distance = future.result()
             distance_info['distance'].update(blk_distance['distance'])
             distance_info['duration'].update(blk_distance['duration'])
+            completed += 1
+            if completed % 20 == 0 or completed == total_blocks:
+                print(f"  Processing block {completed}/{total_blocks}...")
 
     return distance_info
 

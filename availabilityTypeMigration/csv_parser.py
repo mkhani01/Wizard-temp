@@ -158,10 +158,10 @@ def extract_from_csv(csv_path):
 
 
 def deduplicate(types):
-    """Deduplicate by (name, type, category). Keeps last occurrence."""
+    """Deduplicate by (name, type, category). Name comparison is case-insensitive. Keeps last occurrence."""
     unique_map = {}
     for t in types:
-        key = (t["name"], t["type"], t["category"])
+        key = ((t.get("name") or "").strip().lower(), t["type"], t["category"])
         unique_map[key] = t
     result = list(unique_map.values())
     if len(result) != len(types):

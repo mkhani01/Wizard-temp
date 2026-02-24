@@ -146,6 +146,9 @@ def get_availability_types(connection) -> Dict[str, Dict]:
         for row in cursor.fetchall():
             name_lower = (row['name'] or '').strip().lower()
             is_unavailability = (row['type'] or '').strip().lower() == 'unavailability'
+            # Swap Day is always availability (it appears in availability export, not unavailability)
+            if name_lower == 'swap day':
+                is_unavailability = False
             types_map[name_lower] = {
                 'id': row['id'],
                 'is_unavailability': is_unavailability
