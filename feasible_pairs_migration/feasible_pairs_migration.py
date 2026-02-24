@@ -13,6 +13,12 @@ from datetime import datetime
 from collections import defaultdict
 import psycopg2
 from psycopg2.extras import RealDictCursor, execute_values
+from psycopg2 import OperationalError, InterfaceError
+
+try:
+    from connection_manager import ConnectionLostError
+except ImportError:
+    ConnectionLostError = None
 
 # Configure logging
 logging.basicConfig(
@@ -54,6 +60,10 @@ def connect_to_database(config):
             password=config['password'],
             cursor_factory=RealDictCursor,
             connect_timeout=10,
+            keepalives=1,
+            keepalives_idle=30,
+            keepalives_interval=10,
+            keepalives_count=5,
         )
         connection.autocommit = False
         logger.info("✓ Connected to database")
@@ -418,81 +428,34 @@ def extract_visit_frequencies_from_csv(csv_path, users_lookup, clients_lookup):
 
 def seed_feasible_pairs(connection, frequencies, existing_pairs):
     """
-    Insert or update feasible pairs based on frequency data.
-    
-    For new pairs: INSERT
-    For existing pairs: UPDATE frequency (add to existing)
+    Insert or update feasible pairs. Idempotent: CSV is source of truth.
+    For new pairs: INSERT. For existing pairs: SET frequency = value (not add).
+    Re-running after connection loss will not double frequencies.
     """
     if not frequencies:
         logger.warning("No frequency data to insert.")
         return False
-    
     cursor = connection.cursor()
-    
     try:
-        # Separate new pairs from updates
-        new_pairs = []
-        existing_updates = []
-        
-        for (caregiver_id, client_id), frequency in frequencies.items():
-            pair_key = (caregiver_id, client_id)
-            
-            if pair_key in existing_pairs:
-                # Update existing pair - add new frequency to existing
-                existing_freq = existing_pairs[pair_key]['frequency']
-                new_freq = existing_freq + frequency
-                existing_updates.append((caregiver_id, client_id, new_freq))
-            else:
-                # Insert new pair
-                new_pairs.append((caregiver_id, client_id, frequency))
-        
-        logger.info(f"\nSeeding feasible pairs to database...")
-        logger.info(f"  New pairs to insert: {len(new_pairs)}")
-        logger.info(f"  Existing pairs to update: {len(existing_updates)}")
-        
-        # Insert new pairs
-        if new_pairs:
-            insert_query = """
-                INSERT INTO feasible_pairs (cgid, client_id, frequency, wait)
-                VALUES %s
-                RETURNING id, cgid, client_id, frequency
-            """
-            
-            execute_values(
-                cursor,
-                insert_query,
-                new_pairs,
-                template="(%s, %s, %s, 0)"
-            )
-            
-            inserted = cursor.fetchall()
-            logger.info(f"✓ Inserted {len(inserted)} new feasible pairs")
-            
-            # Log sample
-            if inserted:
-                logger.info("Sample inserted pairs:")
-                for pair in inserted[:5]:
-                    logger.info(f"  - Caregiver ID: {pair['cgid']}, Client ID: {pair['client_id']}, Frequency: {pair['frequency']}")
-        
-        # Update existing pairs
-        if existing_updates:
-            update_count = 0
-            for caregiver_id, client_id, frequency in existing_updates:
-                update_query = """
-                    UPDATE feasible_pairs 
-                    SET frequency = %s 
-                    WHERE cgid = %s AND client_id = %s
-                """
-                cursor.execute(update_query, (frequency, caregiver_id, client_id))
-                update_count += cursor.rowcount
-            
-            logger.info(f"✓ Updated {update_count} existing feasible pairs")
-        
+        # Build list of (cgid, client_id, frequency) for upsert
+        pairs_data = [(cgid, cid, freq) for (cgid, cid), freq in frequencies.items()]
+        logger.info(f"\nSeeding feasible pairs to database (idempotent upsert)...")
+        logger.info(f"  Pairs to insert/update: {len(pairs_data)}")
+        upsert_query = """
+            INSERT INTO feasible_pairs (cgid, client_id, frequency, wait)
+            VALUES %s
+            ON CONFLICT (cgid, client_id) DO UPDATE SET
+                frequency = EXCLUDED.frequency
+        """
+        execute_values(cursor, upsert_query, pairs_data, template="(%s, %s, %s, 0)")
         connection.commit()
-        
-        logger.info(f"\n✓ Successfully processed all feasible pairs")
+        logger.info(f"✓ Successfully processed {len(pairs_data)} feasible pairs")
         return True
-        
+    except (OperationalError, InterfaceError) as e:
+        connection.rollback()
+        if ConnectionLostError:
+            raise ConnectionLostError("feasible_pairs", {}) from e
+        raise
     except Exception as e:
         connection.rollback()
         logger.error(f"✗ Failed to seed feasible pairs: {e}")
@@ -501,25 +464,22 @@ def seed_feasible_pairs(connection, frequencies, existing_pairs):
         cursor.close()
 
 
-def run(csv_path=None):
-    """Main execution function. csv_path can be passed (e.g. from wizard) or from sys.argv, or default assets/visit_data.csv."""
+def run(csv_path=None, connection_manager=None, state=None):
+    """Main execution function. connection_manager and state used from wizard for resume support."""
     print("""
     ╔══════════════════════════════════════════════════════════╗
     ║         Feasible Pairs Migration                         ║
     ║         Seeding feasible_pairs from visit data CSV       ║
     ╚══════════════════════════════════════════════════════════╝
     """)
-    
-    # Get database config
+    if state and state.is_completed("feasible_pairs"):
+        logger.info("Feasible pairs migration already completed (resume).")
+        return True
     config = get_db_config()
-    
-    # Validate config
     if not all([config['database'], config['user'], config['password']]):
         logger.error("Missing database configuration in environment variables")
         logger.error("Required: DB_NAME, DB_USER, DB_PASSWORD")
         return False
-    
-    # Get CSV path: explicit argument, then command line, then default
     if csv_path is not None:
         csv_path = Path(csv_path)
     elif len(sys.argv) > 1:
@@ -527,59 +487,51 @@ def run(csv_path=None):
     else:
         from migration_support import get_assets_dir
         csv_path = get_assets_dir() / 'visit_data.csv'
-    
     if not csv_path.exists():
         logger.error(f"CSV file not found: {csv_path}")
         logger.info("Usage: python feasible_pairs_migration.py <path_to_csv>")
         return False
-    
     logger.info(f"CSV file: {csv_path}")
-    
-    # Check file size
     file_size_mb = csv_path.stat().st_size / (1024 * 1024)
     logger.info(f"File size: {file_size_mb:.2f} MB")
-    
     if file_size_mb > 100:
         logger.info("Large file detected - processing may take several minutes")
-    
-    # Connect and migrate
     connection = None
     try:
         logger.info("\n" + "="*60)
         logger.info("STEP 1: DATABASE CONNECTION")
         logger.info("="*60)
-        connection = connect_to_database(config)
-        
+        if connection_manager:
+            connection = connection_manager.get_connection()
+        else:
+            connection = connect_to_database(config)
         logger.info("\n" + "="*60)
         logger.info("STEP 2: LOAD CAREGIVERS (USERS)")
         logger.info("="*60)
         users_lookup = load_users_lookup(connection)
-        
         logger.info("\n" + "="*60)
         logger.info("STEP 3: LOAD CLIENTS")
         logger.info("="*60)
         clients_lookup = load_clients_lookup(connection)
-        
         logger.info("\n" + "="*60)
         logger.info("STEP 4: LOAD EXISTING FEASIBLE PAIRS")
         logger.info("="*60)
         existing_pairs = load_existing_feasible_pairs(connection)
-        
         logger.info("\n" + "="*60)
         logger.info("STEP 5: EXTRACT VISIT FREQUENCIES FROM CSV")
         logger.info("="*60)
         frequencies, stats = extract_visit_frequencies_from_csv(csv_path, users_lookup, clients_lookup)
-        
         if not frequencies:
             logger.warning("No valid visit frequencies found in CSV")
             return False
-        
         logger.info("\n" + "="*60)
         logger.info("STEP 6: SEED FEASIBLE PAIRS TO DATABASE")
         logger.info("="*60)
         success = seed_feasible_pairs(connection, frequencies, existing_pairs)
-        
         if success:
+            if state:
+                state.update("feasible_pairs", status="completed")
+                state.clear_step("feasible_pairs")
             print("\n" + "="*60)
             print("✓ FEASIBLE PAIRS MIGRATION COMPLETED SUCCESSFULLY")
             print("="*60)
@@ -593,17 +545,19 @@ def run(csv_path=None):
             print(f"  - Unmatched caregivers: {len(stats['unmatched_caregivers'])}")
             print(f"  - Unmatched clients: {len(stats['unmatched_clients'])}")
             return True
-        else:
-            print("\n" + "="*60)
-            print("✗ FEASIBLE PAIRS MIGRATION FAILED")
-            print("="*60)
-            return False
-            
+        print("\n" + "="*60)
+        print("✗ FEASIBLE PAIRS MIGRATION FAILED")
+        print("="*60)
+        return False
+    except (OperationalError, InterfaceError) as e:
+        if ConnectionLostError:
+            raise ConnectionLostError("feasible_pairs", {}) from e
+        raise
     except Exception as e:
         logger.error(f"Migration error: {e}", exc_info=True)
         return False
     finally:
-        if connection:
+        if connection and not connection_manager:
             connection.close()
             logger.info("\nDatabase connection closed")
 

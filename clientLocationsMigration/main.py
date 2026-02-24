@@ -10,6 +10,14 @@ from pathlib import Path
 from datetime import datetime
 import psycopg2
 from psycopg2.extras import RealDictCursor, execute_values
+from psycopg2 import OperationalError, InterfaceError
+
+try:
+    from connection_manager import ConnectionLostError
+except ImportError:
+    ConnectionLostError = None
+
+KEEPALIVES = dict(keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=5)
 
 # Configure logging
 logging.basicConfig(
@@ -51,6 +59,7 @@ def connect_to_database(config):
             password=config['password'],
             cursor_factory=RealDictCursor,
             connect_timeout=10,
+            **KEEPALIVES,
         )
         connection.autocommit = False
         logger.info("✓ Connected to database")
@@ -206,71 +215,67 @@ def update_client_locations(connection, client_locations):
         cursor.close()
 
 
-def run():
-    """Main execution function"""
+def run(connection_manager=None, state=None):
+    """Main execution function. connection_manager and state used from wizard for resume support."""
     print("""
     ╔══════════════════════════════════════════════════════════╗
     ║         Client Locations Migration                       ║
     ║         Update lat/lng from JSON backup                  ║
     ╚══════════════════════════════════════════════════════════╝
     """)
-    
-    # Get database config
+    if state and state.is_completed("client_locations"):
+        logger.info("Client locations migration already completed (resume).")
+        return True
     config = get_db_config()
-    
-    # Validate config
     if not all([config['database'], config['user'], config['password']]):
         logger.error("Missing database configuration in .env file")
         logger.error("Required: DB_NAME, DB_USER, DB_PASSWORD")
         return False
-    
-    # Get JSON path (uses exe dir when frozen)
     from migration_support import get_assets_dir
     json_path = get_assets_dir() / 'clientbackup.json'
-    
     if not json_path.exists():
-        logger.error(f"JSON file not found: {json_path}")
-        logger.error("Please place clientbackup.json in the assets/ directory")
+        logger.error("JSON file not found: %s", json_path)
         return False
-    
-    # Connect and migrate
     connection = None
     try:
         logger.info("\n" + "="*60)
         logger.info("STEP 1: DATABASE CONNECTION")
         logger.info("="*60)
-        connection = connect_to_database(config)
-        
+        if connection_manager:
+            connection = connection_manager.get_connection()
+        else:
+            connection = connect_to_database(config)
         logger.info("\n" + "="*60)
         logger.info("STEP 2: LOAD CLIENT LOCATIONS FROM JSON")
         logger.info("="*60)
         client_locations = load_client_locations_from_json(json_path)
-        
         if not client_locations:
             logger.warning("No client locations found in JSON")
             return False
-        
         logger.info("\n" + "="*60)
         logger.info("STEP 3: UPDATE CLIENT LOCATIONS IN DATABASE")
         logger.info("="*60)
         success = update_client_locations(connection, client_locations)
-        
         if success:
+            if state:
+                state.clear_step("client_locations")
             print("\n" + "="*60)
             print("✓ CLIENT LOCATIONS MIGRATION COMPLETED SUCCESSFULLY")
             print("="*60)
             return True
-        else:
-            print("\n" + "="*60)
-            print("✗ CLIENT LOCATIONS MIGRATION FAILED")
-            print("="*60)
-            return False
-            
+        print("\n" + "="*60)
+        print("✗ CLIENT LOCATIONS MIGRATION FAILED")
+        print("="*60)
+        return False
+    except (OperationalError, InterfaceError) as e:
+        if ConnectionLostError:
+            raise ConnectionLostError("client_locations", {}) from e
+        raise
     except Exception as e:
-        logger.error(f"Migration error: {e}", exc_info=True)
+        logger.error("Migration error: %s", e, exc_info=True)
         return False
     finally:
-        if connection:
+        if connection and not connection_manager:
             connection.close()
             logger.info("\nDatabase connection closed")
 

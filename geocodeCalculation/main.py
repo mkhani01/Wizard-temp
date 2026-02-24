@@ -67,6 +67,14 @@ def get_db_config():
     }
 
 
+try:
+    from connection_manager import ConnectionLostError
+except ImportError:
+    ConnectionLostError = None
+
+KEEPALIVES = dict(keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=5)
+
+
 def connect_to_database(config):
     """Connect to PostgreSQL database"""
     try:
@@ -79,6 +87,7 @@ def connect_to_database(config):
             password=config['password'],
             cursor_factory=RealDictCursor,
             connect_timeout=10,
+            **KEEPALIVES,
         )
         connection.autocommit = False
         logger.info("✓ Connected to database")
@@ -548,8 +557,9 @@ def process_clients(connection, geocoder, clients, cities):
     return success_count
 
 
-def run():
-    """Main execution function"""
+def run(connection_manager=None, state=None):
+    """Main execution function. connection_manager and state used from wizard for resume support."""
+    import psycopg2
     print("""
     ╔══════════════════════════════════════════════════════════╗
     ║         Geocode Calculation Migration                    ║
@@ -557,47 +567,42 @@ def run():
     ║         (Only for records with null coordinates)         ║
     ╚══════════════════════════════════════════════════════════╝
     """)
-    
-    logger.info(f"Configuration:")
-    logger.info(f"  Population Threshold: {POPULATION_THRESHOLD}")
-    logger.info(f"  City Radius: {CITY_RADIUS_KM} km")
-    logger.info(f"  Dense Resolution: {DENSE_H3_RESOLUTION}")
-    logger.info(f"  Rural Resolution: {RURAL_H3_RESOLUTION}")
-    
-    # Get Google API key
+    if state and state.is_completed("geocode_api"):
+        logger.info("Geocode migration already completed (resume).")
+        return True
+    logger.info("Configuration:")
+    logger.info("  Population Threshold: %s", POPULATION_THRESHOLD)
+    logger.info("  City Radius: %s km", CITY_RADIUS_KM)
+    logger.info("  Dense Resolution: %s", DENSE_H3_RESOLUTION)
+    logger.info("  Rural Resolution: %s", RURAL_H3_RESOLUTION)
     google_api_key = os.getenv('GOOGLE_MAPS_API_KEY')
     if not google_api_key:
         logger.error("GOOGLE_MAPS_API_KEY not found in environment variables")
         return False
-    
-    # Get database config
     config = get_db_config()
     if not all([config['database'], config['user'], config['password']]):
         logger.error("Missing database configuration")
         return False
-    
-    # Check IE.txt file (uses exe dir when frozen)
     from migration_support import get_assets_dir
     ie_file = get_assets_dir() / 'IE.txt'
     if not ie_file.exists():
-        logger.error(f"IE.txt not found: {ie_file}")
+        logger.error("IE.txt not found: %s", ie_file)
         return False
-    
-    # Initialize
     cache = GeocodeCache()
     geocoder = GoogleGeocoder(google_api_key, cache)
-    
     connection = None
     try:
         logger.info("\n" + "="*60)
         logger.info("STEP 1: LOAD IRISH CITIES")
         logger.info("="*60)
         cities = load_irish_cities(ie_file)
-        
         logger.info("\n" + "="*60)
         logger.info("STEP 2: DATABASE CONNECTION")
         logger.info("="*60)
-        connection = connect_to_database(config)
+        if connection_manager:
+            connection = connection_manager.get_connection()
+        else:
+            connection = connect_to_database(config)
         
         logger.info("\n" + "="*60)
         logger.info("STEP 3: FETCH RECORDS")
@@ -668,16 +673,21 @@ def run():
             print("="*60)
             return False
         else:
+            if state:
+                state.clear_step("geocode_api")
             print("\n" + "="*60)
             print("✓ GEOCODE CALCULATION COMPLETED SUCCESSFULLY")
             print("="*60)
             return True
-            
+    except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+        if ConnectionLostError:
+            raise ConnectionLostError("geocode_api", {}) from e
+        raise
     except Exception as e:
-        logger.error(f"Migration error: {e}", exc_info=True)
+        logger.error("Migration error: %s", e, exc_info=True)
         return False
     finally:
-        if connection:
+        if connection and not connection_manager:
             connection.close()
             logger.info("\nDatabase connection closed")
 

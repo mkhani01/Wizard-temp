@@ -126,6 +126,16 @@ OPT_ASSET_PATH = {
 AOS_URL = "https://aossystem.com/"
 PRIVACY_URL = "https://aossystem.com/"
 
+# Connection-lost exception from migration steps
+try:
+    from connection_manager import ConnectionManager, ConnectionLostError, is_connection_error
+    from migration_state import MigrationState
+except ImportError:
+    ConnectionManager = None
+    ConnectionLostError = None
+    MigrationState = None
+    is_connection_error = None
+
 # Required keys in client/user location JSON backup files
 LOCATION_JSON_REQUIRED_KEYS = ("latitude", "longitude", "name", "lastname")
 
@@ -270,9 +280,12 @@ class MigrationWizard:
         self.btn_continue_next = ttk.Button(btn_frame, text="Continue from next", command=self._on_continue_from_next)
         self.btn_continue_next.pack(side="right", padx=4)
         self.btn_continue_next.pack_forget()
-        self.btn_retry = ttk.Button(btn_frame, text="Retry failed step", command=self._on_retry_migration)
+        self.btn_retry = ttk.Button(btn_frame, text="Retry", command=self._on_retry_migration)
         self.btn_retry.pack(side="right", padx=4)
         self.btn_retry.pack_forget()
+        self.btn_test_connection = ttk.Button(btn_frame, text="Test connection", command=self._on_test_connection)
+        self.btn_test_connection.pack(side="right", padx=4)
+        self.btn_test_connection.pack_forget()
         self.btn_run_again = ttk.Button(btn_frame, text="Run again", command=self._on_run_again)
         self.btn_run_again.pack(side="right", padx=4)
         self.btn_run_again.pack_forget()
@@ -285,6 +298,8 @@ class MigrationWizard:
         self._run_order = []
         self._run_failed_index = None
         self._run_log_path = None
+        self._connection_lost = False
+        self._connection_lost_context = None
 
     def _add_step_header(self, parent, start_row=0):
         """Add logo at top of step. Returns next row index. Keeps logo reference on parent."""
@@ -665,6 +680,19 @@ class MigrationWizard:
         self.run_log = scrolledtext.ScrolledText(parent, height=16, width=72, wrap="word", state="disabled")
         self.run_log.grid(row=row, column=0, sticky=(N, S, E, W), pady=(4, 8))
         row += 1
+        self._connection_lost_frame = ttk.Frame(parent)
+        self._connection_lost_frame.grid(row=row, column=0, sticky=(E, W), pady=(4, 4))
+        self._connection_lost_frame.columnconfigure(0, weight=1)
+        self._connection_lost_label = ttk.Label(
+            self._connection_lost_frame,
+            text="",
+            wraplength=560,
+            foreground="darkred",
+            font=("", 10, "bold"),
+        )
+        self._connection_lost_label.grid(row=0, column=0, sticky=W)
+        self._connection_lost_frame.grid_remove()
+        row += 1
         self.run_progress = ttk.Progressbar(parent, mode="indeterminate")
         self.run_progress.grid(row=row, column=0, sticky=(E, W), pady=(0, 4))
         parent.columnconfigure(0, weight=1)
@@ -704,11 +732,42 @@ class MigrationWizard:
     def _hide_retry_continue_buttons(self):
         self.btn_retry.pack_forget()
         self.btn_continue_next.pack_forget()
+        self.btn_test_connection.pack_forget()
+        self._connection_lost_frame.grid_remove()
 
     def _show_retry_continue_buttons(self):
         self.btn_retry.pack(side="right", padx=4)
+        if self._connection_lost:
+            self.btn_test_connection.pack(side="right", padx=4)
         if self._run_failed_index is not None and self._run_order and self._run_failed_index + 1 < len(self._run_order):
             self.btn_continue_next.pack(side="right", padx=4)
+
+    def _show_connection_lost(self, e):
+        """Show connection-lost message and store context for log."""
+        self._connection_lost = True
+        self._connection_lost_context = getattr(e, "context", None) or {}
+        step_name = getattr(e, "step_name", "Unknown step")
+        lines = [
+            "DATABASE CONNECTION LOST",
+            "The connection to the database was interrupted (port-forward may have dropped).",
+            "",
+            "Progress saved. When you restore the connection, click \"Retry\" to resume",
+            "exactly where it stopped. No work will be repeated.",
+            "",
+            "Step: %s" % step_name,
+        ]
+        ctx = self._connection_lost_context
+        if ctx.get("completed_segments") is not None:
+            lines.append("Progress: %s segments completed" % len(ctx["completed_segments"]))
+        if ctx.get("current_segment"):
+            lines.append("Current segment: %s" % ctx["current_segment"])
+        if "batch_index" in ctx:
+            lines.append("Batch: %s" % ctx["batch_index"])
+        if "current_segment_batches_committed" in ctx:
+            lines.append("Batches committed in current segment: %s" % ctx["current_segment_batches_committed"])
+        self._connection_lost_label.config(text="\n".join(lines))
+        self._connection_lost_frame.grid()
+        self.run_progress.stop()
 
     def _on_cancel(self):
         if self.current_step == STEP_RUN and getattr(self, "_run_in_progress", False):
@@ -718,6 +777,30 @@ class MigrationWizard:
         if messagebox.askyesno("Cancel", "Are you sure you want to cancel the wizard?"):
             self.root.quit()
             self.root.destroy()
+
+    def _on_test_connection(self):
+        """Test database connection (e.g. after restoring port-forward)."""
+        if ConnectionManager is None:
+            messagebox.showinfo("Test connection", "Connection manager not available.")
+            return
+        self._apply_env()
+        config = {
+            "host": self.db_config["host"].get().strip(),
+            "port": self.db_config["port"].get().strip(),
+            "database": self.db_config["database"].get().strip(),
+            "user": self.db_config["user"].get().strip(),
+            "password": self.db_config["password"].get().strip(),
+        }
+        try:
+            mgr = ConnectionManager(config)
+            ok = mgr.check_connection()
+            mgr.close()
+            if ok:
+                messagebox.showinfo("Test connection", "Connection successful. You can click Retry to resume.")
+            else:
+                messagebox.showwarning("Test connection", "Connection failed. Check port-forward and settings.")
+        except Exception as e:
+            messagebox.showerror("Test connection", "Error: %s" % e)
 
     def _on_retry_migration(self):
         if self._run_order and self._run_failed_index is not None:
@@ -853,6 +936,7 @@ class MigrationWizard:
         self._run_cancelled = False
         self._run_failed_index = None
         self._run_in_progress = True
+        self._connection_lost = False
         self._hide_retry_continue_buttons()
         if start_from > 0 and self._run_order:
             order = self._run_order
@@ -897,6 +981,20 @@ class MigrationWizard:
         root_logger.setLevel(logging.DEBUG)
         root_logger.addHandler(handler)
         root_logger.addHandler(console_handler)
+        conn_manager = None
+        state = None
+        if ConnectionManager and MigrationState:
+            db_config = {
+                "host": self.db_config["host"].get().strip(),
+                "port": self.db_config["port"].get().strip(),
+                "database": self.db_config["database"].get().strip(),
+                "user": self.db_config["user"].get().strip(),
+                "password": self.db_config["password"].get().strip(),
+            }
+            conn_manager = ConnectionManager(db_config)
+            state = MigrationState()
+            if start_from == 0:
+                state.clear_all()
         try:
             if start_from == 0:
                 self.root.after(0, lambda: self._append_log("Running pre-run checks...\n"))
@@ -939,7 +1037,10 @@ class MigrationWizard:
                 name, fn = order[i]
                 self.root.after(0, lambda n=name: self._append_log("Running: %s\n" % n))
                 try:
-                    success = fn()
+                    if conn_manager is not None and state is not None:
+                        success = fn(connection_manager=conn_manager, state=state)
+                    else:
+                        success = fn()
                     self.root.after(0, lambda n=name, s=success: self._append_log("  %s: %s\n" % (n, "OK" if s else "FAILED")))
                     if not success:
                         had_failure = True
@@ -950,6 +1051,13 @@ class MigrationWizard:
                     self.root.after(0, lambda n=name: self._append_log("  %s: Not available yet (add your migration script later).\n" % n))
                     logging.info("Migration %s not available: %s", name, e)
                 except Exception as e:
+                    if ConnectionLostError and isinstance(e, ConnectionLostError):
+                        had_failure = True
+                        failed_index = i
+                        self.root.after(0, lambda: self._append_log("\nDatabase connection lost. Progress saved. Restore connection and click Retry to resume.\n"))
+                        self.run_progress.stop()
+                        self.root.after(0, lambda ex=e: self._show_connection_lost(ex))
+                        break
                     had_failure = True
                     failed_index = i
                     self.root.after(0, lambda n=name, err=str(e): self._append_log("  %s: ERROR %s\n" % (n, err)))
@@ -960,6 +1068,8 @@ class MigrationWizard:
                 if not getattr(self, "_run_cancelled", False):
                     self.root.after(0, lambda: self._append_log("\nAll selected steps completed.\n"))
         finally:
+            if conn_manager:
+                conn_manager.close()
             root_logger.removeHandler(handler)
             root_logger.removeHandler(console_handler)
             log_content = buf.getvalue()
@@ -1087,63 +1197,63 @@ class MigrationWizard:
             order.append(("Feasible pairs (visit history)", self._run_feasible_pairs))
         return order
 
-    def _run_users(self):
+    def _run_users(self, connection_manager=None, state=None):
         sys.path.insert(0, str(BUNDLE_ROOT))
         from usersMigration.main import run
-        return run()
+        return run(connection_manager=connection_manager, state=state)
 
-    def _run_availability_types(self):
+    def _run_availability_types(self, connection_manager=None, state=None):
         sys.path.insert(0, str(BUNDLE_ROOT))
         from availabilityTypeMigration.main import run
-        return run()
+        return run(connection_manager=connection_manager, state=state)
 
-    def _run_user_availability(self):
+    def _run_user_availability(self, connection_manager=None, state=None):
         sys.path.insert(0, str(BUNDLE_ROOT))
         from userAvailabilityMigration.main import run
         xlsx_path = str(ASSETS / OPT_ASSET_PATH[OPT_CAREGIVERS_AVAILABILITY])
-        return run(xlsx_path)
+        return run(xlsx_path, connection_manager=connection_manager, state=state)
 
-    def _run_clients(self):
+    def _run_clients(self, connection_manager=None, state=None):
         sys.path.insert(0, str(BUNDLE_ROOT))
         from clientsMigration.main import run
-        return run()
+        return run(connection_manager=connection_manager, state=state)
 
-    def _run_client_availability(self):
+    def _run_client_availability(self, connection_manager=None, state=None):
         sys.path.insert(0, str(BUNDLE_ROOT))
         from clientAvailabilityMigration.main import run
-        return run()
+        return run(connection_manager=connection_manager, state=state)
 
-    def _run_geocode_api(self):
+    def _run_geocode_api(self, connection_manager=None, state=None):
         sys.path.insert(0, str(BUNDLE_ROOT))
         from geocodeCalculation.main import run
-        return run()
+        return run(connection_manager=connection_manager, state=state)
 
-    def _run_client_locations(self):
+    def _run_client_locations(self, connection_manager=None, state=None):
         sys.path.insert(0, str(BUNDLE_ROOT))
         from clientLocationsMigration.main import run
-        return run()
+        return run(connection_manager=connection_manager, state=state)
 
-    def _run_user_locations(self):
+    def _run_user_locations(self, connection_manager=None, state=None):
         sys.path.insert(0, str(BUNDLE_ROOT))
         from userLocationsMigration.main import run
-        return run()
+        return run(connection_manager=connection_manager, state=state)
 
-    def _run_travel_distances(self):
+    def _run_travel_distances(self, connection_manager=None, state=None):
         sys.path.insert(0, str(BUNDLE_ROOT))
         from distance_migration.travel_distances_migration import run
-        return run()
+        return run(connection_manager=connection_manager, state=state)
 
-    def _run_feasible_pairs(self):
+    def _run_feasible_pairs(self, connection_manager=None, state=None):
         sys.path.insert(0, str(BUNDLE_ROOT))
         from feasible_pairs_migration.feasible_pairs_migration import run as run_feasible_pairs
         csv_path = ASSETS / "visit_data.csv"
-        return run_feasible_pairs(csv_path=str(csv_path))
+        return run_feasible_pairs(csv_path=str(csv_path), connection_manager=connection_manager, state=state)
 
-    def _run_client_windows(self):
+    def _run_client_windows(self, connection_manager=None, state=None):
         sys.path.insert(0, str(BUNDLE_ROOT))
         from clientWindowsAnalyzer.main import run as run_client_windows
         csv_path = ASSETS / OPT_ASSET_PATH[OPT_CLIENT_WINDOWS]
-        return run_client_windows(csv_path=str(csv_path))
+        return run_client_windows(csv_path=str(csv_path), connection_manager=connection_manager, state=state)
 
     def run(self):
         self.root.mainloop()

@@ -13,6 +13,15 @@ from datetime import datetime
 from migration_support import get_assets_dir
 import psycopg2
 from psycopg2.extras import RealDictCursor, execute_values
+from psycopg2 import OperationalError, InterfaceError
+
+try:
+    from connection_manager import ConnectionLostError
+except ImportError:
+    ConnectionLostError = None
+
+USER_BATCH_SIZE = 500
+KEEPALIVES = dict(keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=5)
 
 # Configure logging
 logging.basicConfig(
@@ -54,6 +63,7 @@ def connect_to_database(config):
             password=config['password'],
             cursor_factory=RealDictCursor,
             connect_timeout=10,
+            **KEEPALIVES,
         )
         connection.autocommit = False
         logger.info("✓ Connected to database")
@@ -345,135 +355,109 @@ def extract_users_from_csv(csv_path, lookups):
     )
     return users
 
-def seed_users(connection, users):
-    """Insert users into database and link to groups"""
+def seed_users(connection, users, state=None):
+    """Insert users into database and link to groups. If state is provided, use batched inserts and checkpoints."""
     if not users:
         logger.warning("No users to insert")
         return False
-    
-    logger.info(f"Inserting/Updating {len(users)} users...")
-    
+
+    required_keys = [
+        'name', 'lastname', 'middle_name', 'preferred_name', 'email', 'phone_number',
+        'password', 'is_loginable', 'is_caregiver', 'birth_date', 'gender', 'marital_status',
+        'pps_number', 'town', 'county', 'postcode', 'travel_method', 'status',
+        'title_id', 'nationality_id', 'religion_id', 'origin_id',
+    ]
+    user_tuples = []
+    for idx, user in enumerate(users):
+        try:
+            for k in required_keys:
+                if k not in user:
+                    raise KeyError("missing key %r" % k)
+            user_tuples.append((
+                user['name'], user['lastname'], user['middle_name'], user['preferred_name'],
+                user['email'], user['phone_number'], user['password'], user['is_loginable'],
+                user['is_caregiver'], user['birth_date'], user['gender'], user['marital_status'],
+                user['pps_number'], user['town'], user['county'], user['postcode'],
+                user['travel_method'], user['status'], user['title_id'], user['nationality_id'],
+                user['religion_id'], user['origin_id'],
+            ))
+        except KeyError as e:
+            logger.error("User at index %d (email=%r): %s. Keys present: %s", idx, user.get('email'), e, list(user.keys()))
+            raise ValueError("Invalid user at index %d: %s" % (idx, e)) from e
+
+    if not user_tuples:
+        logger.warning("No valid user tuples to insert after validation")
+        return False
+
+    insert_query = """
+        INSERT INTO "user" (
+            name, lastname, middle_name, preferred_name, email, phone_number,
+            password, is_loginable, is_caregiver, birth_date, gender, marital_status,
+            "ppsNumber", town, county, postcode, travel_method, status,
+            title_id, nationality_id, religion_id, origin_id,
+            created_date, last_modified_date
+        ) VALUES %s
+        ON CONFLICT (email) DO UPDATE SET
+            name = EXCLUDED.name, lastname = EXCLUDED.lastname, middle_name = EXCLUDED.middle_name,
+            preferred_name = EXCLUDED.preferred_name, phone_number = EXCLUDED.phone_number,
+            is_loginable = EXCLUDED.is_loginable, is_caregiver = EXCLUDED.is_caregiver,
+            birth_date = EXCLUDED.birth_date, gender = EXCLUDED.gender, marital_status = EXCLUDED.marital_status,
+            "ppsNumber" = EXCLUDED."ppsNumber", town = EXCLUDED.town, county = EXCLUDED.county,
+            postcode = EXCLUDED.postcode, travel_method = EXCLUDED.travel_method, status = EXCLUDED.status,
+            title_id = EXCLUDED.title_id, nationality_id = EXCLUDED.nationality_id,
+            religion_id = EXCLUDED.religion_id, origin_id = EXCLUDED.origin_id,
+            last_modified_date = NOW()
+        RETURNING id, email
+    """
+    template = "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())"
+
     cursor = connection.cursor()
     try:
-        # Do NOT include id in INSERT: let DB default get_next_daily_id('user') generate
-        # YYYYMMDD + 6-digit sequence (e.g. 20260218000001). Same pattern as clients migration.
-        insert_query = """
-            INSERT INTO "user" (
-                name, lastname, middle_name, preferred_name, email, phone_number,
-                password, is_loginable, is_caregiver, birth_date, gender, marital_status,
-                "ppsNumber", town, county, postcode, travel_method, status,
-                title_id, nationality_id, religion_id, origin_id,
-                created_date, last_modified_date
-            ) VALUES %s
-            ON CONFLICT (email) DO UPDATE SET
-                name = EXCLUDED.name,
-                lastname = EXCLUDED.lastname,
-                middle_name = EXCLUDED.middle_name,
-                preferred_name = EXCLUDED.preferred_name,
-                phone_number = EXCLUDED.phone_number,
-                is_loginable = EXCLUDED.is_loginable,
-                is_caregiver = EXCLUDED.is_caregiver,
-                birth_date = EXCLUDED.birth_date,
-                gender = EXCLUDED.gender,
-                marital_status = EXCLUDED.marital_status,
-                "ppsNumber" = EXCLUDED."ppsNumber",
-                town = EXCLUDED.town,
-                county = EXCLUDED.county,
-                postcode = EXCLUDED.postcode,
-                travel_method = EXCLUDED.travel_method,
-                status = EXCLUDED.status,
-                title_id = EXCLUDED.title_id,
-                nationality_id = EXCLUDED.nationality_id,
-                religion_id = EXCLUDED.religion_id,
-                origin_id = EXCLUDED.origin_id,
-                last_modified_date = NOW()
-            RETURNING id, email
-        """
-
-        # Required keys for each user (must match tuple order and template)
-        required_keys = [
-            'name', 'lastname', 'middle_name', 'preferred_name', 'email', 'phone_number',
-            'password', 'is_loginable', 'is_caregiver', 'birth_date', 'gender', 'marital_status',
-            'pps_number', 'town', 'county', 'postcode', 'travel_method', 'status',
-            'title_id', 'nationality_id', 'religion_id', 'origin_id',
-        ]
-        user_tuples = []
-        for idx, user in enumerate(users):
+        if state is None:
+            execute_values(cursor, insert_query, user_tuples, template=template, fetch=True)
+            processed = cursor.fetchall()
+            if processed:
+                user_ids = [row['id'] for row in processed]
+                cursor.execute("DELETE FROM user_users_groups WHERE user_id = ANY(%s)", (user_ids,))
+                link_users_to_groups(cursor, processed, users)
+            connection.commit()
+            logger.info("Successfully processed %d users (inserted/updated)", len(processed))
+            return True
+        start_batch = state.get("users_migration", "batch_index", 0)
+        batch_size = USER_BATCH_SIZE
+        all_processed = []
+        total_committed = start_batch * batch_size
+        for batch_start in range(start_batch * batch_size, len(user_tuples), batch_size):
+            batch = user_tuples[batch_start:batch_start + batch_size]
+            batch_index = batch_start // batch_size
             try:
-                for k in required_keys:
-                    if k not in user:
-                        raise KeyError("missing key %r" % k)
-                user_tuples.append((
-                    user['name'],
-                    user['lastname'],
-                    user['middle_name'],
-                    user['preferred_name'],
-                    user['email'],
-                    user['phone_number'],
-                    user['password'],
-                    user['is_loginable'],
-                    user['is_caregiver'],
-                    user['birth_date'],
-                    user['gender'],
-                    user['marital_status'],
-                    user['pps_number'],
-                    user['town'],
-                    user['county'],
-                    user['postcode'],
-                    user['travel_method'],
-                    user['status'],
-                    user['title_id'],
-                    user['nationality_id'],
-                    user['religion_id'],
-                    user['origin_id'],
-                ))
-            except KeyError as e:
-                logger.error("User at index %d (email=%r): %s. Keys present: %s", idx, user.get('email'), e, list(user.keys()))
-                raise ValueError("Invalid user at index %d: %s" % (idx, e)) from e
+                execute_values(cursor, insert_query, batch, template=template, fetch=True)
+                processed = cursor.fetchall()
+                all_processed.extend(processed)
+                if processed:
+                    user_ids = [row['id'] for row in processed]
+                    cursor.execute("DELETE FROM user_users_groups WHERE user_id = ANY(%s)", (user_ids,))
+                    batch_users = users[batch_start:batch_start + len(batch)]
+                    link_users_to_groups(cursor, processed, batch_users)
+                connection.commit()
+                total_committed = batch_start + len(batch)
+                state.update("users_migration", status="in_progress", batch_index=batch_index + 1, rows_committed=total_committed)
+            except (OperationalError, InterfaceError) as e:
+                connection.rollback()
+                if ConnectionLostError:
+                    raise ConnectionLostError("users_migration", dict(batch_index=batch_index)) from e
+                raise
 
-        if not user_tuples:
-            logger.warning("No valid user tuples to insert after validation")
-            return False
-
-        logger.info("Inserting %d user rows (id from DB default get_next_daily_id)...", len(user_tuples))
-        # 22 columns from tuple + created_date, last_modified_date
-        template = "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())"
-        execute_values(
-            cursor,
-            insert_query,
-            user_tuples,
-            template=template,
-            fetch=True,
-        )
-        
-        processed = cursor.fetchall()
-        
-        # Link users to groups (many-to-many)
-        # First, clear existing group links for these users
-        if processed:
-            logger.info(f"\nUpdating group links for {len(processed)} users...")
-            user_ids = [row['id'] for row in processed]
-            
-            # Delete existing group links
-            cursor.execute(
-                "DELETE FROM user_users_groups WHERE user_id = ANY(%s)",
-                (user_ids,)
-            )
-            
-            # Re-link users to groups
-            link_users_to_groups(cursor, processed, users)
-        
-        connection.commit()
-        
-        logger.info("Successfully processed %d users (inserted/updated)", len(processed))
-        for i, row in enumerate(processed):
-            logger.info("  SEEDED user id=%s email=%r", row['id'], row['email'])
-        
+        state.update("users_migration", status="completed", rows_committed=total_committed)
+        state.clear_step("users_migration")
+        logger.info("Successfully processed %d users (inserted/updated)", len(all_processed))
         return True
-        
+    except (OperationalError, InterfaceError):
+        connection.rollback()
+        raise
     except Exception as e:
         connection.rollback()
-        logger.error(f"\n✗ Failed to process users: {e}")
+        logger.error("\nFailed to process users: %s", e)
         raise
     finally:
         cursor.close()
@@ -517,74 +501,68 @@ def link_users_to_groups(cursor, inserted_users, original_users):
     logger.info(f"✓ Linked {len(user_group_links)} user-group relationships")
 
 
-def run():
-    """Main execution function"""
+def run(connection_manager=None, state=None):
+    """Main execution function. When run from wizard, connection_manager and state are provided for resume support."""
     print("""
     ╔══════════════════════════════════════════════════════════╗
     ║         Users Migration                                  ║
     ║         Seeding user table from CSV                      ║
     ╚══════════════════════════════════════════════════════════╝
     """)
-    
-    # Get database config
+    if state and state.is_completed("users_migration"):
+        logger.info("Users migration already completed (resume).")
+        return True
     config = get_db_config()
-    
-    # Validate config
     if not all([config['database'], config['user'], config['password']]):
         logger.error("Missing database configuration in .env file")
         logger.error("Required: DB_NAME, DB_USER, DB_PASSWORD")
         return False
-    
-    # Get CSV path (uses exe dir when frozen, project root when dev)
     csv_path = get_assets_dir() / 'CareAssistantExport.csv'
-    
     if not csv_path.exists():
         logger.error(f"CSV file not found: {csv_path}")
         return False
-    
-    # Connect and migrate
     connection = None
     try:
         logger.info("\n" + "="*60)
         logger.info("STEP 1: DATABASE CONNECTION")
         logger.info("="*60)
-        connection = connect_to_database(config)
-        
+        if connection_manager:
+            connection = connection_manager.get_connection()
+        else:
+            connection = connect_to_database(config)
         logger.info("\n" + "="*60)
         logger.info("STEP 2: LOAD LOOKUP TABLES")
         logger.info("="*60)
         lookups = get_lookup_tables(connection)
-        
         logger.info("\n" + "="*60)
         logger.info("STEP 3: EXTRACT USERS FROM CSV")
         logger.info("="*60)
         users = extract_users_from_csv(csv_path, lookups)
-        
         if not users:
             logger.warning("No users found in CSV")
             return False
-        
         logger.info("\n" + "="*60)
         logger.info("STEP 4: SEED USERS TO DATABASE")
         logger.info("="*60)
-        success = seed_users(connection, users)
-        
+        success = seed_users(connection, users, state=state)
         if success:
             print("\n" + "="*60)
             print("✓ USERS MIGRATION COMPLETED SUCCESSFULLY")
             print("="*60)
             return True
-        else:
-            print("\n" + "="*60)
-            print("✗ USERS MIGRATION FAILED")
-            print("="*60)
-            return False
-            
+        print("\n" + "="*60)
+        print("✗ USERS MIGRATION FAILED")
+        print("="*60)
+        return False
+    except (OperationalError, InterfaceError) as e:
+        if ConnectionLostError and not connection_manager:
+            raise ConnectionLostError("users_migration", {}) from e
+        raise
     except Exception as e:
         logger.error(f"Migration error: {e}", exc_info=True)
         return False
     finally:
-        if connection:
+        if connection and not connection_manager:
             connection.close()
             logger.info("\nDatabase connection closed")
 

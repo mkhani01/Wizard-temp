@@ -84,6 +84,12 @@ def get_db_config() -> Dict[str, Any]:
     return config
 
 
+try:
+    from connection_manager import ConnectionLostError
+except ImportError:
+    ConnectionLostError = None
+
+
 def connect_to_database(config: Dict[str, Any]):
     """Connect to PostgreSQL database"""
     try:
@@ -96,6 +102,10 @@ def connect_to_database(config: Dict[str, Any]):
             password=config['password'],
             cursor_factory=RealDictCursor,
             connect_timeout=10,
+            keepalives=1,
+            keepalives_idle=30,
+            keepalives_interval=10,
+            keepalives_count=5,
         )
         connection.autocommit = False
         logger.info("✓ Database connection established successfully")
@@ -650,8 +660,8 @@ def generate_summary_report(
     return "\n".join(report)
 
 
-def run(xlsx_path: Optional[str] = None) -> bool:
-    """Main execution function"""
+def run(xlsx_path: Optional[str] = None, connection_manager=None, state=None) -> bool:
+    """Main execution function. connection_manager and state used from wizard for resume support."""
     print("""
     ╔══════════════════════════════════════════════════════════════╗
     ║   USER AVAILABILITY MIGRATION                                ║
@@ -659,21 +669,21 @@ def run(xlsx_path: Optional[str] = None) -> bool:
     ║   - Others: Temp availability/unavailability by type (Exact Date) ║
     ╚══════════════════════════════════════════════════════════════╝
     """)
-    
+    if state and state.is_completed("caregivers_availability"):
+        logger.info("Caregivers availability migration already completed (resume).")
+        return True
     if xlsx_path:
         filepath = Path(xlsx_path)
     else:
-        # Fallback logic if needed
-        filepath = Path('userAvailabilities.xlsx') 
-    
-    logger.info(f"Excel file path: {filepath}")
-    
+        filepath = Path('userAvailabilities.xlsx')
+    logger.info("Excel file path: %s", filepath)
     connection = None
-    
     try:
-        # Step 1: Database connection
         config = get_db_config()
-        connection = connect_to_database(config)
+        if connection_manager:
+            connection = connection_manager.get_connection()
+        else:
+            connection = connect_to_database(config)
         
         # Step 2: Load reference data
         users_map = get_all_users(connection)
@@ -697,24 +707,26 @@ def run(xlsx_path: Optional[str] = None) -> bool:
         report = generate_summary_report(records, availabilities, unmatched_users, inserted_count)
         print(report)
         
+        if state:
+            state.clear_step("caregivers_availability")
         print("\n" + "="*60)
         print("✓ MIGRATION COMPLETED SUCCESSFULLY")
         print("="*60)
-        
         return True
-        
+    except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+        if ConnectionLostError:
+            raise ConnectionLostError("caregivers_availability", {}) from e
+        raise
     except MigrationError as e:
-        logger.error(f"Migration error: {e}")
-        print(f"\n✗ MIGRATION FAILED: {e}")
+        logger.error("Migration error: %s", e)
+        print("\n✗ MIGRATION FAILED: %s" % e)
         return False
-        
     except Exception as e:
-        logger.exception(f"Unexpected error: {e}")
-        print(f"\n✗ MIGRATION FAILED: {e}")
+        logger.exception("Unexpected error: %s", e)
+        print("\n✗ MIGRATION FAILED: %s" % e)
         return False
-        
     finally:
-        if connection:
+        if connection and not connection_manager:
             connection.close()
             logger.info("\nDatabase connection closed")
 

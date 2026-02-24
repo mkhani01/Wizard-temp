@@ -96,6 +96,12 @@ def get_db_config() -> Dict[str, Any]:
     return config
 
 
+try:
+    from connection_manager import ConnectionLostError
+except ImportError:
+    ConnectionLostError = None
+
+
 def connect_to_database(config: Dict[str, Any]):
     try:
         logger.info(f"Connecting to PostgreSQL at {config['host']}:{config['port']}/{config['database']}...")
@@ -107,6 +113,10 @@ def connect_to_database(config: Dict[str, Any]):
             password=config['password'],
             cursor_factory=RealDictCursor,
             connect_timeout=10,
+            keepalives=1,
+            keepalives_idle=30,
+            keepalives_interval=10,
+            keepalives_count=5,
         )
         connection.autocommit = False
         logger.info("✓ Database connection established successfully")
@@ -793,30 +803,31 @@ def generate_summary_report(
     return "\n".join(report)
 
 
-def run(xlsx_path: Optional[str] = None) -> bool:
-    print(f"""
+def run(xlsx_path: Optional[str] = None, connection_manager=None, state=None) -> bool:
+    print("""
     ╔════════════════════════════════════════════════════════════════╗
     ║   CLIENT AVAILABILITY MIGRATION                                ║
-    ║                                                                ║
     ║   - Filter: Personal Care only                                 ║
     ║   - Start Date: First service date - 14 days                   ║
     ║   - Auto-detect weekly vs bi-weekly                            ║
     ╚════════════════════════════════════════════════════════════════╝
     """)
-    
+    if state and state.is_completed("clients_availability"):
+        logger.info("Clients availability migration already completed (resume).")
+        return True
     from migration_support import get_assets_dir
     filepath = Path(xlsx_path) if xlsx_path else get_assets_dir() / 'clientAvailability' / 'ClientHoursWithServiceType.xlsx'
-    logger.info(f"Excel file path: {filepath}")
-    
+    logger.info("Excel file path: %s", filepath)
     connection = None
-    
     try:
-        logger.info(f"\n{'='*60}")
+        logger.info("\n%s", "="*60)
         logger.info("STEP 1: DATABASE CONNECTION")
-        logger.info(f"{'='*60}")
-        
+        logger.info("%s", "="*60)
         config = get_db_config()
-        connection = connect_to_database(config)
+        if connection_manager:
+            connection = connection_manager.get_connection()
+        else:
+            connection = connect_to_database(config)
         
         logger.info(f"\n{'='*60}")
         logger.info("STEP 2: LOAD REFERENCE DATA")
@@ -852,22 +863,26 @@ def run(xlsx_path: Optional[str] = None) -> bool:
         print(report)
         logger.info(report)
         
+        if state:
+            state.clear_step("clients_availability")
         print("\n" + "="*60)
         print("✓ MIGRATION COMPLETED SUCCESSFULLY")
         print("="*60)
-        
         return True
-        
+    except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+        if ConnectionLostError:
+            raise ConnectionLostError("clients_availability", {}) from e
+        raise
     except MigrationError as e:
-        logger.error(f"Migration error: {e}")
-        print(f"\n✗ MIGRATION FAILED: {e}")
+        logger.error("Migration error: %s", e)
+        print("\n✗ MIGRATION FAILED: %s" % e)
         return False
     except Exception as e:
-        logger.exception(f"Unexpected error: {e}")
-        print(f"\n✗ MIGRATION FAILED: {e}")
+        logger.exception("Unexpected error: %s", e)
+        print("\n✗ MIGRATION FAILED: %s" % e)
         return False
     finally:
-        if connection:
+        if connection and not connection_manager:
             connection.close()
             logger.info("\nDatabase connection closed")
 

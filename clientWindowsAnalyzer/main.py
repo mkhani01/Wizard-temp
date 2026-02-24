@@ -19,9 +19,14 @@ try:
     import psycopg2
     from psycopg2.extras import RealDictCursor, execute_batch
 except ImportError as e:
-    print(f"Missing required package: {e}")
+    print("Missing required package: %s" % e)
     print("Please install: pip install psycopg2-binary pandas numpy")
     sys.exit(1)
+
+try:
+    from connection_manager import ConnectionLostError
+except ImportError:
+    ConnectionLostError = None
 
 # ============================================================================
 # CONFIGURATION
@@ -82,6 +87,10 @@ def connect_to_database(config: Dict[str, Any]):
             password=config["password"],
             cursor_factory=RealDictCursor,
             connect_timeout=10,
+            keepalives=1,
+            keepalives_idle=30,
+            keepalives_interval=10,
+            keepalives_count=5,
         )
         conn.autocommit = False
         logger.info("✓ Database connection established successfully")
@@ -500,10 +509,10 @@ def build_availability_lookup(availabilities: List[Dict]) -> Dict[Tuple[int, str
     return lookup
 
 
-def run(csv_path: Optional[str] = None) -> bool:
+def run(csv_path: Optional[str] = None, connection_manager=None, state=None) -> bool:
     """
-    Entry point: run 3-stage analysis on CSV, then UPDATE client_availabilities
-    (start_time, end_time, minDuration) for matching records.
+    Entry point: run 3-stage analysis on CSV, then UPDATE client_availabilities.
+    connection_manager and state used from wizard for resume support.
     """
     print("""
     ╔════════════════════════════════════════════════════════════════╗
@@ -511,31 +520,32 @@ def run(csv_path: Optional[str] = None) -> bool:
     ║   Updates start_time, end_time, minDuration from visit CSV     ║
     ╚════════════════════════════════════════════════════════════════╝
     """)
-
+    if state and state.is_completed("client_windows"):
+        logger.info("Client windows migration already completed (resume).")
+        return True
     if not csv_path or not Path(csv_path).exists():
         logger.error("CSV path is required and must exist: %s", csv_path)
         return False
-
     connection = None
     try:
-        # Stage 1–3
         df1 = stage1_load_and_clean(csv_path)
         if df1.empty:
             logger.warning("No data after Stage 1; nothing to update.")
             return True
-
         stage2 = stage2_initial_pattern_intelligence(df1)
         stage3 = stage3_context_aware_suggestion(stage2)
         patterns_count = len(stage3)
         logger.info("  Patterns from analysis (candidates for update): %d", patterns_count)
         if patterns_count > 0 and patterns_count <= 20:
             for _, r in stage3.iterrows():
-                logger.info("    → %s | requested %s–%s → suggested %s–%s minDuration=%s",
+                logger.info("    -> %s | requested %s-%s -> suggested %s-%s minDuration=%s",
                     r.get("Formatted_Name"), r.get("requested_start_str"), r.get("requested_end_str"),
                     r.get("start_time_str"), r.get("end_time_str"), r.get("minDuration"))
-
         config = get_db_config()
-        connection = connect_to_database(config)
+        if connection_manager:
+            connection = connection_manager.get_connection()
+        else:
+            connection = connect_to_database(config)
         clients_map = get_all_clients(connection)
         avail_list = load_client_availabilities(connection)
         avail_lookup = build_availability_lookup(avail_list)
@@ -628,8 +638,13 @@ def run(csv_path: Optional[str] = None) -> bool:
         logger.info("  Why other records were not updated: This step only updates rows for which a suggested window was computed from the CSV. Most CSV rows were dropped in Stage 1 (e.g. Service Requirement Duration < %s min). Only %d pattern(s) were produced, so only those could be applied. To include more visits, set env CLIENT_WINDOWS_MIN_DURATION_MINUTES to a lower value (e.g. 15 or 10) and re-run.", MINIMUM_DURATION_MINUTES, patterns_count)
         logger.info("=" * 60)
 
+        if state:
+            state.clear_step("client_windows")
         return True
-
+    except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+        if ConnectionLostError:
+            raise ConnectionLostError("client_windows", {}) from e
+        raise
     except MigrationError as e:
         logger.error("%s", e)
         return False
@@ -637,7 +652,7 @@ def run(csv_path: Optional[str] = None) -> bool:
         logger.exception("Unexpected error: %s", e)
         return False
     finally:
-        if connection:
+        if connection and not connection_manager:
             try:
                 connection.close()
             except Exception:

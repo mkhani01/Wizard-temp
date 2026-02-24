@@ -64,19 +64,21 @@ def _collect_csv_paths(path_arg=None):
     return sorted(DEFAULT_CSV_DIR.glob("*.csv"))
 
 
-def run(csv_path_or_folder=None):
+try:
+    from connection_manager import ConnectionLostError
+except ImportError:
+    ConnectionLostError = None
+
+
+def run(csv_path_or_folder=None, connection_manager=None, state=None):
     """
     Main entry point. Run migration from CSV to availability_types table.
-
-    Args:
-        csv_path_or_folder: Optional. Path to a single CSV file or a folder
-            containing *.csv. If None, uses assets/availabilitytypes (wizard default).
-
-    Returns:
-        True on success, False on failure.
+    connection_manager and state are used when run from wizard for resume support.
     """
     _setup_logging(log_to_file=True)
-
+    if state and state.is_completed("availability_types"):
+        logger.info("Availability types migration already completed (resume).")
+        return True
     print(
         """
     ╔══════════════════════════════════════════════════════════╗
@@ -85,12 +87,10 @@ def run(csv_path_or_folder=None):
     ╚══════════════════════════════════════════════════════════╝
     """
     )
-
     config = db_config.get_db_config()
     if not all([config["database"], config["user"], config["password"]]):
         logger.error("Missing database configuration. Set DB_NAME, DB_USER, DB_PASSWORD (e.g. in .env)")
         return False
-
     csv_paths = _collect_csv_paths(csv_path_or_folder)
     if not csv_paths:
         if csv_path_or_folder is not None:
@@ -101,7 +101,6 @@ def run(csv_path_or_folder=None):
                 DEFAULT_CSV_DIR,
             )
         return False
-
     all_types = []
     for csv_path in csv_paths:
         logger.info("\n" + "=" * 60)
@@ -113,24 +112,31 @@ def run(csv_path_or_folder=None):
         except Exception as e:
             logger.exception("Failed to parse %s: %s", csv_path, e)
             return False
-
     if not all_types:
         logger.warning("No availability types extracted from any CSV")
         return False
-
     connection = None
     try:
         logger.info("\n" + "=" * 60)
         logger.info("STEP: DATABASE CONNECTION")
         logger.info("=" * 60)
-        connection = db_config.connect_to_database(config)
-
+        if connection_manager:
+            connection = connection_manager.get_connection()
+        else:
+            connection = db_config.connect_to_database(config)
         logger.info("\n" + "=" * 60)
         logger.info("STEP: SEED AVAILABILITY TYPES")
         logger.info("=" * 60)
-        success = db_seed.seed_availability_types(connection, all_types)
-
+        try:
+            success = db_seed.seed_availability_types(connection, all_types)
+        except Exception as e:
+            import psycopg2
+            if isinstance(e, (psycopg2.OperationalError, psycopg2.InterfaceError)) and ConnectionLostError:
+                raise ConnectionLostError("availability_types", {}) from e
+            raise
         if success:
+            if state:
+                state.clear_step("availability_types")
             print("\n" + "=" * 60)
             print("✓ AVAILABILITY TYPES MIGRATION COMPLETED SUCCESSFULLY")
             print("=" * 60)
@@ -139,12 +145,11 @@ def run(csv_path_or_folder=None):
         print("✗ AVAILABILITY TYPES MIGRATION FAILED")
         print("=" * 60)
         return False
-
     except Exception as e:
         logger.exception("Migration error: %s", e)
         return False
     finally:
-        if connection:
+        if connection and not connection_manager:
             connection.close()
             logger.info("\nDatabase connection closed")
 

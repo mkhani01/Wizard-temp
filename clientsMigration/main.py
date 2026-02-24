@@ -12,6 +12,14 @@ import psycopg2
 
 from migration_support import get_assets_dir
 from psycopg2.extras import RealDictCursor, execute_values
+from psycopg2 import OperationalError, InterfaceError
+
+try:
+    from connection_manager import ConnectionLostError
+except ImportError:
+    ConnectionLostError = None
+
+KEEPALIVES = dict(keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=5)
 
 # Configure logging
 logging.basicConfig(
@@ -53,6 +61,7 @@ def connect_to_database(config):
             password=config['password'],
             cursor_factory=RealDictCursor,
             connect_timeout=10,
+            **KEEPALIVES,
         )
         connection.autocommit = False
         logger.info("✓ Connected to database")
@@ -894,38 +903,35 @@ def link_clients_to_groups(cursor, processed_clients, original_clients):
     logger.info(f"✓ Linked {len(client_group_links)} client-group relationships")
 
 
-def run():
-    """Main execution function"""
+def run(connection_manager=None, state=None):
+    """Main execution function. connection_manager and state used from wizard for resume support."""
     print("""
     ╔══════════════════════════════════════════════════════════╗
     ║         Clients Migration                                ║
     ║         Seeding client table from CSV                    ║
     ╚══════════════════════════════════════════════════════════╝
     """)
-    
-    # Get database config
+    if state and state.is_completed("clients_migration"):
+        logger.info("Clients migration already completed (resume).")
+        return True
     config = get_db_config()
-    
-    # Validate config
     if not all([config['database'], config['user'], config['password']]):
         logger.error("Missing database configuration in .env file")
         logger.error("Required: DB_NAME, DB_USER, DB_PASSWORD")
         return False
-    
-    # Get CSV path
     csv_path = get_assets_dir() / 'CustomerExport.csv'
-    
     if not csv_path.exists():
-        logger.error(f"CSV file not found: {csv_path}")
+        logger.error("CSV file not found: %s", csv_path)
         return False
-    
-    # Connect and migrate
     connection = None
     try:
         logger.info("\n" + "="*60)
         logger.info("STEP 1: DATABASE CONNECTION")
         logger.info("="*60)
-        connection = connect_to_database(config)
+        if connection_manager:
+            connection = connection_manager.get_connection()
+        else:
+            connection = connect_to_database(config)
         
         logger.info("\n" + "="*60)
         logger.info("STEP 2: SEED CLIENT GROUPS")
@@ -957,21 +963,25 @@ def run():
         success = seed_clients(connection, clients)
         
         if success:
+            if state:
+                state.clear_step("clients_migration")
             print("\n" + "="*60)
             print("✓ CLIENTS MIGRATION COMPLETED SUCCESSFULLY")
             print("="*60)
             return True
-        else:
-            print("\n" + "="*60)
-            print("✗ CLIENTS MIGRATION FAILED")
-            print("="*60)
-            return False
-            
+        print("\n" + "="*60)
+        print("✗ CLIENTS MIGRATION FAILED")
+        print("="*60)
+        return False
+    except (OperationalError, InterfaceError) as e:
+        if ConnectionLostError:
+            raise ConnectionLostError("clients_migration", {}) from e
+        raise
     except Exception as e:
-        logger.error(f"Migration error: {e}", exc_info=True)
+        logger.error("Migration error: %s", e, exc_info=True)
         return False
     finally:
-        if connection:
+        if connection and not connection_manager:
             connection.close()
             logger.info("\nDatabase connection closed")
 
