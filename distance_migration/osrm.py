@@ -40,15 +40,6 @@ def call_osrm_table_api(
 ) -> Dict:
     """
     Calls OSRM table API to get distance and duration matrix.
-
-    Args:
-        locations: List of (lon, lat) tuples - IMPORTANT: OSRM uses lon,lat format
-        travel_method: One of 'driving-car', 'cycling-regular', 'foot-walking'
-        sources: Optional list of source indices (default: all)
-        destinations: Optional list of destination indices (default: all)
-
-    Returns:
-        Dictionary with 'distances' and 'durations' matrices
     """
     assert travel_method in OSRM_CONFIG, f"Unknown travel method: {travel_method}"
 
@@ -58,7 +49,7 @@ def call_osrm_table_api(
     # Format coordinates as lon,lat;lon,lat;...
     coordinates_str = ';'.join([f"{lon},{lat}" for lon, lat in locations])
 
-    # Build URL - coordinates go in the path
+    # Build URL
     url = f"{OSRM_BASE_URL}{base_path}/{coordinates_str}"
 
     # Add query parameters
@@ -87,24 +78,25 @@ def call_osrm_table_api(
 def get_cross_distance_matrix(
     ent1: Dict,
     ent2: Dict,
-    travel_method: Literal['driving-car', 'cycling-regular', 'foot-walking']
+    travel_method: Literal['driving-car', 'cycling-regular', 'foot-walking'],
+    is_self_matrix: bool = False
 ) -> Dict:
     """
-    Computes distance matrix from ent1 → ent2 (rectangular matrix).
-
+    Computes distance matrix from ent1 → ent2.
+    
     Args:
-        ent1: Dictionary of entities with 'longitude' and 'latitude' keys
-        ent2: Dictionary of entities with 'longitude' and 'latitude' keys
+        ent1: Dictionary of entities {id: {longitude, latitude}} (Sources)
+        ent2: Dictionary of entities {id: {longitude, latitude}} (Destinations)
         travel_method: Travel method to use
-
-    Returns:
-        Dictionary with 'distance' and 'duration' keys containing dictionaries
-        mapping (entity1_id, entity2_id) tuples to values
+        is_self_matrix: True if ent1 and ent2 are the same set (handles diagonal zeroing).
     """
     assert travel_method in ('driving-car', 'cycling-regular', 'foot-walking')
 
     ent1_ids = list(ent1.keys())
     ent2_ids = list(ent2.keys())
+
+    if not ent1_ids or not ent2_ids:
+        return {"distance": {}, "duration": {}}
 
     locations = []
     src_idx = []
@@ -133,7 +125,8 @@ def get_cross_distance_matrix(
 
     for i, eid in enumerate(ent1_ids):
         for j, pid in enumerate(ent2_ids):
-            if eid == pid:
+            # Handle Self Matrix Diagonal (User->User same ID)
+            if is_self_matrix and eid == pid:
                 distance[(eid, pid)] = 0.0
                 duration[(eid, pid)] = 0
                 continue
@@ -142,6 +135,7 @@ def get_cross_distance_matrix(
             du = matrix['durations'][i][j]
 
             if dist is None or dist < 0:
+                # Fallback for nulls/invalid using geodesic
                 p1 = (ent1[eid]['latitude'], ent1[eid]['longitude'])
                 p2 = (ent2[pid]['latitude'], ent2[pid]['longitude'])
                 geo_dist = geodesic(p1, p2)
@@ -167,16 +161,7 @@ def get_distance_matrix(
     step_size: int = 50
 ) -> Dict:
     """
-    Computes distance matrix between two sets of entities.
-
-    Args:
-        entities_info1: Dictionary of entities with 'longitude' and 'latitude' keys
-        entities_info2: Dictionary of entities with 'longitude' and 'latitude' keys
-        travel_method: Travel method to use
-        step_size: Batch size for API calls
-
-    Returns:
-        Dictionary with 'distance' and 'duration' keys
+    Computes distance matrix between two sets of entities with batching.
     """
     entity_ids1 = list(entities_info1.keys())
     num_entity1 = len(entities_info1)
@@ -188,10 +173,8 @@ def get_distance_matrix(
 
     distance_info = {'distance': {}, 'duration': {}}
 
-    if entities_info1 is entities_info2:
-        for eid in entity_ids1:
-            distance_info['distance'][(eid, eid)] = 0.0
-            distance_info['duration'][(eid, eid)] = 0
+    # Check if this is a self-matrix (User->User or Client->Client)
+    is_self_matrix = (entities_info1 is entities_info2)
 
     print(f"Processing {num_entity1} x {num_entity2} matrix with {travel_method}...")
     total_blocks = len(blocks1) * len(blocks2)
@@ -213,7 +196,8 @@ def get_distance_matrix(
             blk_distance = get_cross_distance_matrix(
                 ent1=src_entities,
                 ent2=dst_entities,
-                travel_method=travel_method
+                travel_method=travel_method,
+                is_self_matrix=is_self_matrix
             )
             distance_info['distance'].update(blk_distance['distance'])
             distance_info['duration'].update(blk_distance['duration'])
@@ -225,6 +209,34 @@ def load_json_data(file_path: str) -> Dict:
     """Load JSON data from file."""
     with open(file_path, 'r') as f:
         return json.load(f)
+
+
+def validate_outputs(
+    output_data: Dict,
+    caregiver_locations: Dict,
+    patient_locations: Dict
+):
+    """Validate that all required pairs are present in the outputs."""
+    cids = list(caregiver_locations.keys())
+    pids = list(patient_locations.keys())
+    distance_dict = output_data['distance']
+
+    missing_cid_cid = [f"{c1}_{c2}" for c1 in cids for c2 in cids if f"{c1}_{c2}" not in distance_dict]
+    missing_pid_pid = [f"{p1}_{p2}" for p1 in pids for p2 in pids if f"{p1}_{p2}" not in distance_dict]
+    missing_cid_pid = [f"{c}_{p}" for c in cids for p in pids if f"{c}_{p}" not in distance_dict]
+    missing_pid_cid = [f"{p}_{c}" for p in pids for c in cids if f"{p}_{c}" not in distance_dict]
+
+    if missing_cid_cid:
+        print(f"  WARNING: Missing {len(missing_cid_cid)} cid_to_cid pairs (first 5): {missing_cid_cid[:5]}")
+    if missing_pid_pid:
+        print(f"  WARNING: Missing {len(missing_pid_pid)} pid_to_pid pairs (first 5): {missing_pid_pid[:5]}")
+    if missing_cid_pid:
+        print(f"  WARNING: Missing {len(missing_cid_pid)} cid_to_pid pairs (first 5): {missing_cid_pid[:5]}")
+    if missing_pid_cid:
+        print(f"  WARNING: Missing {len(missing_pid_cid)} pid_to_cid pairs (first 5): {missing_pid_cid[:5]}")
+
+    total_expected = len(cids)**2 + len(pids)**2 + len(cids)*len(pids) + len(pids)*len(cids)
+    print(f"  Total pairs: {len(distance_dict)} (expected: {total_expected})")
 
 
 def process_all_pairs(
@@ -324,34 +336,6 @@ def process_all_pairs(
         print("\nValidating outputs...")
         validate_outputs(output_data, caregiver_locations, patient_locations)
         print("Validation complete!")
-
-
-def validate_outputs(
-    output_data: Dict,
-    caregiver_locations: Dict,
-    patient_locations: Dict
-):
-    """Validate that all required pairs are present in the outputs."""
-    cids = list(caregiver_locations.keys())
-    pids = list(patient_locations.keys())
-    distance_dict = output_data['distance']
-
-    missing_cid_cid = [f"{c1}_{c2}" for c1 in cids for c2 in cids if f"{c1}_{c2}" not in distance_dict]
-    missing_pid_pid = [f"{p1}_{p2}" for p1 in pids for p2 in pids if f"{p1}_{p2}" not in distance_dict]
-    missing_cid_pid = [f"{c}_{p}" for c in cids for p in pids if f"{c}_{p}" not in distance_dict]
-    missing_pid_cid = [f"{p}_{c}" for p in pids for c in cids if f"{p}_{c}" not in distance_dict]
-
-    if missing_cid_cid:
-        print(f"  WARNING: Missing {len(missing_cid_cid)} cid_to_cid pairs (first 5): {missing_cid_cid[:5]}")
-    if missing_pid_pid:
-        print(f"  WARNING: Missing {len(missing_pid_pid)} pid_to_pid pairs (first 5): {missing_pid_pid[:5]}")
-    if missing_cid_pid:
-        print(f"  WARNING: Missing {len(missing_cid_pid)} cid_to_pid pairs (first 5): {missing_cid_pid[:5]}")
-    if missing_pid_cid:
-        print(f"  WARNING: Missing {len(missing_pid_cid)} pid_to_cid pairs (first 5): {missing_pid_cid[:5]}")
-
-    total_expected = len(cids)**2 + len(pids)**2 + len(cids)*len(pids) + len(pids)*len(cids)
-    print(f"  Total pairs: {len(distance_dict)} (expected: {total_expected})")
 
 
 if __name__ == "__main__":

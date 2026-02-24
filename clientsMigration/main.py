@@ -229,7 +229,7 @@ def parse_cognitive_status(row, safe_get_fn):
         if not s:
             return False
         return str(s).strip().lower() in ('true', '1', 'yes', 'y')
-    # CSV has: MentalCapacity, LearningDisability, MentalHealth, MultiDiagnosis, ComplexNeeds, etc.
+    
     if truthy('ServiceLocationCustom_LearningDisability') or truthy('ServiceLocationCustom_MentalHealth') or truthy('ServiceLocationCustom_MultiDiagnosis') or truthy('ServiceLocationCustom_ComplexNeeds') or truthy('ServiceLocationCustom_DualDiagnosis'):
         return 'Impaired'
     if truthy('ServiceLocationCustom_MentalCapacity'):  # sometimes used as "has capacity" = Normal
@@ -256,7 +256,15 @@ def seed_client_groups_from_csv(connection, csv_path):
     logger.info(f"Reading CSV for client groups: {csv_path}")
     
     with open(csv_path, 'r', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
+        # Detect delimiter
+        sample = f.read(2048)
+        f.seek(0)
+        try:
+            dialect = csv.Sniffer().sniff(sample)
+        except csv.Error:
+            dialect = csv.excel  # default to comma
+        
+        reader = csv.DictReader(f, dialect=dialect)
         for row in reader:
             # FIX: Handle None values properly
             area = safe_strip(row.get('Area'))
@@ -324,21 +332,28 @@ def seed_client_groups_from_csv(connection, csv_path):
 def seed_areas_from_csv(connection, csv_path):
     """
     Extract unique Area values from CSV and insert missing ones into area table.
-    Matches Area entity: id, name, size, lat, long, description, created_date, last_modified_date.
-    We set only name and description; size, lat, long stay NULL.
-    After this, get_lookup_tables will include new areas so client.area_id can be set.
     """
     areas = set()
     logger.info(f"Reading CSV for areas: {csv_path}")
+    
     with open(csv_path, 'r', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
+        sample = f.read(2048)
+        f.seek(0)
+        try:
+            dialect = csv.Sniffer().sniff(sample)
+        except csv.Error:
+            dialect = csv.excel
+            
+        reader = csv.DictReader(f, dialect=dialect)
         for row in reader:
             area = safe_strip(row.get('Area'))
             if area:
                 areas.add(area)
+                
     if not areas:
         logger.warning("No areas found in CSV")
         return
+        
     logger.info(f"Found {len(areas)} unique areas")
     cursor = connection.cursor()
     try:
@@ -348,14 +363,15 @@ def seed_areas_from_csv(connection, csv_path):
         logger.warning("Area table not found or not readable; skipping area seeding: %s", e)
         cursor.close()
         return
+        
     new_areas = areas - set(existing.keys())
     if not new_areas:
         logger.info("✓ All areas already exist")
         cursor.close()
         return
+        
     logger.info(f"Inserting {len(new_areas)} new areas...")
     try:
-        # Area entity: name (required), description/size/lat/long (nullable), created_date, last_modified_date
         area_data = [(name, f"Area: {name}") for name in sorted(new_areas)]
         insert_query = """
             INSERT INTO area (name, description, created_date, last_modified_date)
@@ -388,7 +404,17 @@ def extract_clients_from_csv(csv_path, lookups):
     logger.info(f"Reading CSV: {csv_path}")
     
     with open(csv_path, 'r', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
+        # FIX: Detect delimiter to handle pipe-delimited files
+        sample = f.read(2048)
+        f.seek(0)
+        try:
+            dialect = csv.Sniffer().sniff(sample)
+            logger.info(f"Detected CSV delimiter: {repr(dialect.delimiter)}")
+        except csv.Error:
+            logger.warning("Could not detect delimiter, defaulting to comma.")
+            dialect = csv.excel
+            
+        reader = csv.DictReader(f, dialect=dialect)
         row_num = 0
         
         for row in reader:
@@ -404,10 +430,12 @@ def extract_clients_from_csv(csv_path, lookups):
             last_name = safe_get('Last Name')
 
             if not first_name or not last_name:
-                logger.warning(
-                    "Row %d: SKIPPED - missing name | First Name=%r, Last Name=%r, Email=%r, Area=%r, PIN=%r, Phone=%r",
-                    row_num, first_name, last_name, safe_get('Email'), safe_get('Area'), safe_get('PIN Number'), safe_get('Phone')
-                )
+                # Only log warning if we expected data (i.e. row doesn't look empty)
+                if any(safe_get(k) for k in ['First Name', 'Last Name', 'PIN Number']):
+                    logger.warning(
+                        "Row %d: SKIPPED - missing name | First Name=%r, Last Name=%r, Email=%r",
+                        row_num, first_name, last_name, safe_get('Email')
+                    )
                 continue
 
             # Generate unique identifier for this client
@@ -475,10 +503,10 @@ def extract_clients_from_csv(csv_path, lookups):
             postcode_raw = clean_excel_value(safe_get('Post Code'))
             postcode = postcode_raw if postcode_raw else None
             
-            # Booleans from custom columns (entity defaults false)
+            # Booleans from custom columns
             disability = parse_boolean_csv(row.get('ServiceLocationCustom_PhysicalDisability'))
-            palliative_care = parse_boolean_csv(row.get('ServiceLocationCustom_POA'))  # or DNR etc.
-            incontinency = False  # no CSV column
+            palliative_care = parse_boolean_csv(row.get('ServiceLocationCustom_POA'))
+            incontinency = False
             exercise_need = False
             dysphagia_need = False
             race_sensitivity = False
@@ -486,7 +514,7 @@ def extract_clients_from_csv(csv_path, lookups):
             continuity_required = False
             only_preferred = False
             
-            # Build client data (all entity fields we can map from CSV)
+            # Build client data
             client_data = {
                 'name': first_name,
                 'lastname': last_name,
@@ -546,9 +574,10 @@ def extract_clients_from_csv(csv_path, lookups):
 
 
 def seed_clients(connection, clients):
-    """Insert or update clients using manual upsert (no ON CONFLICT since no unique constraint on name+lastname)"""
+    """Insert or update clients using manual upsert"""
     if not clients:
-        logger.warning("No clients to insert")
+        logger.warning("No clients extracted from CSV. Aborting sync to prevent database wipe.")
+        logger.warning("Please check CSV file format and delimiters.")
         return False
     
     logger.info(f"Inserting/Updating {len(clients)} clients...")
@@ -556,10 +585,12 @@ def seed_clients(connection, clients):
     cursor = connection.cursor()
     try:
         # Load existing clients by (name, lastname)
+        # We normalize to lower case for matching to handle case inconsistencies
         cursor.execute("SELECT id, name, lastname FROM client WHERE deleted_at IS NULL")
         existing = {}
         for row in cursor.fetchall():
-            key = f"{row['name']}|{row['lastname']}"
+            # Key is lowercase name|lastname
+            key = f"{row['name'].lower()}|{row['lastname'].lower()}"
             existing[key] = row['id']
         
         logger.info(f"Found {len(existing)} existing clients in database")
@@ -568,8 +599,14 @@ def seed_clients(connection, clients):
         to_insert = []
         to_update = []
         
+        # Create a set of keys in the CSV file (normalized)
+        keys_in_file = set()
+        
         for client in clients:
-            key = f"{client['name']}|{client['lastname']}"
+            # Normalize key for matching
+            key = f"{client['name'].lower()}|{client['lastname'].lower()}"
+            keys_in_file.add(key)
+            
             if key in existing:
                 to_update.append((client, existing[key]))
             else:
@@ -579,8 +616,12 @@ def seed_clients(connection, clients):
         logger.info(f"  - {len(to_update)} existing clients to update")
         
         # Clients in DB but not in file(s) -> set status to Deactive
-        keys_in_file = {f"{c['name']}|{c['lastname']}" for c in clients}
-        to_deactivate_ids = [existing[key] for key in existing if key not in keys_in_file]
+        # Only if we actually parsed clients successfully
+        to_deactivate_ids = []
+        for key in existing:
+            if key not in keys_in_file:
+                to_deactivate_ids.append(existing[key])
+                
         if to_deactivate_ids:
             logger.info(f"  - {len(to_deactivate_ids)} existing clients not in file(s) will be deactivated")
         
@@ -807,16 +848,17 @@ def seed_clients(connection, clients):
 def link_clients_to_groups(cursor, processed_clients, original_clients):
     """Link clients to their groups via many-to-many relationship"""
     
-    # Create name+lastname to client mapping
+    # Create name+lastname to client mapping (normalized)
     name_to_client = {
-        f"{client['name']}|{client['lastname']}": client 
+        f"{client['name'].lower()}|{client['lastname'].lower()}": client 
         for client in original_clients
     }
     
     # Prepare client-group links
     client_group_links = []
     for client_row in processed_clients:
-        key = f"{client_row['name']}|{client_row['lastname']}"
+        # Normalize key for matching
+        key = f"{client_row['name'].lower()}|{client_row['lastname'].lower()}"
         client_id = client_row['id']
         
         # Get group_id from original client data
@@ -870,7 +912,7 @@ def run():
         logger.error("Required: DB_NAME, DB_USER, DB_PASSWORD")
         return False
     
-    # Get CSV path (uses exe dir when frozen, project root when dev)
+    # Get CSV path
     csv_path = get_assets_dir() / 'CustomerExport.csv'
     
     if not csv_path.exists():
@@ -906,7 +948,7 @@ def run():
         clients = extract_clients_from_csv(csv_path, lookups)
         
         if not clients:
-            logger.warning("No clients found in CSV")
+            logger.error("Halting migration: No clients parsed from CSV.")
             return False
         
         logger.info("\n" + "="*60)

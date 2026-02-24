@@ -17,7 +17,7 @@ try:
     import pandas as pd
     import numpy as np
     import psycopg2
-    from psycopg2.extras import RealDictCursor
+    from psycopg2.extras import RealDictCursor, execute_batch
 except ImportError as e:
     print(f"Missing required package: {e}")
     print("Please install: pip install psycopg2-binary pandas numpy")
@@ -554,54 +554,55 @@ def run(csv_path: Optional[str] = None) -> bool:
         skipped_no_client = 0
         skipped_no_match = 0
         unmatched_clients = set()
+        update_args = []
+
+        for _, row in stage3.iterrows():
+            # Service Location Name is "Lastname, Firstname" (e.g. "Hawkshaw (DS), Harry")
+            raw = (row["Formatted_Name"] or "").strip()
+            name_key = re.sub(r"\s+", " ", raw).lower() if raw else ""
+            if not name_key:
+                continue
+            client_id = clients_map.get(name_key)
+            if client_id is None:
+                skipped_no_client += 1
+                unmatched_clients.add(row["Formatted_Name"])
+                logger.warning("No client found for name: %s", row["Formatted_Name"])
+                continue
+
+            req_start, req_end = requested_key(row)
+            key = (client_id, req_start, req_end)
+            recs = avail_lookup.get(key)
+            if not recs:
+                skipped_no_match += 1
+                logger.warning(
+                    "No client_availabilities record for client_id=%s requested %s–%s",
+                    client_id, req_start, req_end,
+                )
+                continue
+
+            start_time_str = row["start_time_str"]
+            end_time_str = row["end_time_str"]
+            min_dur = row.get("minDuration")
+            if pd.isna(min_dur):
+                min_dur = None
+            else:
+                min_dur = int(min_dur)
+
+            for rec in recs:
+                update_args.append((start_time_str, end_time_str, min_dur, rec["id"]))
+                updated += 1
 
         cursor = connection.cursor()
         try:
-            for _, row in stage3.iterrows():
-                # Service Location Name is "Lastname, Firstname" (e.g. "Hawkshaw (DS), Harry")
-                raw = (row["Formatted_Name"] or "").strip()
-                name_key = re.sub(r"\s+", " ", raw).lower() if raw else ""
-                if not name_key:
-                    continue
-                client_id = clients_map.get(name_key)
-                if client_id is None:
-                    skipped_no_client += 1
-                    unmatched_clients.add(row["Formatted_Name"])
-                    logger.warning("No client found for name: %s", row["Formatted_Name"])
-                    continue
-
-                req_start, req_end = requested_key(row)
-                key = (client_id, req_start, req_end)
-                recs = avail_lookup.get(key)
-                if not recs:
-                    skipped_no_match += 1
-                    logger.warning(
-                        "No client_availabilities record for client_id=%s requested %s–%s",
-                        client_id, req_start, req_end,
-                    )
-                    continue
-
-                start_time_str = row["start_time_str"]
-                end_time_str = row["end_time_str"]
-                min_dur = row.get("minDuration")
-                if pd.isna(min_dur):
-                    min_dur = None
-                else:
-                    min_dur = int(min_dur)
-
-                for rec in recs:
-                    cursor.execute("""
-                        UPDATE client_availabilities
-                        SET start_time = %s,
-                            end_time = %s,
-                            "minDuration" = %s,
-                            last_modified_date = NOW()
-                        WHERE id = %s
-                    """, (start_time_str, end_time_str, min_dur, rec["id"]))
-                    updated += 1
-                logger.info("  Updated %d client_availabilities row(s) | client=%s | %s–%s → start=%s end=%s minDuration=%s",
-                    len(recs), row["Formatted_Name"], req_start, req_end, start_time_str, end_time_str, min_dur)
-
+            if update_args:
+                execute_batch(
+                    cursor,
+                    """UPDATE client_availabilities
+                       SET start_time = %s, end_time = %s, "minDuration" = %s, last_modified_date = NOW()
+                       WHERE id = %s""",
+                    update_args,
+                    page_size=500,
+                )
             connection.commit()
         except Exception as e:
             connection.rollback()
