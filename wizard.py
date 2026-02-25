@@ -289,6 +289,9 @@ class MigrationWizard:
         self.btn_run_again = ttk.Button(btn_frame, text="Run again", command=self._on_run_again)
         self.btn_run_again.pack(side="right", padx=4)
         self.btn_run_again.pack_forget()
+        self.btn_check_migration = ttk.Button(btn_frame, text="Check the migration", command=self._on_check_migration)
+        self.btn_check_migration.pack(side="right", padx=4)
+        self.btn_check_migration.pack_forget()
         self.btn_back = ttk.Button(btn_frame, text="Back", command=self._on_back)
         self.btn_back.pack(side="right", padx=4)
         self.btn_continue = ttk.Button(btn_frame, text="Continue", command=self._on_continue)
@@ -733,6 +736,7 @@ class MigrationWizard:
         self.btn_retry.pack_forget()
         self.btn_continue_next.pack_forget()
         self.btn_test_connection.pack_forget()
+        self.btn_check_migration.pack_forget()
         self._connection_lost_frame.grid_remove()
 
     def _show_retry_continue_buttons(self):
@@ -1101,17 +1105,107 @@ class MigrationWizard:
             self._append_log("\nDone successfully.\n")
             messagebox.showinfo("Migration", "Migration completed successfully.\n\nLog saved to:\n%s" % log_path)
             self.btn_run_again.pack(side="right", padx=4)
+            self.btn_check_migration.pack(side="right", padx=4)
         self.btn_cancel.config(state="normal")
         self.btn_cancel.config(text="Close")
 
     def _on_run_again(self):
         """Re-run the full migration from the beginning (same options and files)."""
         self.btn_run_again.pack_forget()
+        self.btn_check_migration.pack_forget()
         self.btn_cancel.config(text="Cancel")
         self.run_log.config(state="normal")
         self.run_log.delete("1.0", "end")
         self.run_log.config(state="disabled")
         self._run_migrations(start_from=0)
+
+    def _on_check_migration(self):
+        """Run post-migration validation checks in a background thread."""
+        self.btn_check_migration.config(state="disabled")
+        self.btn_run_again.config(state="disabled")
+        self.btn_cancel.config(state="disabled")
+        self._append_log("\n")
+        self.run_progress.start()
+        thread = threading.Thread(target=self._do_check_migration, daemon=True)
+        thread.start()
+
+    def _do_check_migration(self):
+        """Background worker for post-migration checks."""
+        conn_manager = None
+        try:
+            self._apply_env()
+            db_config = {
+                "host": self.db_config["host"].get().strip(),
+                "port": self.db_config["port"].get().strip(),
+                "database": self.db_config["database"].get().strip(),
+                "user": self.db_config["user"].get().strip(),
+                "password": self.db_config["password"].get().strip(),
+            }
+            if ConnectionManager:
+                conn_manager = ConnectionManager(db_config)
+                connection = conn_manager.get_connection()
+            else:
+                import psycopg2
+                from psycopg2.extras import RealDictCursor
+                connection = psycopg2.connect(
+                    host=db_config["host"],
+                    port=int(db_config["port"]),
+                    database=db_config["database"],
+                    user=db_config["user"],
+                    password=db_config["password"],
+                    cursor_factory=RealDictCursor,
+                    connect_timeout=10,
+                )
+
+            selected = [k for k, v in self.check_vars.items() if v.get()]
+
+            from tests.migration_check import run_migration_checks
+            def _log_line(msg):
+                self.root.after(0, lambda m=msg: self._append_log(m + "\n"))
+
+            all_passed, all_msgs = run_migration_checks(
+                connection, selected, log_callback=_log_line,
+            )
+
+            # Append results to the log file if available
+            if self._run_log_path:
+                try:
+                    with open(self._run_log_path, "a", encoding="utf-8") as f:
+                        f.write("\n--- Post-Migration Checks ---\n")
+                        for msg in all_msgs:
+                            f.write(msg + "\n")
+                except OSError:
+                    pass
+
+            self.run_progress.stop()
+            if all_passed:
+                self.root.after(0, lambda: messagebox.showinfo(
+                    "Migration Check",
+                    "All post-migration checks passed."
+                ))
+            else:
+                self.root.after(0, lambda: messagebox.showwarning(
+                    "Migration Check",
+                    "Some checks failed. Review the log for details."
+                ))
+        except Exception as e:
+            self.run_progress.stop()
+            self.root.after(0, lambda err=str(e): self._append_log(
+                "\nMigration check error: %s\n" % err
+            ))
+            self.root.after(0, lambda: messagebox.showerror(
+                "Migration Check", "Check failed: %s" % e
+            ))
+        finally:
+            if conn_manager:
+                conn_manager.close()
+            self.root.after(0, self._check_migration_finished)
+
+    def _check_migration_finished(self):
+        """Re-enable buttons after check completes."""
+        self.btn_check_migration.config(state="normal")
+        self.btn_run_again.config(state="normal")
+        self.btn_cancel.config(state="normal")
 
     def _apply_env(self):
         os.environ["DB_HOST"] = self.db_config["host"].get().strip()
