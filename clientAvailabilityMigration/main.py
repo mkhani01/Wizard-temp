@@ -8,9 +8,9 @@ Configuration:
 - AUTO_DETECT_WEEK_ROTATION: If True, compares both weeks to determine occurs_every automatically
 
 Rules:
-- Sheet: "Data"
-- Filter: "Planned Service Type Description" = "Personal Care" AND
-          "Planned Service Requirement Type Description" = "Personal Care"
+- Sheet: "Data" (Excel) or CSV with same column semantics
+- Filter (before everything): Only rows where "Planned Service Type Description" = "Personal Care"
+  AND "Planned Service Requirement Type Description" = "Personal Care" are considered.
 - Client matching: "Service Location Name" column (format: "lastname, name")
 - Time: "Service Requirement Start Date And Time" and "Service Requirement End Date And Time"
 - Start Date: First service date - 14 days (2 weeks before)
@@ -19,10 +19,10 @@ Rules:
   - If weeks are DIFFERENT → occurs_every=2 (bi-weekly)
 
 Record rules (Personal Care only):
-- Each distinct (start_time, end_time) becomes one availability record.
-  E.g. 08:00-08:30 and 08:00-09:00 → two separate records.
+- Each distinct (day_of_week, start_time, end_time) becomes one availability record. Never merge
+  different time slots (e.g. 09:00-15:00 and 15:00-21:00 stay two separate records).
 - When X source rows have the exact same (start_time, end_time) on a date,
-  one record is emitted with number_of_care_givers = X (max per date across dates).
+  one record is emitted with number_of_care_givers = X (plus caregiver).
 """
 
 import os
@@ -233,18 +233,17 @@ def find_excel_column_index(header_row: tuple, column_names: List[str]) -> int:
     return -1
 
 
-def process_xlsx_file(filepath: Path, clients_map: Dict[str, int]) -> Tuple[Dict[int, List[Dict]], List[str]]:
-    logger.info(f"\n{'='*60}")
-    logger.info(f"PROCESSING EXCEL FILE: {filepath}")
-    logger.info(f"{'='*60}")
-    
+def _load_file_headers_and_rows(filepath: Path) -> Tuple[tuple, Any]:
+    """Load file (Excel or CSV) and return (header_row, row_iterator)."""
     if not filepath.exists():
-        raise MigrationError(f"Excel file not found: {filepath}")
-    
-    sheet_name = 'Data'
-    header_row = None
-    row_iter = None
-
+        raise MigrationError(f"File not found: {filepath}")
+    suffix = (filepath.suffix or "").lower()
+    if suffix == ".csv":
+        df = pd.read_csv(filepath, encoding="utf-8", low_memory=False)
+        df.columns = [str(c).strip() for c in df.columns]
+        header_row = tuple(df.columns)
+        return header_row, (tuple(x) for x in df.to_numpy())
+    sheet_name = "Data"
     try:
         wb = openpyxl.load_workbook(filepath, data_only=True)
         if sheet_name not in wb.sheetnames:
@@ -252,43 +251,57 @@ def process_xlsx_file(filepath: Path, clients_map: Dict[str, int]) -> Tuple[Dict
         ws = wb[sheet_name]
         header_row = tuple(ws.iter_rows(min_row=1, max_row=1, values_only=True))[0]
         row_iter = ws.iter_rows(min_row=2, values_only=True)
+        return header_row, row_iter
     except MigrationError:
         raise
     except Exception as e:
         try:
             df = pd.read_excel(filepath, sheet_name=sheet_name)
             header_row = tuple(df.columns.astype(str))
-            row_iter = (tuple(x) for x in df.to_numpy())
-            logger.info("Loaded Excel via pandas (openpyxl fallback)")
+            return header_row, (tuple(x) for x in df.to_numpy())
         except Exception as e2:
-            raise MigrationError(f"Failed to load Excel file: {e2}") from e
+            raise MigrationError(f"Failed to load file: {e2}") from e
+
+
+def process_xlsx_file(filepath: Path, clients_map: Dict[str, int]) -> Tuple[Dict[int, List[Dict]], List[str]]:
+    logger.info(f"\n{'='*60}")
+    logger.info(f"PROCESSING FILE: {filepath}")
+    logger.info(f"{'='*60}")
+    
+    if not filepath.exists():
+        raise MigrationError(f"File not found: {filepath}")
+    
+    header_row, row_iter = _load_file_headers_and_rows(filepath)
+    header_row = tuple(str(h).strip() for h in header_row)
     
     logger.info(f"Header row has {len(header_row)} columns")
     
     col_service_location_name = find_excel_column_index(header_row, ['Service Location Name'])
-    col_service_type_desc = find_excel_column_index(header_row, ['Planned Service Type Description'])
-    col_service_req_type_desc = find_excel_column_index(header_row, ['Planned Service Requirement Type Description'])
+    # Before everything: only rows with BOTH Planned columns = "Personal Care" are considered.
+    col_planned_type = find_excel_column_index(header_row, ['Planned Service Type Description'])
+    col_planned_req_type = find_excel_column_index(header_row, ['Planned Service Requirement Type Description'])
     col_start_datetime = find_excel_column_index(header_row, ['Service Requirement Start Date And Time'])
     col_end_datetime = find_excel_column_index(header_row, ['Service Requirement End Date And Time'])
     
     logger.info(f"Column mappings:")
     logger.info(f"  - Service Location Name: column {col_service_location_name}")
-    logger.info(f"  - Planned Service Type Description: column {col_service_type_desc}")
-    logger.info(f"  - Planned Service Requirement Type Description: column {col_service_req_type_desc}")
+    logger.info(f"  - Planned Service Type Description: column {col_planned_type}")
+    logger.info(f"  - Planned Service Requirement Type Description: column {col_planned_req_type}")
     logger.info(f"  - Service Requirement Start Date And Time: column {col_start_datetime}")
     logger.info(f"  - Service Requirement End Date And Time: column {col_end_datetime}")
     
-    required_cols = {
-        'Service Location Name': col_service_location_name,
-        'Planned Service Type Description': col_service_type_desc,
-        'Planned Service Requirement Type Description': col_service_req_type_desc,
-        'Service Requirement Start Date And Time': col_start_datetime,
-        'Service Requirement End Date And Time': col_end_datetime,
-    }
-    
-    missing_cols = [name for name, idx in required_cols.items() if idx == -1]
-    if missing_cols:
-        raise MigrationError(f"Missing required columns: {missing_cols}")
+    if col_service_location_name == -1:
+        raise MigrationError("Missing required column: Service Location Name")
+    if col_planned_type == -1 or col_planned_req_type == -1:
+        raise MigrationError(
+            "Missing required columns for Personal Care filter: 'Planned Service Type Description' and "
+            "'Planned Service Requirement Type Description' must both be present. "
+            "Before everything, only rows with both = 'Personal Care' are considered."
+        )
+    if col_start_datetime == -1 or col_end_datetime == -1:
+        raise MigrationError(
+            "Missing required columns: Service Requirement Start Date And Time and/or Service Requirement End Date And Time"
+        )
     
     client_records = defaultdict(list)
     unmatched_clients = set()
@@ -300,11 +313,24 @@ def process_xlsx_file(filepath: Path, clients_map: Dict[str, int]) -> Tuple[Dict
         total_rows += 1
         
         service_location_name = row[col_service_location_name] if col_service_location_name < len(row) else None
-        service_type_desc = row[col_service_type_desc] if col_service_type_desc < len(row) else None
-        service_req_type_desc = row[col_service_req_type_desc] if col_service_req_type_desc < len(row) else None
+        planned_type_val = row[col_planned_type] if col_planned_type < len(row) else None
+        planned_req_type_val = row[col_planned_req_type] if col_planned_req_type < len(row) else None
         start_datetime_val = row[col_start_datetime] if col_start_datetime < len(row) else None
         end_datetime_val = row[col_end_datetime] if col_end_datetime < len(row) else None
         
+        # Before everything: only rows with BOTH "Planned Service Type Description" = "Personal Care"
+        # AND "Planned Service Requirement Type Description" = "Personal Care" are considered.
+        planned_type_str = str(planned_type_val).strip() if planned_type_val is not None and (not hasattr(pd, 'isna') or not pd.isna(planned_type_val)) else ''
+        planned_req_type_str = str(planned_req_type_val).strip() if planned_req_type_val is not None and (not hasattr(pd, 'isna') or not pd.isna(planned_req_type_val)) else ''
+        if planned_type_str.lower() != 'personal care' or planned_req_type_str.lower() != 'personal care':
+            skipped_non_personal_care += 1
+            logger.warning(
+                "Row %d: SKIPPED - not Personal Care (Planned Type=%r, Planned Req Type=%r) | Location=%r, Start=%r, End=%r",
+                row_num, planned_type_str or planned_type_val, planned_req_type_str or planned_req_type_val,
+                service_location_name, start_datetime_val, end_datetime_val
+            )
+            continue
+
         # Check for empty/NaN values
         is_empty = False
         if hasattr(pd, 'isna'):
@@ -315,18 +341,7 @@ def process_xlsx_file(filepath: Path, clients_map: Dict[str, int]) -> Tuple[Dict
         if is_empty:
             logger.warning(
                 "Row %d: SKIPPED - empty Service Location Name | Type=%r, ReqType=%r, Start=%r, End=%r",
-                row_num, service_type_desc, service_req_type_desc, start_datetime_val, end_datetime_val
-            )
-            continue
-
-        service_type_str = str(service_type_desc).strip() if service_type_desc else ''
-        service_req_type_str = str(service_req_type_desc).strip() if service_req_type_desc else ''
-
-        if service_type_str.lower() != 'personal care' or service_req_type_str.lower() != 'personal care':
-            skipped_non_personal_care += 1
-            logger.warning(
-                "Row %d: SKIPPED - not Personal Care | Location=%r, Type=%r, ReqType=%r, Start=%r, End=%r",
-                row_num, service_location_name, service_type_str, service_req_type_str, start_datetime_val, end_datetime_val
+                row_num, planned_type_str, planned_req_type_str, start_datetime_val, end_datetime_val
             )
             continue
 
@@ -337,7 +352,7 @@ def process_xlsx_file(filepath: Path, clients_map: Dict[str, int]) -> Tuple[Dict
             unmatched_clients.add(str(service_location_name))
             logger.warning(
                 "Row %d: SKIPPED - client not found | Location=%r, Type=%r, ReqType=%r, Start=%r, End=%r",
-                row_num, service_location_name, service_type_str, service_req_type_str, start_datetime_val, end_datetime_val
+                row_num, service_location_name, planned_type_str, planned_req_type_str, start_datetime_val, end_datetime_val
             )
             continue
 
@@ -383,7 +398,7 @@ def process_xlsx_file(filepath: Path, clients_map: Dict[str, int]) -> Tuple[Dict
         )
 
     logger.info(f"\n{'='*60}")
-    logger.info("EXCEL PROCESSING SUMMARY")
+    logger.info("FILE PROCESSING SUMMARY")
     logger.info(f"{'='*60}")
     logger.info(f"Total rows processed: {total_rows}")
     logger.info(f"Clients with records: {len(client_records)}")
@@ -416,9 +431,10 @@ def analyze_client_schedule(records: List[Dict]) -> Dict[str, Any]:
     min_date = min(r['start_date'] for r in records)
     logger.info(f"  Analyzing schedule - min_date: {min_date}, total records: {len(records)}")
     
-    # Group by (day_of_week, start_time, end_time)
-    # Track which weeks each slot appears in
-    # Count source rows (caregivers) PER DATE so we get "caregivers per occurrence", not total across all dates
+    # Group by (day_of_week, start_time, end_time). Never merge different time slots:
+    # 09:00-15:00 and 15:00-21:00 remain two separate schedule records.
+    # Track which weeks each slot appears in.
+    # Count source rows (caregivers) PER DATE so we get "caregivers per occurrence" (plus caregiver when same slot).
     slot_weeks = defaultdict(set)
     slot_record_count_per_date = defaultdict(lambda: defaultdict(int))
     

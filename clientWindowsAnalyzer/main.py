@@ -38,6 +38,7 @@ UPPER_PERCENTILE = 0.90
 MIN_WINDOW_WIDTH_MINS = 60
 TOLERANCE_MINS = 15
 FLEXIBILITY_THRESHOLD = 10
+DURATION_SIGNIFICANCE_THRESHOLD = 0.10  # Stage 3.7: duration must appear in >= 10% of records
 
 # ============================================================================
 # LOGGING
@@ -377,11 +378,40 @@ def stage2_initial_pattern_intelligence(df: pd.DataFrame) -> pd.DataFrame:
 # STAGE 3 — Context-Aware Suggestion Engine
 # ============================================================================
 
+def _clamp_suggested_window_to_required(
+    sugg_start_min: int,
+    sugg_end_min: int,
+    req_start_min: int,
+    req_end_min: int,
+) -> Tuple[int, int]:
+    """
+    Clamp suggested window to [req_start_min - TOLERANCE_MINS, req_end_min + TOLERANCE_MINS].
+    If clamping makes the window narrower than MIN_WINDOW_WIDTH_MINS, center within required
+    boundaries and expand to minimum width while respecting required range as hard boundary.
+    """
+    lo = max(sugg_start_min, req_start_min - TOLERANCE_MINS)
+    hi = min(sugg_end_min, req_end_min + TOLERANCE_MINS)
+    if hi - lo >= MIN_WINDOW_WIDTH_MINS:
+        return lo, hi
+    allowed_width = req_end_min - req_start_min
+    if allowed_width < MIN_WINDOW_WIDTH_MINS:
+        return req_start_min, req_end_min
+    center = (req_start_min + req_end_min) / 2
+    half = MIN_WINDOW_WIDTH_MINS / 2
+    lo = max(req_start_min, int(center - half))
+    hi = min(req_end_min, int(center + half))
+    if hi - lo < MIN_WINDOW_WIDTH_MINS:
+        lo = req_start_min
+        hi = req_end_min
+    return lo, hi
+
+
 def stage3_context_aware_suggestion(stage2: pd.DataFrame) -> pd.DataFrame:
     """
     Per patient, per day of week: find all patterns, sort by required start.
     Sub-group contiguous (current start = previous end) or concurrent (same start).
-    Apply conflict resolution. Then aggregate by (Formatted_Name, req_start, req_end) for DB matching.
+    Apply conflict resolution (pinch inward, only between different groups). Clamp suggested
+    windows to required boundaries. Aggregate with median; clamp again.
     """
     logger.info("Stage 3: Context-Aware Suggestion Engine")
 
@@ -394,9 +424,13 @@ def stage3_context_aware_suggestion(stage2: pd.DataFrame) -> pd.DataFrame:
         patterns = grp.sort_values("req_start_min").to_dict("records")
         if not patterns:
             continue
-        # Single pattern: use as-is
+        # Single pattern: clamp and use
         if len(patterns) == 1:
             p = patterns[0]
+            sugg_start, sugg_end = _clamp_suggested_window_to_required(
+                int(p["sugg_start_min"]), int(p["sugg_end_min"]),
+                int(p["req_start_min"]), int(p["req_end_min"]),
+            )
             rows_out.append({
                 "Formatted_Name": name,
                 "day_of_week": day,
@@ -404,14 +438,15 @@ def stage3_context_aware_suggestion(stage2: pd.DataFrame) -> pd.DataFrame:
                 "req_start_minute": p["req_start_minute"],
                 "req_end_hour": p["req_end_hour"],
                 "req_end_minute": p["req_end_minute"],
-                "sugg_start_min": p["sugg_start_min"],
-                "sugg_end_min": p["sugg_end_min"],
+                "sugg_start_min": sugg_start,
+                "sugg_end_min": sugg_end,
                 "minDuration": p["minDuration"],
                 "Service Requirement Duration": p.get("Service Requirement Duration"),
             })
             continue
-        # Multiple: group into contiguous (current start = previous end) or concurrent (same start)
+        # Multiple: group into contiguous/concurrent and assign group_index
         adjusted = []
+        group_idx = 0
         i = 0
         while i < len(patterns):
             p = patterns[i]
@@ -422,33 +457,44 @@ def stage3_context_aware_suggestion(stage2: pd.DataFrame) -> pd.DataFrame:
             while j < len(patterns) and patterns[j]["req_start_min"] == p["req_start_min"]:
                 j += 1
             if j > i + 1:
-                # Concurrent: same wide window (min of sugg_start, max of sugg_end in group)
+                # Concurrent: same wide window; all share group_index
                 group = patterns[i:j]
                 s_start = min(px["sugg_start_min"] for px in group)
                 s_end = max(px["sugg_end_min"] for px in group)
                 for px in group:
-                    adjusted.append({**px, "sugg_start_min": s_start, "sugg_end_min": s_end})
+                    adjusted.append({
+                        **px,
+                        "sugg_start_min": s_start,
+                        "sugg_end_min": s_end,
+                        "group_index": group_idx,
+                    })
+                group_idx += 1
                 i = j
                 continue
-            # Contiguous: check if this start equals previous end
-            if adjusted and adjusted[-1]["sugg_end_min"] == p["req_start_min"]:
-                # Stack back-to-back: keep suggested window
-                adjusted.append(p)
-            else:
-                adjusted.append(p)
+            # Single pattern (or contiguous); own group
+            adjusted.append({**p, "group_index": group_idx})
+            group_idx += 1
             i += 1
-        # Inter-group conflict: shift overlapping by (overlap/2) + 5
+        # Inter-group conflict: only between different group_index; pinch inward (prev end down, curr start up; curr end unchanged)
         for k in range(len(adjusted)):
             if k == 0:
                 continue
             prev = adjusted[k - 1]
             curr = adjusted[k]
+            if prev["group_index"] == curr["group_index"]:
+                continue
             overlap = prev["sugg_end_min"] - curr["sugg_start_min"]
             if overlap > 0:
                 shift = (overlap / 2) + 5
+                prev["sugg_end_min"] = prev["sugg_end_min"] - shift
                 curr["sugg_start_min"] = curr["sugg_start_min"] + shift
-                curr["sugg_end_min"] = curr["sugg_end_min"] + shift
+                # curr["sugg_end_min"] stays unchanged
+        # Clamp each pattern to required boundaries before appending
         for p in adjusted:
+            sugg_start, sugg_end = _clamp_suggested_window_to_required(
+                int(p["sugg_start_min"]), int(p["sugg_end_min"]),
+                int(p["req_start_min"]), int(p["req_end_min"]),
+            )
             rows_out.append({
                 "Formatted_Name": name,
                 "day_of_week": day,
@@ -456,8 +502,8 @@ def stage3_context_aware_suggestion(stage2: pd.DataFrame) -> pd.DataFrame:
                 "req_start_minute": p["req_start_minute"],
                 "req_end_hour": p["req_end_hour"],
                 "req_end_minute": p["req_end_minute"],
-                "sugg_start_min": p["sugg_start_min"],
-                "sugg_end_min": p["sugg_end_min"],
+                "sugg_start_min": sugg_start,
+                "sugg_end_min": sugg_end,
                 "minDuration": p["minDuration"],
                 "Service Requirement Duration": p.get("Service Requirement Duration"),
             })
@@ -475,14 +521,26 @@ def stage3_context_aware_suggestion(stage2: pd.DataFrame) -> pd.DataFrame:
         out["end_time_str"] = out["sugg_end_min"].apply(min_to_time_str)
         return out
 
-    # Aggregate by (Formatted_Name, req_start, req_end) across days: min(sugg_start), max(sugg_end), min(minDuration)
+    # Aggregate by (Formatted_Name, req_start, req_end) across days: median(sugg_start), median(sugg_end), min(minDuration)
     out["req_start_min"] = out["req_start_hour"] * 60 + out["req_start_minute"]
     out["req_end_min"] = out["req_end_hour"] * 60 + out["req_end_minute"]
     agg = out.groupby(["Formatted_Name", "req_start_hour", "req_start_minute", "req_end_hour", "req_end_minute"]).agg({
-        "sugg_start_min": "min",
-        "sugg_end_min": "max",
+        "sugg_start_min": lambda x: int(np.floor(np.median(x))),
+        "sugg_end_min": lambda x: int(np.ceil(np.median(x))),
         "minDuration": "min",
+        "Service Requirement Duration": "first",
     }).reset_index()
+    # Boundary clamp after aggregation (safety net)
+    def clamp_agg_row(r):
+        req_start = int(r["req_start_hour"]) * 60 + int(r["req_start_minute"])
+        req_end = int(r["req_end_hour"]) * 60 + int(r["req_end_minute"])
+        return _clamp_suggested_window_to_required(
+            int(r["sugg_start_min"]), int(r["sugg_end_min"]), req_start, req_end,
+        )
+
+    sugg_pairs = agg.apply(clamp_agg_row, axis=1)
+    agg["sugg_start_min"] = [p[0] for p in sugg_pairs]
+    agg["sugg_end_min"] = [p[1] for p in sugg_pairs]
     agg["requested_start_str"] = agg.apply(
         lambda r: min_to_time_str(int(r["req_start_hour"]) * 60 + int(r["req_start_minute"])), axis=1
     )
@@ -492,6 +550,128 @@ def stage3_context_aware_suggestion(stage2: pd.DataFrame) -> pd.DataFrame:
     agg["start_time_str"] = agg["sugg_start_min"].apply(min_to_time_str)
     agg["end_time_str"] = agg["sugg_end_min"].apply(min_to_time_str)
     return agg
+
+
+# ============================================================================
+# STAGE 3.5 — Routine Anomaly Detection & Removal
+# ============================================================================
+
+def stage3_5_remove_anomalies(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Group patterns by (Formatted_Name, req_start_hour, req_start_minute). For each group
+    with 2+ entries, find the most common Service Requirement Duration (standard) and
+    drop rows that differ (anomalies). Log each anomaly and a summary count.
+    """
+    logger.info("Stage 3.5: Routine Anomaly Detection & Removal")
+    col_dur = "Service Requirement Duration"
+    if col_dur not in df.columns:
+        logger.warning("  Column '%s' not found; skipping anomaly removal.", col_dur)
+        return df
+
+    total_before = len(df)
+    anchor_cols = ["Formatted_Name", "req_start_hour", "req_start_minute"]
+    # Build standard duration per anchor: mode of Service Requirement Duration
+    mode_per_anchor = df.groupby(anchor_cols)[col_dur].agg(
+        lambda s: s.mode().iloc[0] if len(s) and len(s.mode()) else s.iloc[0]
+    ).to_dict()
+
+    anomaly_indices = []
+    for (name, h, m), grp in df.groupby(anchor_cols):
+        if len(grp) < 2:
+            continue
+        standard = mode_per_anchor.get((name, h, m))
+        if standard is None:
+            continue
+        for idx, row in grp.iterrows():
+            dur = row[col_dur]
+            if pd.isna(dur) or int(dur) != int(standard):
+                anomaly_indices.append(idx)
+                slot = f"{int(h):02d}:{int(m):02d}"
+                req_end = row.get("requested_end_str", "")
+                if not req_end and "req_end_hour" in row.index and "req_end_minute" in row.index:
+                    req_end = f"{int(row['req_end_hour']):02d}:{int(row['req_end_minute']):02d}"
+                extra = f" req_end=%s" % req_end if req_end else ""
+                logger.info(
+                    "  Anomaly: patient=%s time_slot=%s standard_duration=%s min anomaly_duration=%s min%s",
+                    name, slot, int(standard), int(dur) if not pd.isna(dur) else "NaN", extra,
+                )
+
+    out = df.drop(index=anomaly_indices).reset_index(drop=True)
+    removed = len(anomaly_indices)
+    logger.info("  Removed %d anomalous patterns out of %d total", removed, total_before)
+    return out
+
+
+# ============================================================================
+# STAGE 3.7 — Suggested Duration Refinement
+# ============================================================================
+
+def stage3_7_refine_duration(pattern_df: pd.DataFrame, stage1_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    For each pattern, use actual duration distribution from Stage 1. Build frequency map
+    for durations <= Service Requirement Duration; apply 10%% significance threshold;
+    set suggested_duration to highest significant duration < required, else keep required.
+    Set minDuration = suggested_duration for DB update.
+    """
+    logger.info("Stage 3.7: Suggested Duration Refinement")
+    col_req_start = "Service Requirement Start Date And Time"
+    col_req_end = "Service Requirement End Date And Time"
+    col_req_dur = "Service Requirement Duration"
+    col_act_dur = "Actual Duration"
+
+    if col_act_dur not in stage1_df.columns or col_req_dur not in pattern_df.columns:
+        logger.warning("  Missing duration columns; skipping refinement.")
+        return pattern_df
+
+    # Add req hour/minute to Stage 1 for matching
+    s1 = stage1_df.copy()
+    s1["req_start_hour"] = s1[col_req_start].dt.hour
+    s1["req_start_minute"] = s1[col_req_start].dt.minute
+    s1["req_end_hour"] = s1[col_req_end].dt.hour
+    s1["req_end_minute"] = s1[col_req_end].dt.minute
+
+    match_cols = ["Formatted_Name", "req_start_hour", "req_start_minute", "req_end_hour", "req_end_minute"]
+    suggested = []
+    for _, row in pattern_df.iterrows():
+        req_dur = row[col_req_dur]
+        if pd.isna(req_dur):
+            suggested.append(req_dur)
+            continue
+        req_dur = int(req_dur)
+        mask = True
+        for c in match_cols:
+            if c not in s1.columns or c not in row.index:
+                mask = pd.Series(True, index=s1.index)
+                break
+            mask = mask & (s1[c] == row[c])
+        subset = s1.loc[mask]
+        if subset.empty:
+            suggested.append(req_dur)
+            continue
+        # Frequency map: duration -> count, only durations <= req_dur
+        dur_counts: Dict[int, int] = defaultdict(int)
+        for d in subset[col_act_dur].dropna():
+            d = int(d)
+            if d <= req_dur:
+                dur_counts[d] += 1
+        total = subset.shape[0]
+        if total == 0:
+            suggested.append(req_dur)
+            continue
+        threshold_count = max(1, int(round(total * DURATION_SIGNIFICANCE_THRESHOLD)))
+        significant = [d for d, cnt in dur_counts.items() if cnt >= threshold_count and d < req_dur]
+        if significant:
+            chosen = max(significant)
+            suggested.append(chosen)
+        else:
+            suggested.append(req_dur)
+
+    out = pattern_df.copy()
+    out["suggested_duration"] = suggested
+    out["minDuration"] = out["suggested_duration"]
+    logger.info("  Refined minDuration for %d patterns using %.0f%% significance threshold",
+                len(out), DURATION_SIGNIFICANCE_THRESHOLD * 100)
+    return out
 
 
 # ============================================================================
@@ -534,6 +714,8 @@ def run(csv_path: Optional[str] = None, connection_manager=None, state=None) -> 
             return True
         stage2 = stage2_initial_pattern_intelligence(df1)
         stage3 = stage3_context_aware_suggestion(stage2)
+        stage3 = stage3_5_remove_anomalies(stage3)
+        stage3 = stage3_7_refine_duration(stage3, df1)
         patterns_count = len(stage3)
         logger.info("  Patterns from analysis (candidates for update): %d", patterns_count)
         if patterns_count > 0 and patterns_count <= 20:
