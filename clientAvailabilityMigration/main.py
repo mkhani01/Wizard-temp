@@ -28,6 +28,7 @@ Record rules (Personal Care only):
 import os
 import sys
 import logging
+import datetime as dt
 from pathlib import Path
 from datetime import datetime, timedelta, date, time
 from collections import defaultdict
@@ -101,6 +102,8 @@ try:
 except ImportError:
     ConnectionLostError = None
 
+from encoding_utils import fix_utf8_mojibake, normalize_name_for_match
+
 
 def connect_to_database(config: Dict[str, Any]):
     try:
@@ -134,9 +137,18 @@ def get_all_clients(connection) -> Dict[str, int]:
         for row in cursor.fetchall():
             name = (row['name'] or '').strip()
             lastname = (row['lastname'] or '').strip()
-            key = f"{lastname}, {name}".strip().lower()
-            if key:
-                clients[key] = row['id']
+            client_id = row['id']
+            # Normalize so case and apostrophe variants match Excel
+            key_comma = normalize_name_for_match(f"{lastname}, {name}")
+            key_space = normalize_name_for_match(f"{name} {lastname}")
+            # When duplicate names exist (e.g. same person with two rows), keep the highest id
+            # so we attach availabilities to the most recently created/updated client.
+            if key_comma:
+                if key_comma not in clients or client_id > clients[key_comma]:
+                    clients[key_comma] = client_id
+            if key_space:
+                if key_space not in clients or client_id > clients[key_space]:
+                    clients[key_space] = client_id
         logger.info(f"✓ Loaded {len(clients)} clients from database")
         return clients
     finally:
@@ -210,7 +222,7 @@ def normalize_time_for_slot(t: time) -> time:
     Floors to 10-minute boundary so e.g. 20:00 (string) and 20:05 (Excel serial) both become 20:00."""
     minute_floor = (t.minute // 10) * 10
 
-    return time(t.hour, minute_floor, 0)
+    return dt.time(t.hour, minute_floor, 0)
 
 
 def format_date_str(d: date) -> str:
@@ -282,13 +294,15 @@ def process_xlsx_file(filepath: Path, clients_map: Dict[str, int]) -> Tuple[Dict
     col_planned_req_type = find_excel_column_index(header_row, ['Planned Service Requirement Type Description'])
     col_start_datetime = find_excel_column_index(header_row, ['Service Requirement Start Date And Time'])
     col_end_datetime = find_excel_column_index(header_row, ['Service Requirement End Date And Time'])
-    
+    col_duration = find_excel_column_index(header_row, ['Service Requirement Duration'])
+
     logger.info(f"Column mappings:")
     logger.info(f"  - Service Location Name: column {col_service_location_name}")
     logger.info(f"  - Planned Service Type Description: column {col_planned_type}")
     logger.info(f"  - Planned Service Requirement Type Description: column {col_planned_req_type}")
     logger.info(f"  - Service Requirement Start Date And Time: column {col_start_datetime}")
     logger.info(f"  - Service Requirement End Date And Time: column {col_end_datetime}")
+    logger.info(f"  - Service Requirement Duration: column {col_duration}")
     
     if col_service_location_name == -1:
         raise MigrationError("Missing required column: Service Location Name")
@@ -312,11 +326,13 @@ def process_xlsx_file(filepath: Path, clients_map: Dict[str, int]) -> Tuple[Dict
     for row_num, row in enumerate(row_iter, start=2):
         total_rows += 1
         
-        service_location_name = row[col_service_location_name] if col_service_location_name < len(row) else None
+        raw_location = row[col_service_location_name] if col_service_location_name < len(row) else None
+        service_location_name = fix_utf8_mojibake(raw_location) if raw_location is not None else None
         planned_type_val = row[col_planned_type] if col_planned_type < len(row) else None
         planned_req_type_val = row[col_planned_req_type] if col_planned_req_type < len(row) else None
         start_datetime_val = row[col_start_datetime] if col_start_datetime < len(row) else None
         end_datetime_val = row[col_end_datetime] if col_end_datetime < len(row) else None
+        duration_val = row[col_duration] if col_duration != -1 and col_duration < len(row) else None
         
         # Before everything: only rows with BOTH "Planned Service Type Description" = "Personal Care"
         # AND "Planned Service Requirement Type Description" = "Personal Care" are considered.
@@ -345,7 +361,7 @@ def process_xlsx_file(filepath: Path, clients_map: Dict[str, int]) -> Tuple[Dict
             )
             continue
 
-        client_key = str(service_location_name).strip().lower()
+        client_key = normalize_name_for_match(str(service_location_name))
 
         client_id = clients_map.get(client_key)
         if not client_id:
@@ -381,6 +397,19 @@ def process_xlsx_file(filepath: Path, clients_map: Dict[str, int]) -> Tuple[Dict
             )
             continue
 
+        # Parse duration: convert from hours to minutes (e.g., 0.75 hours = 45 minutes)
+        duration_minutes = None
+        if duration_val is not None:
+            try:
+                duration_hours = float(duration_val)
+                if duration_hours > 0:
+                    duration_minutes = int(duration_hours * 60)
+            except (ValueError, TypeError):
+                logger.warning(
+                    "Row %d: Invalid duration value %r (expected hours as number), using None",
+                    row_num, duration_val
+                )
+
         client_records[client_id].append({
             'client_id': client_id,
             'client_name': service_location_name,
@@ -390,11 +419,13 @@ def process_xlsx_file(filepath: Path, clients_map: Dict[str, int]) -> Tuple[Dict
             'start_time': start_time_val,
             'end_time': end_time_val,
             'day_of_week': get_day_of_week(start_date_val),
+            'duration_minutes': duration_minutes,
             'source_row': row_num,
         })
         logger.info(
-            "Row %d: ADDED | client=%r (id=%s), start=%s %s, end_time=%s, day=%s",
-            row_num, service_location_name, client_id, start_date_val, start_time_val, end_time_val, get_day_of_week(start_date_val)
+            "Row %d: ADDED | client=%r (id=%s), start=%s %s, end_time=%s, day=%s, duration=%s min",
+            row_num, service_location_name, client_id, start_date_val, start_time_val, end_time_val,
+            get_day_of_week(start_date_val), duration_minutes
         )
 
     logger.info(f"\n{'='*60}")
@@ -437,60 +468,92 @@ def analyze_client_schedule(records: List[Dict]) -> Dict[str, Any]:
     # Count source rows (caregivers) PER DATE so we get "caregivers per occurrence" (plus caregiver when same slot).
     slot_weeks = defaultdict(set)
     slot_record_count_per_date = defaultdict(lambda: defaultdict(int))
-    
+    slot_durations = defaultdict(list)  # Track all durations for each slot
+
+    # Track original (non-normalized) times for each slot key
+    slot_original_times = {}  # key: (day, start_n, end_n) -> (original_start, original_end)
+
     for record in records:
         # Normalize times so "same" slot (e.g. 20:00-20:30) groups together even if Excel had microsecond variance
         start_n = normalize_time_for_slot(record['start_time'])
         end_n = normalize_time_for_slot(record['end_time'])
         key = (record['day_of_week'], start_n, end_n)
+
+        # Keep the original (non-normalized) times - use first occurrence
+        if key not in slot_original_times:
+            slot_original_times[key] = (record['start_time'], record['end_time'])
+
+        # Track duration if present
+        if record.get('duration_minutes') is not None:
+            slot_durations[key].append(record['duration_minutes'])
+
         slot_record_count_per_date[key][record['start_date']] += 1
         week_num = get_week_number(record['start_date'], min_date)
         # Only consider weeks 1 and 2 for comparison
         if 1 <= week_num <= 2:
             slot_weeks[key].add(week_num)
-    
+
     logger.info(f"  Found {len(slot_weeks)} unique slot types")
-    
+
     # number_of_care_givers = max over all dates of (rows for that slot on that date) = caregivers per occurrence
     def _caregivers_for_slot(slot_key):
         counts = slot_record_count_per_date.get(slot_key, {})
         return max(1, max(counts.values())) if counts else 1
-    
+
+    # duration = most common duration (mode) for this slot, or max if no clear mode
+    def _duration_for_slot(slot_key):
+        durations = slot_durations.get(slot_key, [])
+        if not durations:
+            return None
+        # Use most common duration (mode)
+        from collections import Counter
+        counts = Counter(durations)
+        most_common = counts.most_common(1)
+        return most_common[0][0] if most_common else None
+
     # Classify slots; number_of_care_givers = count of source rows for that slot on a single date (same time = multiple caregivers)
     both_weeks = []  # Same slot in both week 1 and week 2
     week1_only = []  # Slot only in week 1
     week2_only = []  # Slot only in week 2
-    
-    for (day, start_time, end_time), weeks in slot_weeks.items():
-        slot_key = (day, start_time, end_time)
+
+    for (day, start_n, end_n), weeks in slot_weeks.items():
+        slot_key = (day, start_n, end_n)
         num_care_givers = _caregivers_for_slot(slot_key)
+        duration = _duration_for_slot(slot_key)
+
+        # Get original (non-normalized) times
+        original_start, original_end = slot_original_times.get(slot_key, (start_n, end_n))
+
         has_week1 = 1 in weeks
         has_week2 = 2 in weeks
-        
+
         if has_week1 and has_week2:
             both_weeks.append({
                 'day': day,
-                'start_time': start_time,
-                'end_time': end_time,
+                'start_time': original_start,
+                'end_time': original_end,
                 'number_of_care_givers': num_care_givers,
+                'duration': duration,
             })
-            logger.debug(f"    Slot {day} {format_time_str(start_time)}-{format_time_str(end_time)}: BOTH weeks, caregivers={num_care_givers}")
+            logger.debug(f"    Slot {day} {format_time_str(original_start)}-{format_time_str(original_end)}: BOTH weeks (will be weekly), caregivers={num_care_givers}, duration={duration}")
         elif has_week1:
             week1_only.append({
                 'day': day,
-                'start_time': start_time,
-                'end_time': end_time,
+                'start_time': original_start,
+                'end_time': original_end,
                 'number_of_care_givers': num_care_givers,
+                'duration': duration,
             })
-            logger.debug(f"    Slot {day} {format_time_str(start_time)}-{format_time_str(end_time)}: WEEK 1 only, caregivers={num_care_givers}")
+            logger.debug(f"    Slot {day} {format_time_str(original_start)}-{format_time_str(original_end)}: WEEK 1 only, caregivers={num_care_givers}, duration={duration}")
         elif has_week2:
             week2_only.append({
                 'day': day,
-                'start_time': start_time,
-                'end_time': end_time,
+                'start_time': original_start,
+                'end_time': original_end,
                 'number_of_care_givers': num_care_givers,
+                'duration': duration,
             })
-            logger.debug(f"    Slot {day} {format_time_str(start_time)}-{format_time_str(end_time)}: WEEK 2 only, caregivers={num_care_givers}")
+            logger.debug(f"    Slot {day} {format_time_str(original_start)}-{format_time_str(original_end)}: WEEK 2 only, caregivers={num_care_givers}, duration={duration}")
     
     logger.info(f"  Slot analysis: both_weeks={len(both_weeks)}, week1_only={len(week1_only)}, week2_only={len(week2_only)}")
     
@@ -521,6 +584,7 @@ def analyze_client_schedule(records: List[Dict]) -> Dict[str, Any]:
                 'start_date': min_date,
                 'occurs_every': 1,
                 'number_of_care_givers': item.get('number_of_care_givers', 1),
+                'duration': item.get('duration'),
             })
         # Also include week1_only and week2_only if any (they become weekly too)
         for item in week1_only + week2_only:
@@ -531,20 +595,23 @@ def analyze_client_schedule(records: List[Dict]) -> Dict[str, Any]:
                 'start_date': min_date,
                 'occurs_every': 1,
                 'number_of_care_givers': item.get('number_of_care_givers', 1),
+                'duration': item.get('duration'),
             })
     else:
         # Bi-weekly: Create records based on which week they appear
         for item in both_weeks:
-            # Slot in both weeks with bi-weekly = one record starting week 1
+            # Slot in both weeks means it repeats every week, so use occurs_every=1
+            # even though the overall pattern is bi-weekly
             schedules.append({
                 'day': item['day'],
                 'start_time': item['start_time'],
                 'end_time': item['end_time'],
                 'start_date': min_date,
-                'occurs_every': 2,
+                'occurs_every': 1,  # Weekly, since it appears in both weeks
                 'number_of_care_givers': item.get('number_of_care_givers', 1),
+                'duration': item.get('duration'),
             })
-        
+
         for item in week1_only:
             schedules.append({
                 'day': item['day'],
@@ -553,8 +620,9 @@ def analyze_client_schedule(records: List[Dict]) -> Dict[str, Any]:
                 'start_date': min_date,
                 'occurs_every': 2,
                 'number_of_care_givers': item.get('number_of_care_givers', 1),
+                'duration': item.get('duration'),
             })
-        
+
         for item in week2_only:
             week2_start = min_date + timedelta(days=7)
             schedules.append({
@@ -564,6 +632,7 @@ def analyze_client_schedule(records: List[Dict]) -> Dict[str, Any]:
                 'start_date': week2_start,
                 'occurs_every': 2,
                 'number_of_care_givers': item.get('number_of_care_givers', 1),
+                'duration': item.get('duration'),
             })
     
     return {
@@ -604,6 +673,7 @@ def generate_availability_records(
         
         for schedule in schedules:
             num_care_givers = schedule.get('number_of_care_givers', DEFAULT_NUMBER_OF_CARE_GIVERS)
+            duration = schedule.get('duration', DEFAULT_DURATION)
             availabilities.append({
                 'client_id': client_id,
                 'days': [schedule['day']],
@@ -619,7 +689,7 @@ def generate_availability_records(
                 'flex_end': DEFAULT_FLEX_END,
                 'fix_window': DEFAULT_FIX_WINDOW,
                 'min_duration': DEFAULT_MIN_DURATION,
-                'duration': DEFAULT_DURATION,
+                'duration': duration,
                 'note': None,
                 'start_date': format_date_str(schedule['start_date']),
                 'end_date': None,
@@ -627,10 +697,10 @@ def generate_availability_records(
                 'effective_date_from': None,
                 'effective_date_to': None,
             })
-            
+
             logger.info(f"  → {schedule['day']} {format_time_str(schedule['start_time'])}-{format_time_str(schedule['end_time'])}, "
                        f"start={format_date_str(schedule['start_date'])}, occurs_every={schedule['occurs_every']}, "
-                       f"number_of_care_givers={num_care_givers}")
+                       f"number_of_care_givers={num_care_givers}, duration={duration}")
     
     logger.info(f"\nGenerated {len(availabilities)} total availability records")
     return availabilities

@@ -8,9 +8,10 @@ import re
 import csv
 import logging
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, date
 
 from migration_support import get_assets_dir
+from encoding_utils import fix_utf8_mojibake
 import psycopg2
 from psycopg2.extras import RealDictCursor, execute_values
 from psycopg2 import OperationalError, InterfaceError
@@ -111,20 +112,17 @@ def get_lookup_tables(connection):
 
 
 def parse_date(date_str):
-    """Parse date from CSV format DD/MM/YYYY HH:MM:SS"""
+    """Parse date from CSV format DD/MM/YYYY with optional time (HH:MM:SS or HH:MM)"""
     if not date_str or date_str.strip() == '':
         return None
-    
-    try:
-        # Format: 01/01/1999 00:00:00
-        return datetime.strptime(date_str.strip(), '%d/%m/%Y %H:%M:%S').date()
-    except:
+    s = date_str.strip()
+    for fmt in ('%d/%m/%Y %H:%M:%S', '%d/%m/%Y %H:%M', '%d/%m/%Y'):
         try:
-            # Try without time
-            return datetime.strptime(date_str.strip(), '%d/%m/%Y').date()
-        except:
-            logger.warning(f"Could not parse date: {date_str}")
-            return None
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    logger.warning(f"Could not parse date: {date_str}")
+    return None
 
 
 def map_gender(csv_gender):
@@ -213,7 +211,7 @@ def extract_users_from_csv(csv_path, lookups):
     """Extract user data from CSV and map to database fields"""
     users = []
     used_emails = set()
-    stats = {"skipped_no_name": 0, "warn_no_phone": 0, "placeholder_email": 0}
+    stats = {"skipped_no_name": 0, "skipped_terminated": 0, "warn_no_phone": 0, "placeholder_email": 0}
     
     logger.info("Reading CSV: %s", csv_path)
     
@@ -224,10 +222,10 @@ def extract_users_from_csv(csv_path, lookups):
         for row in reader:
             row_num += 1
             
-            # Basic fields first (need name for placeholder if email missing)
-            first_name = row.get('First Name', '').strip()
-            last_name = row.get('Last Name', '').strip()
-            
+            # Basic fields first (need name for placeholder if email missing); fix encoding mojibake
+            first_name = fix_utf8_mojibake(row.get('First Name', '') or '').strip()
+            last_name = fix_utf8_mojibake(row.get('Last Name', '') or '').strip()
+
             # If Last Name is empty but First Name contains spaces, split
             if not last_name and first_name and ' ' in first_name:
                 parts = first_name.split()
@@ -249,9 +247,19 @@ def extract_users_from_csv(csv_path, lookups):
                     row_num, first_name, last_name, row.get('Email', ''), row.get('Title', ''), row.get('Mobile', ''), row.get('Home', '')
                 )
                 continue
-            
-            # Email: use from CSV or unique placeholder when missing
-            email_raw = row.get('Email', '').strip().lower()
+
+            # Seed only when Termination Date is null/empty OR >= today (equal to today is seeded)
+            termination_date = parse_date(clean_excel_value(row.get('Termination Date', '')))
+            if termination_date is not None and termination_date < date.today():
+                stats["skipped_terminated"] += 1
+                logger.info(
+                    "Row %d: SKIPPED - Termination Date %s is before today | name=%r, lastname=%r",
+                    row_num, termination_date, first_name, last_name
+                )
+                continue
+
+            # Email: use from CSV or unique placeholder when missing (fix encoding)
+            email_raw = fix_utf8_mojibake(row.get('Email', '') or '').strip().lower()
             if email_raw:
                 email = email_raw
                 if email in used_emails:
@@ -280,28 +288,28 @@ def extract_users_from_csv(csv_path, lookups):
             
             # Map foreign keys
             title_id = None
-            title_name = row.get('Title', '').strip()
+            title_name = fix_utf8_mojibake(row.get('Title', '') or '').strip()
             if title_name and title_name in lookups['titles']:
                 title_id = lookups['titles'][title_name]
             
             nationality_id = None
-            nationality_name = row.get('Nationality', '').strip()
+            nationality_name = fix_utf8_mojibake(row.get('Nationality', '') or '').strip()
             if nationality_name and nationality_name in lookups['nationalities']:
                 nationality_id = lookups['nationalities'][nationality_name]
-            
+
             religion_id = None
-            religion_name = row.get('Religion', '').strip()
+            religion_name = fix_utf8_mojibake(row.get('Religion', '') or '').strip()
             if religion_name and religion_name in lookups['religions']:
                 religion_id = lookups['religions'][religion_name]
-            
+
             origin_id = None
-            origin_name = row.get('Ethnic Origin', '').strip()
+            origin_name = fix_utf8_mojibake(row.get('Ethnic Origin', '') or '').strip()
             if origin_name and origin_name in lookups['origins']:
                 origin_id = lookups['origins'][origin_name]
-            
+
             # Get group_id for many-to-many relationship (not area_id)
             group_id = None
-            group_name = row.get('Area', '').strip()
+            group_name = fix_utf8_mojibake(row.get('Area', '') or '').strip()
             if group_name and group_name in lookups['groups']:
                 group_id = lookups['groups'][group_name]
             
@@ -320,8 +328,8 @@ def extract_users_from_csv(csv_path, lookups):
             user_data = {
                 'name': first_name,
                 'lastname': last_name,
-                'middle_name': row.get('Initial', '').strip() or None,
-                'preferred_name': row.get('Preferred Name', '').strip() or None,
+                'middle_name': fix_utf8_mojibake(row.get('Initial', '') or '').strip() or None,
+                'preferred_name': fix_utf8_mojibake(row.get('Preferred Name', '') or '').strip() or None,
                 'email': email,
                 'phone_number': phone,
                 'password': 'default_password_123',
@@ -335,7 +343,7 @@ def extract_users_from_csv(csv_path, lookups):
                 'county': row.get('County', '').strip() or None,
                 'postcode': row.get('Post Code', '').strip() or None,
                 'travel_method': travel_method,
-                'status': 'Active' if row.get('Status', '').strip() == 'Active' else 'Deactive',
+                'status': 'Active',  # Ignore CSV Status column; all seeded users are Active per termination-date filter
                 'title_id': title_id,
                 'nationality_id': nationality_id,
                 'religion_id': religion_id,
@@ -350,8 +358,8 @@ def extract_users_from_csv(csv_path, lookups):
             )
     
     logger.info(
-        "Extracted %d users from CSV. Skipped: %d (no name). Placeholder email used: %d. Warnings (no phone): %d.",
-        len(users), stats["skipped_no_name"], stats["placeholder_email"], stats["warn_no_phone"]
+        "Extracted %d users from CSV. Skipped: %d (no name), %d (termination date before today). Placeholder email used: %d. Warnings (no phone): %d.",
+        len(users), stats["skipped_no_name"], stats["skipped_terminated"], stats["placeholder_email"], stats["warn_no_phone"]
     )
     return users
 
@@ -360,6 +368,13 @@ def seed_users(connection, users, state=None):
     if not users:
         logger.warning("No users to insert")
         return False
+
+    # Deduplicate by email (last occurrence wins) so ON CONFLICT (email) never sees duplicates in one batch
+    n_original = len(users)
+    by_email = {u["email"]: u for u in users}
+    users = list(by_email.values())
+    if n_original > len(users):
+        logger.info("Deduplicated by email: %d rows -> %d unique users (removed %d duplicate email(s))", n_original, len(users), n_original - len(users))
 
     required_keys = [
         'name', 'lastname', 'middle_name', 'preferred_name', 'email', 'phone_number',

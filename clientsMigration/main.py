@@ -7,10 +7,11 @@ import os
 import csv
 import logging
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, date
 import psycopg2
 
 from migration_support import get_assets_dir
+from encoding_utils import fix_utf8_mojibake, normalize_name_for_match
 from psycopg2.extras import RealDictCursor, execute_values
 from psycopg2 import OperationalError, InterfaceError
 
@@ -141,7 +142,7 @@ def clean_excel_value(value):
 
 
 def parse_datetime(date_str):
-    """Parse datetime from CSV format DD/MM/YYYY HH:MM:SS"""
+    """Parse datetime from CSV format DD/MM/YYYY with optional time (HH:MM:SS or HH:MM)"""
     if not date_str:
         return None
     
@@ -149,20 +150,17 @@ def parse_datetime(date_str):
     if not date_str:
         return None
     
-    try:
-        # Format: 01/01/2024 13:49:14
-        return datetime.strptime(date_str, '%d/%m/%Y %H:%M:%S')
-    except:
+    for fmt in ('%d/%m/%Y %H:%M:%S', '%d/%m/%Y %H:%M', '%d/%m/%Y'):
         try:
-            # Try without time
-            return datetime.strptime(date_str, '%d/%m/%Y')
-        except:
-            logger.warning(f"Could not parse datetime: {date_str}")
-            return None
+            return datetime.strptime(date_str, fmt)
+        except ValueError:
+            continue
+    logger.warning(f"Could not parse datetime: {date_str}")
+    return None
 
 
 def parse_date(date_str):
-    """Parse date from CSV format DD/MM/YYYY HH:MM:SS"""
+    """Parse date from CSV format DD/MM/YYYY with optional time (HH:MM:SS or HH:MM)"""
     dt = parse_datetime(date_str)
     return dt.date() if dt else None
 
@@ -180,14 +178,15 @@ def map_gender(csv_gender):
 
 
 def map_status(csv_status):
-    """Map CSV status to entity enum"""
+    """Map CSV status to entity enum. Default Active for seeded rows (non-terminated)."""
     status_map = {
         'Active': 'Active',
         'Deactive': 'Deactive',
         'Pending': 'Pending',
         'Uncomplete': 'Uncomplete',
+        'Complete': 'Complete',
     }
-    return status_map.get(csv_status, 'Uncomplete')
+    return status_map.get(csv_status, 'Active')
 
 
 def map_service_priority(csv_priority):
@@ -275,8 +274,8 @@ def seed_client_groups_from_csv(connection, csv_path):
         
         reader = csv.DictReader(f, dialect=dialect)
         for row in reader:
-            # FIX: Handle None values properly
-            area = safe_strip(row.get('Area'))
+            # FIX: Handle None values properly; fix encoding mojibake in names
+            area = safe_strip(fix_utf8_mojibake(row.get('Area')))
             if area:
                 groups.add(area)
     
@@ -355,7 +354,7 @@ def seed_areas_from_csv(connection, csv_path):
             
         reader = csv.DictReader(f, dialect=dialect)
         for row in reader:
-            area = safe_strip(row.get('Area'))
+            area = safe_strip(fix_utf8_mojibake(row.get('Area')))
             if area:
                 areas.add(area)
                 
@@ -429,10 +428,11 @@ def extract_clients_from_csv(csv_path, lookups):
         for row in reader:
             row_num += 1
             
-            # Helper function for safe CSV field access
+            # Helper function for safe CSV field access (fixes encoding mojibake e.g. O‚ÄôCeallaigh -> O'Ceallaigh)
             def safe_get(field_name):
-                """Safely get and strip CSV field"""
-                return safe_strip(row.get(field_name))
+                """Safely get, fix encoding, and strip CSV field"""
+                raw = row.get(field_name)
+                return safe_strip(fix_utf8_mojibake(raw))
             
             # Basic fields
             first_name = safe_get('First Name')
@@ -486,13 +486,22 @@ def extract_clients_from_csv(csv_path, lookups):
             birth_date = parse_date(safe_get('Date Of Birth'))
             start_date = parse_date(safe_get('Start Date'))
             termination_date = parse_date(safe_get('Termination Date'))
+
+            # Seed only when Termination Date is null/empty OR >= today (equal to today is seeded)
+            if termination_date is not None and termination_date < date.today():
+                logger.info(
+                    "Row %d: SKIPPED - Termination Date %s is before today | name=%r, lastname=%r",
+                    row_num, termination_date, first_name, last_name
+                )
+                continue
+
             consent_date = parse_date(safe_get('Consent Date'))
             created_date = parse_datetime(safe_get('Service Location Created Date & Time'))
             updated_date = parse_datetime(safe_get('Service Location Updated Date & Time'))
             
-            # Map enums
+            # Map enums (status ignored: all seeded clients are Active per termination-date filter)
             gender = map_gender(safe_get('Gender'))
-            status = map_status(safe_get('Service Location Status'))
+            status = 'Active'
             service_priority = map_service_priority(safe_get('Service Location Service Priority'))
             consent_status = map_consent_status(safe_get('Consent Status'))
             living_circumstances = map_living_circumstances(safe_get('ServiceLocationCustom_Living_Circumstances'))
@@ -594,13 +603,14 @@ def seed_clients(connection, clients):
     cursor = connection.cursor()
     try:
         # Load existing clients by (name, lastname)
-        # We normalize to lower case for matching to handle case inconsistencies
+        # Normalize (lowercase + apostrophe variants) so encoding doesn't create duplicates.
+        # When multiple rows normalize to the same key, keep the highest id (most recent).
         cursor.execute("SELECT id, name, lastname FROM client WHERE deleted_at IS NULL")
         existing = {}
         for row in cursor.fetchall():
-            # Key is lowercase name|lastname
-            key = f"{row['name'].lower()}|{row['lastname'].lower()}"
-            existing[key] = row['id']
+            key = f"{normalize_name_for_match(row['name'])}|{normalize_name_for_match(row['lastname'])}"
+            if key and (key not in existing or row['id'] > existing[key]):
+                existing[key] = row['id']
         
         logger.info(f"Found {len(existing)} existing clients in database")
         
@@ -612,8 +622,8 @@ def seed_clients(connection, clients):
         keys_in_file = set()
         
         for client in clients:
-            # Normalize key for matching
-            key = f"{client['name'].lower()}|{client['lastname'].lower()}"
+            # Normalize key for matching (same as existing: lowercase + apostrophe normalized)
+            key = f"{normalize_name_for_match(client['name'])}|{normalize_name_for_match(client['lastname'])}"
             keys_in_file.add(key)
             
             if key in existing:
@@ -857,17 +867,16 @@ def seed_clients(connection, clients):
 def link_clients_to_groups(cursor, processed_clients, original_clients):
     """Link clients to their groups via many-to-many relationship"""
     
-    # Create name+lastname to client mapping (normalized)
+    # Create name+lastname to client mapping (normalized for encoding-safe matching)
     name_to_client = {
-        f"{client['name'].lower()}|{client['lastname'].lower()}": client 
+        f"{normalize_name_for_match(client['name'])}|{normalize_name_for_match(client['lastname'])}": client
         for client in original_clients
     }
     
     # Prepare client-group links
     client_group_links = []
     for client_row in processed_clients:
-        # Normalize key for matching
-        key = f"{client_row['name'].lower()}|{client_row['lastname'].lower()}"
+        key = f"{normalize_name_for_match(client_row['name'])}|{normalize_name_for_match(client_row['lastname'])}"
         client_id = client_row['id']
         
         # Get group_id from original client data

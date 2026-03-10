@@ -292,6 +292,9 @@ class MigrationWizard:
         self.btn_check_migration = ttk.Button(btn_frame, text="Check the migration", command=self._on_check_migration)
         self.btn_check_migration.pack(side="right", padx=4)
         self.btn_check_migration.pack_forget()
+        self.btn_check_files = ttk.Button(btn_frame, text="Check migration", command=self._on_check_files)
+        self.btn_check_files.pack(side="right", padx=4)
+        self.btn_check_files.pack_forget()
         self.btn_back = ttk.Button(btn_frame, text="Back", command=self._on_back)
         self.btn_back.pack(side="right", padx=4)
         self.btn_continue = ttk.Button(btn_frame, text="Continue", command=self._on_continue)
@@ -714,10 +717,17 @@ class MigrationWizard:
         ]
         self.step_label.config(text=titles[step])
         self.btn_back.config(state="normal" if step > 0 else "disabled")
+
+        # Show/hide Check Migration button for file selection step
         if step == STEP_FILES:
             self._refresh_file_step()
-        elif step == STEP_SUMMARY:
+            self.btn_check_files.pack(side="right", padx=4)
+        else:
+            self.btn_check_files.pack_forget()
+
+        if step == STEP_SUMMARY:
             self._refresh_summary()
+
         if step == STEP_RUN:
             self.btn_continue.config(state="disabled")
             self.btn_back.config(state="disabled")
@@ -1205,6 +1215,129 @@ class MigrationWizard:
         """Re-enable buttons after check completes."""
         self.btn_check_migration.config(state="normal")
         self.btn_run_again.config(state="normal")
+        self.btn_cancel.config(state="normal")
+
+    def _on_check_files(self):
+        """Check migration with selected files (from file selection step)."""
+        # Validate database connection first
+        if not self._validate_db():
+            return
+
+        # Validate files are selected
+        if not self._validate_files():
+            return
+
+        # Ask for confirmation
+        if not messagebox.askyesno(
+            "Check Migration",
+            "This will validate the selected files against the database.\n\n"
+            "Make sure the database connection is correct and files are properly selected.\n\n"
+            "Continue?"
+        ):
+            return
+
+        # Disable button and show progress
+        self.btn_check_files.config(state="disabled")
+        self.btn_continue.config(state="disabled")
+        self.btn_back.config(state="disabled")
+        self.btn_cancel.config(state="disabled")
+
+        # Run check in background thread
+        thread = threading.Thread(target=self._do_check_files, daemon=True)
+        thread.start()
+
+    def _do_check_files(self):
+        """Background worker for checking files against database."""
+        conn_manager = None
+        temp_log_path = None
+        try:
+            # Apply environment variables
+            self._apply_env()
+
+            # Copy files to assets temporarily
+            try:
+                self._copy_files()
+            except Exception as e:
+                self.root.after(0, lambda err=str(e): messagebox.showerror(
+                    "File Error", "Failed to copy files: %s" % err
+                ))
+                return
+
+            # Connect to database
+            db_config = {
+                "host": self.db_config["host"].get().strip(),
+                "port": self.db_config["port"].get().strip(),
+                "database": self.db_config["database"].get().strip(),
+                "user": self.db_config["user"].get().strip(),
+                "password": self.db_config["password"].get().strip(),
+            }
+
+            if ConnectionManager:
+                conn_manager = ConnectionManager(db_config)
+                connection = conn_manager.get_connection()
+            else:
+                import psycopg2
+                from psycopg2.extras import RealDictCursor
+                connection = psycopg2.connect(
+                    host=db_config["host"],
+                    port=int(db_config["port"]),
+                    database=db_config["database"],
+                    user=db_config["user"],
+                    password=db_config["password"],
+                    cursor_factory=RealDictCursor,
+                    connect_timeout=10,
+                )
+
+            # Get selected options
+            selected = [k for k, v in self.check_vars.items() if v.get()]
+
+            # Run migration checks
+            from tests.migration_check import run_migration_checks
+
+            all_passed, all_msgs = run_migration_checks(
+                connection, selected, log_callback=None
+            )
+
+            # Save results to temp log file
+            temp_log_path = PROJECT_ROOT / ("migration_check_%s.log" % datetime.now().strftime("%Y%m%d_%H%M%S"))
+            with open(temp_log_path, "w", encoding="utf-8") as f:
+                for msg in all_msgs:
+                    f.write(msg + "\n")
+
+            # Show results
+            result_summary = "\n".join(all_msgs[:50])  # Show first 50 lines
+            if len(all_msgs) > 50:
+                result_summary += f"\n\n... and {len(all_msgs) - 50} more lines"
+            result_summary += f"\n\nFull log saved to:\n{temp_log_path}"
+
+            if all_passed:
+                self.root.after(0, lambda: messagebox.showinfo(
+                    "Check Migration - PASSED",
+                    "All checks passed!\n\n" + result_summary
+                ))
+            else:
+                self.root.after(0, lambda: messagebox.showwarning(
+                    "Check Migration - FAILED",
+                    "Some checks failed. Review the details:\n\n" + result_summary
+                ))
+
+        except Exception as e:
+            self.root.after(0, lambda err=str(e): messagebox.showerror(
+                "Check Error",
+                "Migration check failed with error:\n\n%s" % err
+            ))
+        finally:
+            if conn_manager:
+                conn_manager.close()
+
+            # Re-enable buttons
+            self.root.after(0, self._check_files_finished)
+
+    def _check_files_finished(self):
+        """Re-enable buttons after file check completes."""
+        self.btn_check_files.config(state="normal")
+        self.btn_continue.config(state="normal")
+        self.btn_back.config(state="normal")
         self.btn_cancel.config(state="normal")
 
     def _apply_env(self):

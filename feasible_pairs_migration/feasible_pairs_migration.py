@@ -426,6 +426,39 @@ def extract_visit_frequencies_from_csv(csv_path, users_lookup, clients_lookup):
     return frequencies, stats
 
 
+def ensure_unique_constraint(connection):
+    """Ensure unique constraint exists on feasible_pairs (cgid, client_id)."""
+    cursor = connection.cursor()
+    try:
+        # Check if unique constraint already exists
+        cursor.execute("""
+            SELECT constraint_name
+            FROM information_schema.table_constraints
+            WHERE table_name = 'feasible_pairs'
+              AND constraint_type = 'UNIQUE'
+              AND constraint_name = 'feasible_pairs_cgid_client_id_unique'
+        """)
+        if cursor.fetchone():
+            logger.info("✓ Unique constraint on (cgid, client_id) already exists")
+            return
+
+        # Create unique constraint
+        logger.info("Creating unique constraint on feasible_pairs (cgid, client_id)...")
+        cursor.execute("""
+            ALTER TABLE feasible_pairs
+            ADD CONSTRAINT feasible_pairs_cgid_client_id_unique
+            UNIQUE (cgid, client_id)
+        """)
+        connection.commit()
+        logger.info("✓ Created unique constraint on (cgid, client_id)")
+    except Exception as e:
+        connection.rollback()
+        # If constraint creation fails, we'll fall back to manual upsert logic
+        logger.warning(f"Could not create unique constraint (will use manual upsert): {e}")
+    finally:
+        cursor.close()
+
+
 def seed_feasible_pairs(connection, frequencies, existing_pairs):
     """
     Insert or update feasible pairs. Idempotent: CSV is source of truth.
@@ -435,22 +468,62 @@ def seed_feasible_pairs(connection, frequencies, existing_pairs):
     if not frequencies:
         logger.warning("No frequency data to insert.")
         return False
+
     cursor = connection.cursor()
     try:
         # Build list of (cgid, client_id, frequency) for upsert
         pairs_data = [(cgid, cid, freq) for (cgid, cid), freq in frequencies.items()]
         logger.info(f"\nSeeding feasible pairs to database (idempotent upsert)...")
         logger.info(f"  Pairs to insert/update: {len(pairs_data)}")
-        upsert_query = """
-            INSERT INTO feasible_pairs (cgid, client_id, frequency, wait)
-            VALUES %s
-            ON CONFLICT (cgid, client_id) DO UPDATE SET
-                frequency = EXCLUDED.frequency
-        """
-        execute_values(cursor, upsert_query, pairs_data, template="(%s, %s, %s, 0)")
-        connection.commit()
-        logger.info(f"✓ Successfully processed {len(pairs_data)} feasible pairs")
-        return True
+
+        # Try ON CONFLICT approach first (requires unique constraint)
+        try:
+            upsert_query = """
+                INSERT INTO feasible_pairs (cgid, client_id, frequency, wait)
+                VALUES %s
+                ON CONFLICT (cgid, client_id) DO UPDATE SET
+                    frequency = EXCLUDED.frequency
+            """
+            execute_values(cursor, upsert_query, pairs_data, template="(%s, %s, %s, 0)")
+            connection.commit()
+            logger.info(f"✓ Successfully processed {len(pairs_data)} feasible pairs (using ON CONFLICT)")
+            return True
+        except Exception as on_conflict_error:
+            # ON CONFLICT failed (likely missing constraint), fall back to manual upsert
+            connection.rollback()
+            logger.warning(f"ON CONFLICT failed, using manual upsert approach: {on_conflict_error}")
+
+            # Manual upsert: separate INSERT and UPDATE
+            inserts = []
+            updates = []
+
+            for cgid, cid, freq in pairs_data:
+                if (cgid, cid) in existing_pairs:
+                    updates.append((freq, cgid, cid))
+                else:
+                    inserts.append((cgid, cid, freq, 0))
+
+            if inserts:
+                logger.info(f"  Inserting {len(inserts)} new pairs...")
+                insert_query = """
+                    INSERT INTO feasible_pairs (cgid, client_id, frequency, wait)
+                    VALUES %s
+                """
+                execute_values(cursor, insert_query, inserts, template="(%s, %s, %s, %s)")
+
+            if updates:
+                logger.info(f"  Updating {len(updates)} existing pairs...")
+                for freq, cgid, cid in updates:
+                    cursor.execute("""
+                        UPDATE feasible_pairs
+                        SET frequency = %s
+                        WHERE cgid = %s AND client_id = %s
+                    """, (freq, cgid, cid))
+
+            connection.commit()
+            logger.info(f"✓ Successfully processed {len(pairs_data)} feasible pairs (manual upsert)")
+            return True
+
     except (OperationalError, InterfaceError) as e:
         connection.rollback()
         if ConnectionLostError:
@@ -525,7 +598,11 @@ def run(csv_path=None, connection_manager=None, state=None):
             logger.warning("No valid visit frequencies found in CSV")
             return False
         logger.info("\n" + "="*60)
-        logger.info("STEP 6: SEED FEASIBLE PAIRS TO DATABASE")
+        logger.info("STEP 6: ENSURE UNIQUE CONSTRAINT")
+        logger.info("="*60)
+        ensure_unique_constraint(connection)
+        logger.info("\n" + "="*60)
+        logger.info("STEP 7: SEED FEASIBLE PAIRS TO DATABASE")
         logger.info("="*60)
         success = seed_feasible_pairs(connection, frequencies, existing_pairs)
         if success:

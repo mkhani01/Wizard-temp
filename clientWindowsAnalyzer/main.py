@@ -1,7 +1,26 @@
 """
 Client Windows Analyzer
 Updates existing client_availabilities records with optimized start_time, end_time, and minDuration
-computed from historical visit data (VisitExport-style CSV) using a 3-stage analysis pipeline.
+computed from historical visit data (VisitExport-style CSV).
+
+Matching Logic:
+For each client_availability record, finds all CSV visits that are "covered" by it using:
+1. Client ID match
+2. Day of week match (CSV visit day must be in availability.days array)
+3. Time slot match (with 10-minute tolerance)
+4. Date falls within recurrence pattern (using start_date and occurs_every)
+
+This ensures CSV visits are properly matched even if they occur on different dates within
+the same recurrence pattern (e.g., weekly or bi-weekly schedules).
+
+Important Rules - Records are SKIPPED and left with NULL start_time, end_time, and minDuration if:
+1. number_of_care_givers >= 2 (multiple caregivers needed simultaneously)
+2. Time slots overlap on the same day for the same client (detected by checking if two time ranges
+   on shared days overlap)
+3. No CSV visits match the availability pattern (day/time/recurrence mismatch)
+
+Only non-overlapping records with number_of_care_givers = 1 are analyzed and updated.
+minDuration is always clamped to not exceed the Service Requirement Duration.
 """
 
 import os
@@ -27,6 +46,8 @@ try:
     from connection_manager import ConnectionLostError
 except ImportError:
     ConnectionLostError = None
+
+from encoding_utils import fix_utf8_mojibake, normalize_name_for_match
 
 # ============================================================================
 # CONFIGURATION
@@ -115,20 +136,13 @@ def get_all_clients(connection) -> Dict[str, int]:
         for row in cursor.fetchall():
             name = (row["name"] or "").strip()
             lastname = (row["lastname"] or "").strip()
-            key = _normalize_client_key(lastname, name)
+            key = normalize_name_for_match(f"{lastname}, {name}")
             if key:
                 clients[key] = row["id"]
         logger.info(f"✓ Loaded {len(clients)} clients from database")
         return clients
     finally:
         cursor.close()
-
-
-def _normalize_client_key(lastname: str, name: str) -> str:
-    """Build lookup key: 'lastname, name' lowercased with single space after comma."""
-    key = f"{lastname}, {name}".strip().lower()
-    key = re.sub(r"\s+", " ", key)  # collapse spaces so "Hawkshaw (DS),  Harry" still matches
-    return key
 
 
 def _normalize_time_to_hhmmss(t) -> str:
@@ -149,30 +163,154 @@ def _normalize_time_to_hhmmss(t) -> str:
     return s
 
 
-def load_client_availabilities(connection) -> List[Dict]:
-    """Load existing client_availabilities: id, client_id, requested_start_time, requested_end_time.
-    Multiple rows can share (client_id, requested_start_time, requested_end_time) (e.g. one per day).
+def _times_overlap(start1_str: str, end1_str: str, start2_str: str, end2_str: str) -> bool:
+    """Check if two time ranges overlap. Times are HH:MM:SS strings."""
+    def time_to_minutes(t_str: str) -> int:
+        """Convert HH:MM:SS to minutes from midnight."""
+        if not t_str:
+            return 0
+        parts = t_str.split(':')
+        h = int(parts[0]) if len(parts) > 0 else 0
+        m = int(parts[1]) if len(parts) > 1 else 0
+        return h * 60 + m
+
+    start1 = time_to_minutes(start1_str)
+    end1 = time_to_minutes(end1_str)
+    start2 = time_to_minutes(start2_str)
+    end2 = time_to_minutes(end2_str)
+
+    # Two ranges overlap if one starts before the other ends
+    return start1 < end2 and start2 < end1
+
+
+def load_client_availabilities(connection) -> Tuple[List[Dict], Dict[int, str]]:
+    """Load existing client_availabilities: id, client_id, requested_start_time, requested_end_time, number_of_care_givers.
+    Skip records that have:
+    1. number_of_care_givers >= 2 (multiple caregivers needed)
+    2. Overlapping time slots on the same day for the same client
+
+    Returns:
+        Tuple of (records_to_analyze, skip_reasons_dict)
+        skip_reasons_dict: {availability_id: reason_string}
     """
     cursor = connection.cursor()
     try:
+        # Count total records
         cursor.execute("""
-            SELECT id, client_id, requested_start_time, requested_end_time
+            SELECT COUNT(*) as total FROM client_availabilities WHERE deleted_at IS NULL
+        """)
+        total_count = cursor.fetchone()["total"]
+
+        # Load ALL records first to detect overlaps (now including start_date and occurs_every for matching)
+        cursor.execute("""
+            SELECT id, client_id, requested_start_time, requested_end_time,
+                   number_of_care_givers, days, start_date, occurs_every
             FROM client_availabilities
             WHERE deleted_at IS NULL
         """)
-        rows = cursor.fetchall()
-        out = []
-        for r in rows:
+        all_rows = cursor.fetchall()
+
+        # Convert to list with normalized times
+        all_records = []
+        for r in all_rows:
             rs = _normalize_time_to_hhmmss(r["requested_start_time"])
             re_ = _normalize_time_to_hhmmss(r["requested_end_time"])
-            out.append({
+
+            # Parse days field - PostgreSQL array type may come as list or need parsing
+            days_raw = r.get("days", [])
+            if isinstance(days_raw, str):
+                # PostgreSQL array came as string like "{Tuesday,Friday}"
+                days_list = days_raw.strip('{}').split(',') if days_raw else []
+                days_list = [d.strip() for d in days_list if d.strip()]
+            elif isinstance(days_raw, list):
+                days_list = days_raw
+            else:
+                days_list = []
+
+            all_records.append({
                 "id": r["id"],
                 "client_id": r["client_id"],
                 "requested_start_time": rs,
                 "requested_end_time": re_,
+                "number_of_care_givers": r.get("number_of_care_givers", 1),
+                "days": days_list,
+                "start_date": r.get("start_date"),
+                "occurs_every": r.get("occurs_every", 1),
             })
-        logger.info(f"✓ Loaded {len(out)} client_availabilities records")
-        return out
+
+        # Detect overlaps: for each client, check if any two time slots overlap on the same day
+        overlapping_ids = set()
+        multiple_caregiver_ids = set()
+        skip_reasons = {}  # Track reason for each skipped record
+
+        # Group by client_id
+        client_records = defaultdict(list)
+        for rec in all_records:
+            client_records[rec["client_id"]].append(rec)
+
+        # For each client, check for overlapping time slots on the same days
+        for client_id, records in client_records.items():
+            # Check each pair of records
+            for i in range(len(records)):
+                rec1 = records[i]
+
+                # Skip if already marked or has multiple caregivers
+                if rec1["number_of_care_givers"] >= 2:
+                    multiple_caregiver_ids.add(rec1["id"])
+                    skip_reasons[rec1["id"]] = f"Multiple caregivers required (number_of_care_givers={rec1['number_of_care_givers']})"
+                    continue
+
+                # Check if this record overlaps with any other record on the same day
+                for j in range(i + 1, len(records)):
+                    rec2 = records[j]
+
+                    # Check if they share any day of week
+                    days1 = set(rec1["days"]) if rec1["days"] else set()
+                    days2 = set(rec2["days"]) if rec2["days"] else set()
+                    shared_days = days1 & days2
+
+                    if shared_days:
+                        # They share a day - check if times overlap
+                        if _times_overlap(
+                            rec1["requested_start_time"], rec1["requested_end_time"],
+                            rec2["requested_start_time"], rec2["requested_end_time"]
+                        ):
+                            # Mark both as overlapping
+                            overlapping_ids.add(rec1["id"])
+                            overlapping_ids.add(rec2["id"])
+                            skip_reasons[rec1["id"]] = f"Overlapping time slots on same day (shared days: {sorted(shared_days)})"
+                            skip_reasons[rec2["id"]] = f"Overlapping time slots on same day (shared days: {sorted(shared_days)})"
+                            logger.debug(
+                                f"  Overlap detected: client_id={client_id}, "
+                                f"slot1={rec1['requested_start_time']}-{rec1['requested_end_time']}, "
+                                f"slot2={rec2['requested_start_time']}-{rec2['requested_end_time']}, "
+                                f"shared_days={shared_days}"
+                            )
+
+        # Filter out records with multiple caregivers or overlaps
+        out = []
+        skipped_multiple = 0
+        skipped_overlap = 0
+
+        for rec in all_records:
+            if rec["id"] in multiple_caregiver_ids:
+                skipped_multiple += 1
+                continue
+            if rec["id"] in overlapping_ids:
+                skipped_overlap += 1
+                continue
+            # Only include if number_of_care_givers = 1 and no overlaps
+            if rec["number_of_care_givers"] <= 1:
+                out.append(rec)
+
+        logger.info(f"✓ Loaded {len(out)} client_availabilities records for analysis")
+        if skipped_multiple > 0:
+            logger.info(f"  Skipped {skipped_multiple} records with multiple caregivers (number_of_care_givers >= 2)")
+        if skipped_overlap > 0:
+            logger.info(f"  Skipped {skipped_overlap} records with overlapping time slots on the same day")
+        logger.info(f"  Total client_availabilities: {total_count}")
+
+        return out, skip_reasons
     finally:
         cursor.close()
 
@@ -211,6 +349,116 @@ def normalize_time_for_slot(h: int, m: int) -> Tuple[int, int]:
     total_min = h * 60 + m
     floored = (total_min // 10) * 10
     return floored // 60, floored % 60
+
+
+def _get_day_of_week(dt) -> str:
+    """Get day of week name from date (0=Monday, 6=Sunday)."""
+    days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+    if hasattr(dt, 'weekday'):
+        return days[dt.weekday()]
+    return days[dt]
+
+
+def _normalize_time_for_match(t_str: str) -> str:
+    """Normalize time string to HH:MM for matching (10-minute tolerance)."""
+    if not t_str:
+        return "00:00"
+    parts = t_str.split(':')
+    hour = int(parts[0]) if len(parts) > 0 else 0
+    minute = int(parts[1]) if len(parts) > 1 else 0
+    # Round to nearest 10 minutes
+    minute = (minute // 10) * 10
+    return f"{hour:02d}:{minute:02d}"
+
+
+def _occurrence_is_covered(
+    occurrence_date,  # date object or datetime
+    occurrence_start_time: str,  # HH:MM:SS or HH:MM
+    occurrence_end_time: str,    # HH:MM:SS or HH:MM
+    avail_record: Dict
+) -> bool:
+    """
+    Check if a specific CSV visit (occurrence) matches a client_availability pattern.
+
+    For clientWindowsAnalyzer, we match visits to availability patterns regardless of
+    start_date, because we're analyzing historical data to SET the windows, not
+    checking if visits fall within a scheduled period.
+
+    A record matches an occurrence if:
+    1. The day of week matches
+    2. The time range matches (allowing 10-minute tolerance)
+    3. The recurrence pattern matches (weekly/bi-weekly)
+
+    Parameters:
+    - occurrence_date: The specific date to check (date or datetime object)
+    - occurrence_start_time: Start time string "HH:MM:SS" or "HH:MM"
+    - occurrence_end_time: End time string "HH:MM:SS" or "HH:MM"
+    - avail_record: Database record with fields:
+        - days: list of day names
+        - requested_start_time: "HH:MM:SS"
+        - requested_end_time: "HH:MM:SS"
+        - start_date: date object (used as reference for recurrence calculation)
+        - occurs_every: int (1=weekly, 2=bi-weekly, etc.)
+    """
+    if hasattr(occurrence_date, 'date'):
+        occurrence_date = occurrence_date.date()
+
+    occurrence_dow = _get_day_of_week(occurrence_date)
+
+    # Check day of week
+    if occurrence_dow not in avail_record.get('days', []):
+        return False
+
+    # Check time match (10-minute tolerance)
+    occ_start_norm = _normalize_time_for_match(occurrence_start_time)
+    occ_end_norm = _normalize_time_for_match(occurrence_end_time)
+
+    db_start_norm = _normalize_time_for_match(avail_record.get('requested_start_time', ''))
+    db_end_norm = _normalize_time_for_match(avail_record.get('requested_end_time', ''))
+
+    if db_start_norm != occ_start_norm or db_end_norm != occ_end_norm:
+        return False
+
+    # Check recurrence pattern (weekly/bi-weekly)
+    # For clientWindowsAnalyzer, we don't enforce start_date - we want to match
+    # ALL historical visits that fit this pattern, even if they're before start_date
+    record_start_date = avail_record.get('start_date')
+    occurs_every = avail_record.get('occurs_every', 1)
+
+    # If occurs_every = 1 (weekly), all matching day/time visits belong to this pattern
+    if occurs_every == 1:
+        return True
+
+    # For bi-weekly patterns, we need to check if this date aligns with the pattern
+    # Use start_date as a reference point to determine which week this is
+    if not record_start_date:
+        # If no start_date, can't determine bi-weekly alignment, assume it matches
+        return True
+
+    # Calculate which week this occurrence falls into relative to start_date
+    # Works for dates both before and after start_date
+    occurrence_dow_index = occurrence_date.weekday()
+
+    # Find a reference date with the same day of week as the occurrence
+    start_dow_index = record_start_date.weekday()
+    if occurrence_dow_index >= start_dow_index:
+        days_to_first = occurrence_dow_index - start_dow_index
+    else:
+        days_to_first = 7 - start_dow_index + occurrence_dow_index
+
+    from datetime import timedelta
+    reference_date = record_start_date + timedelta(days=days_to_first)
+
+    # Calculate weeks difference (can be negative for dates before start_date)
+    days_diff = (occurrence_date - reference_date).days
+    weeks_diff = days_diff // 7
+
+    # For bi-weekly: check if this week aligns with the pattern
+    # weeks_diff % 2 == 0 means even weeks (0, 2, 4, -2, -4, etc.)
+    if weeks_diff % occurs_every == 0:
+        return True
+
+    return False
 
 
 # ============================================================================
@@ -255,7 +503,8 @@ def stage1_load_and_clean(csv_path: str) -> pd.DataFrame:
     col_loc = "Service Location Name"
     if col_loc not in df.columns:
         raise MigrationError(f"Missing column: {col_loc}")
-    df["Formatted_Name"] = df[col_loc].astype(str).str.strip()
+    # Fix encoding (e.g. O‚ÄôCeallaigh -> O'Ceallaigh) so matching to DB works
+    df["Formatted_Name"] = df[col_loc].astype(str).apply(lambda x: fix_utf8_mojibake(x).strip())
 
     # Keep latest per (patient, Service Requirement Start Date And Time) by Service Location Updated Date & Time desc
     col_req_start = "Service Requirement Start Date And Time"
@@ -275,6 +524,17 @@ def stage1_load_and_clean(csv_path: str) -> pd.DataFrame:
     df = df[df[col_act_start].notna() & df[col_act_end].notna()]
     dropped_act = before_act - len(df)
     logger.info(f"  After dropping missing Actual Start/End: {len(df)} rows (dropped {dropped_act} with missing Actual Start/End)")
+
+    # Calculate minute-from-midnight values for actual times (needed for matching later)
+    df["Actual_start_min"] = df[col_act_start].dt.hour * 60 + df[col_act_start].dt.minute
+    df["Actual_end_min"] = df[col_act_end].dt.hour * 60 + df[col_act_end].dt.minute
+
+    # Drop rows where actual time calculation failed (resulted in NaN)
+    before_time_calc = len(df)
+    df = df[df["Actual_start_min"].notna() & df["Actual_end_min"].notna()]
+    dropped_time_calc = before_time_calc - len(df)
+    if dropped_time_calc > 0:
+        logger.info(f"  After dropping rows with invalid actual times: {len(df)} rows (dropped {dropped_time_calc})")
 
     # Duration: CSV stores HOURS (e.g. 0.75 = 45 min) — convert to minutes like Patient_Analyzer_1.py
     col_req_dur = "Service Requirement Duration"
@@ -668,7 +928,21 @@ def stage3_7_refine_duration(pattern_df: pd.DataFrame, stage1_df: pd.DataFrame) 
 
     out = pattern_df.copy()
     out["suggested_duration"] = suggested
-    out["minDuration"] = out["suggested_duration"]
+
+    # Ensure minDuration is not bigger than duration (Service Requirement Duration)
+    def clamp_min_duration(row):
+        min_dur = row["suggested_duration"]
+        req_dur = row.get(col_req_dur)
+        if pd.isna(min_dur) or pd.isna(req_dur):
+            return min_dur
+        min_dur = int(min_dur)
+        req_dur = int(req_dur)
+        if min_dur > req_dur:
+            logger.warning(f"  Clamping minDuration for {row.get('Formatted_Name')}: {min_dur} min > required {req_dur} min, setting to {req_dur}")
+            return req_dur
+        return min_dur
+
+    out["minDuration"] = out.apply(clamp_min_duration, axis=1)
     logger.info("  Refined minDuration for %d patterns using %.0f%% significance threshold",
                 len(out), DURATION_SIGNIFICANCE_THRESHOLD * 100)
     return out
@@ -708,81 +982,157 @@ def run(csv_path: Optional[str] = None, connection_manager=None, state=None) -> 
         return False
     connection = None
     try:
+        # Load and clean CSV data
         df1 = stage1_load_and_clean(csv_path)
         if df1.empty:
             logger.warning("No data after Stage 1; nothing to update.")
             return True
-        stage2 = stage2_initial_pattern_intelligence(df1)
-        stage3 = stage3_context_aware_suggestion(stage2)
-        stage3 = stage3_5_remove_anomalies(stage3)
-        stage3 = stage3_7_refine_duration(stage3, df1)
-        patterns_count = len(stage3)
-        logger.info("  Patterns from analysis (candidates for update): %d", patterns_count)
-        if patterns_count > 0 and patterns_count <= 20:
-            for _, r in stage3.iterrows():
-                logger.info("    -> %s | requested %s-%s -> suggested %s-%s minDuration=%s",
-                    r.get("Formatted_Name"), r.get("requested_start_str"), r.get("requested_end_str"),
-                    r.get("start_time_str"), r.get("end_time_str"), r.get("minDuration"))
+
+        logger.info(f"  Stage 1 complete: {len(df1)} CSV visit records loaded")
+
+        # Connect to database
         config = get_db_config()
         if connection_manager:
             connection = connection_manager.get_connection()
         else:
             connection = connect_to_database(config)
+
         clients_map = get_all_clients(connection)
-        avail_list = load_client_availabilities(connection)
-        avail_lookup = build_availability_lookup(avail_list)
-        logger.info("  Matching: %d patterns vs %d clients, %d client_availabilities records",
-            patterns_count, len(clients_map), len(avail_list))
+        avail_list, skip_reasons = load_client_availabilities(connection)
 
-        # Normalize requested times to 10-min slot for matching (same as clientAvailabilityMigration)
-        def requested_key(row):
-            h_s, m_s = normalize_time_for_slot(int(row["req_start_hour"]), int(row["req_start_minute"]))
-            h_e, m_e = normalize_time_for_slot(int(row["req_end_hour"]), int(row["req_end_minute"]))
-            req_start = min_to_time_str(h_s * 60 + m_s)
-            req_end = min_to_time_str(h_e * 60 + m_e)
-            return req_start, req_end
+        logger.info(f"  Loaded {len(avail_list)} client_availabilities records for analysis")
+        logger.info(f"  Loaded {len(clients_map)} clients from database")
 
-        updated = 0
-        skipped_no_client = 0
-        skipped_no_match = 0
-        unmatched_clients = set()
-        update_args = []
+        # Build reverse lookup: client_id -> list of availability records
+        client_avails = defaultdict(list)
+        for avail in avail_list:
+            client_avails[avail["client_id"]].append(avail)
 
-        for _, row in stage3.iterrows():
-            # Service Location Name is "Lastname, Firstname" (e.g. "Hawkshaw (DS), Harry")
-            raw = (row["Formatted_Name"] or "").strip()
-            name_key = re.sub(r"\s+", " ", raw).lower() if raw else ""
+        # Build CSV lookup: client name -> list of visit records (with dates)
+        csv_by_client = defaultdict(list)
+        for _, row in df1.iterrows():
+            raw_name = (row.get("Formatted_Name") or "").strip()
+            name_key = normalize_name_for_match(raw_name) if raw_name else ""
             if not name_key:
                 continue
             client_id = clients_map.get(name_key)
-            if client_id is None:
-                skipped_no_client += 1
-                unmatched_clients.add(row["Formatted_Name"])
-                logger.warning("No client found for name: %s", row["Formatted_Name"])
+            if not client_id:
                 continue
 
-            req_start, req_end = requested_key(row)
-            key = (client_id, req_start, req_end)
-            recs = avail_lookup.get(key)
-            if not recs:
-                skipped_no_match += 1
-                logger.warning(
-                    "No client_availabilities record for client_id=%s requested %s–%s",
-                    client_id, req_start, req_end,
-                )
+            # Extract visit information
+            visit_date = row.get("Service Requirement Start Date And Time")
+            if pd.isna(visit_date):
                 continue
 
-            start_time_str = row["start_time_str"]
-            end_time_str = row["end_time_str"]
-            min_dur = row.get("minDuration")
-            if pd.isna(min_dur):
-                min_dur = None
+            visit_start_time = visit_date.strftime("%H:%M:%S")
+            visit_end_datetime = row.get("Service Requirement End Date And Time")
+            if pd.isna(visit_end_datetime):
+                continue
+            visit_end_time = visit_end_datetime.strftime("%H:%M:%S")
+
+            actual_start_min = row.get("Actual_start_min")
+            actual_end_min = row.get("Actual_end_min")
+            actual_duration = row.get("Actual Duration")
+
+            csv_by_client[client_id].append({
+                "date": visit_date,
+                "start_time": visit_start_time,
+                "end_time": visit_end_time,
+                "actual_start_min": actual_start_min,
+                "actual_end_min": actual_end_min,
+                "actual_duration": actual_duration,
+            })
+
+        logger.info(f"  CSV visits grouped by {len(csv_by_client)} clients")
+
+        # ======================================================================
+        # NEW MATCHING LOGIC: For each availability, find matching CSV visits
+        # ======================================================================
+        updated = 0
+        updated_ids = set()
+        update_reasons = {}
+        update_args = []
+
+        for avail in avail_list:
+            client_id = avail["client_id"]
+            avail_id = avail["id"]
+
+            # Get all CSV visits for this client
+            visits = csv_by_client.get(client_id, [])
+            if not visits:
+                skip_reasons[avail_id] = "No CSV visits found for this client"
+                continue
+
+            # Find visits covered by this availability
+            matching_visits = []
+            for visit in visits:
+                if _occurrence_is_covered(
+                    visit["date"],
+                    visit["start_time"],
+                    visit["end_time"],
+                    avail
+                ):
+                    matching_visits.append(visit)
+
+            if not matching_visits:
+                skip_reasons[avail_id] = "No CSV visits match this availability pattern (day/time/recurrence)"
+                continue
+
+            # Calculate suggested window from matching visits
+            start_mins = [v["actual_start_min"] for v in matching_visits if not pd.isna(v["actual_start_min"])]
+            end_mins = [v["actual_end_min"] for v in matching_visits if not pd.isna(v["actual_end_min"])]
+            durations = [v["actual_duration"] for v in matching_visits if not pd.isna(v["actual_duration"])]
+
+            if not start_mins or not end_mins:
+                skip_reasons[avail_id] = f"Found {len(matching_visits)} matching visits but missing actual time data"
+                continue
+
+            # Calculate suggested start/end using percentiles
+            if len(start_mins) == 1:
+                sugg_start_min = start_mins[0] - TOLERANCE_MINS
+                sugg_end_min = end_mins[0] + TOLERANCE_MINS
             else:
-                min_dur = int(min_dur)
+                sugg_start_min = np.percentile(start_mins, LOWER_PERCENTILE * 100) - TOLERANCE_MINS
+                sugg_end_min = np.percentile(end_mins, UPPER_PERCENTILE * 100) + TOLERANCE_MINS
 
-            for rec in recs:
-                update_args.append((start_time_str, end_time_str, min_dur, rec["id"]))
-                updated += 1
+            # Enforce minimum window width
+            width = sugg_end_min - sugg_start_min
+            if width < MIN_WINDOW_WIDTH_MINS:
+                extra = (MIN_WINDOW_WIDTH_MINS - width) / 2
+                sugg_start_min -= extra
+                sugg_end_min += extra
+
+            sugg_start_min = max(0, int(round(sugg_start_min)))
+            sugg_end_min = min(24 * 60 - 1, int(round(sugg_end_min)))
+
+            # Calculate minDuration (using 10% significance threshold)
+            min_duration = None
+            if durations:
+                dur_counts = defaultdict(int)
+                for d in durations:
+                    dur_counts[int(d)] += 1
+
+                total_visits = len(durations)
+                threshold_count = max(1, int(round(total_visits * DURATION_SIGNIFICANCE_THRESHOLD)))
+
+                # Find significant durations
+                significant_durs = [d for d, cnt in dur_counts.items() if cnt >= threshold_count]
+                if significant_durs:
+                    min_duration = max(significant_durs)
+                else:
+                    min_duration = int(min(durations))
+
+            # Convert to time strings
+            start_time_str = min_to_time_str(sugg_start_min)
+            end_time_str = min_to_time_str(sugg_end_min)
+
+            # Add to update batch
+            update_args.append((start_time_str, end_time_str, min_duration, avail_id))
+            updated_ids.add(avail_id)
+            update_reasons[avail_id] = f"Successfully updated from {len(matching_visits)} matching CSV visits (start_time={start_time_str}, end_time={end_time_str}, minDuration={min_duration})"
+            updated += 1
+
+        logger.info(f"  Matched {updated} availabilities to CSV visits")
 
         cursor = connection.cursor()
         try:
@@ -803,21 +1153,145 @@ def run(csv_path: Optional[str] = None, connection_manager=None, state=None) -> 
         finally:
             cursor.close()
 
+        # ======================================================================
+        # TRACK NON-UPDATED RECORDS
+        # ======================================================================
+        # For records that were analyzed but not updated, determine why
+        for rec in avail_list:
+            rec_id = rec["id"]
+            if rec_id not in updated_ids and rec_id not in skip_reasons:
+                # This record was eligible for analysis but no pattern matched
+                skip_reasons[rec_id] = "No matching time slot pattern found in CSV analysis"
+
+        # Reload ALL client_availabilities from DB to get complete data for report
+        cursor = connection.cursor()
+        try:
+            cursor.execute("""
+                SELECT ca.id, ca.client_id, c.name as client_name, c.lastname as client_lastname,
+                       ca.requested_start_time, ca.requested_end_time, ca.days,
+                       ca.number_of_care_givers, ca.start_time, ca.end_time, ca."minDuration"
+                FROM client_availabilities ca
+                LEFT JOIN client c ON ca.client_id = c.id
+                WHERE ca.deleted_at IS NULL
+                ORDER BY c.lastname, c.name, ca.requested_start_time
+            """)
+            all_availabilities = cursor.fetchall()
+        finally:
+            cursor.close()
+
+        # ======================================================================
+        # GENERATE COMPREHENSIVE REPORT
+        # ======================================================================
+        logger.info("")
+        logger.info("=" * 80)
+        logger.info("CLIENT AVAILABILITY DETAILED REPORT")
+        logger.info("=" * 80)
+        logger.info("This report shows each client_availability record and why its fields")
+        logger.info("were filled (UPDATED) or not filled (SKIPPED).")
+        logger.info("=" * 80)
+        logger.info("")
+
+        # Group by client for clearer reporting
+        client_groups = defaultdict(list)
+        for row in all_availabilities:
+            client_id = row["client_id"]
+            client_groups[client_id].append(row)
+
+        # Report each client
+        for client_id, records in sorted(client_groups.items()):
+            first_rec = records[0]
+            client_name = f"{first_rec['client_lastname'] or ''}, {first_rec['client_name'] or ''}".strip(', ')
+            logger.info("")
+            logger.info("-" * 80)
+            logger.info(f"CLIENT: {client_name} (ID: {client_id})")
+            logger.info("-" * 80)
+
+            for rec in records:
+                rec_id = rec["id"]
+                req_start = _normalize_time_to_hhmmss(rec["requested_start_time"])
+                req_end = _normalize_time_to_hhmmss(rec["requested_end_time"])
+
+                # Parse days field properly
+                days_raw = rec["days"]
+                if isinstance(days_raw, str):
+                    days = days_raw.strip('{}').split(',') if days_raw else []
+                    days = [d.strip() for d in days if d.strip()]
+                elif isinstance(days_raw, list):
+                    days = days_raw
+                else:
+                    days = []
+
+                num_caregivers = rec.get("number_of_care_givers", 1)
+
+                # Get current values from DB
+                start_time = _normalize_time_to_hhmmss(rec["start_time"]) if rec["start_time"] else "NULL"
+                end_time = _normalize_time_to_hhmmss(rec["end_time"]) if rec["end_time"] else "NULL"
+                min_duration = rec["minDuration"] if rec["minDuration"] is not None else "NULL"
+
+                # Determine status and reason
+                if rec_id in updated_ids:
+                    status = "UPDATED"
+                    reason = update_reasons.get(rec_id, "Updated from CSV pattern")
+                else:
+                    status = "SKIPPED"
+                    reason = skip_reasons.get(rec_id, "Not analyzed (unknown reason)")
+
+                logger.info(f"  Availability ID: {rec_id}")
+                logger.info(f"    Requested Time:     {req_start} - {req_end}")
+                logger.info(f"    Days:               {days}")
+                logger.info(f"    Caregivers Needed:  {num_caregivers}")
+                logger.info(f"    start_time:         {start_time}")
+                logger.info(f"    end_time:           {end_time}")
+                logger.info(f"    minDuration:        {min_duration}")
+                logger.info(f"    Status:             {status}")
+                logger.info(f"    Reason:             {reason}")
+                logger.info("")
+
         # Summary report
         logger.info("")
         logger.info("=" * 60)
         logger.info("CLIENT WINDOWS ANALYZER SUMMARY")
         logger.info("=" * 60)
-        logger.info("  Patterns from CSV analysis: %d", patterns_count)
-        logger.info("  Updated (matched client + availability): %d", updated)
-        logger.info("  Skipped (no client in DB for CSV name): %d", skipped_no_client)
-        logger.info("  Skipped (no client_availabilities row for this client + requested time slot): %d", skipped_no_match)
-        if unmatched_clients:
-            logger.info("  Unmatched CSV client names (sample): %s", list(unmatched_clients)[:10])
-        if patterns_count > 0 and updated < patterns_count:
-            logger.info("  Note: Only rows that match an existing client_availabilities record (same client_id + requested_start_time + requested_end_time) are updated. Run Clients Availability first to seed records.")
-        # Explain why other client_availabilities were not updated
-        logger.info("  Why other records were not updated: This step only updates rows for which a suggested window was computed from the CSV. Most CSV rows were dropped in Stage 1 (e.g. Service Requirement Duration < %s min). Only %d pattern(s) were produced, so only those could be applied. To include more visits, set env CLIENT_WINDOWS_MIN_DURATION_MINUTES to a lower value (e.g. 15 or 10) and re-run.", MINIMUM_DURATION_MINUTES, patterns_count)
+        logger.info("  Total client_availabilities in database: %d", len(avail_list) + len(skip_reasons))
+        logger.info("  Analyzed (eligible for matching): %d", len(avail_list))
+        logger.info("  Successfully updated: %d", updated)
+        logger.info("  Skipped: %d", len(skip_reasons))
+        logger.info("")
+        logger.info("  Skip reasons breakdown:")
+
+        # Count skip reasons by category
+        reason_counts = defaultdict(int)
+        for reason in skip_reasons.values():
+            if "Multiple caregivers" in reason:
+                reason_counts["Multiple caregivers required"] += 1
+            elif "Overlapping time slots" in reason:
+                reason_counts["Overlapping time slots"] += 1
+            elif "No CSV visits found" in reason:
+                reason_counts["No CSV visits for client"] += 1
+            elif "No CSV visits match" in reason:
+                reason_counts["No matching visits (day/time/recurrence mismatch)"] += 1
+            elif "missing actual time data" in reason:
+                reason_counts["Missing actual time data in CSV"] += 1
+            else:
+                reason_counts["Other"] += 1
+
+        for reason, count in sorted(reason_counts.items()):
+            logger.info("    - %s: %d", reason, count)
+
+        logger.info("")
+        logger.info("  Matching logic:")
+        logger.info("    - CSV visits matched to availabilities using:")
+        logger.info("      1. Client ID")
+        logger.info("      2. Day of week (from availability.days array)")
+        logger.info("      3. Time slot (with 10-minute tolerance)")
+        logger.info("      4. Date falls within recurrence pattern (start_date + occurs_every)")
+        logger.info("")
+        logger.info("  Records excluded from analysis:")
+        logger.info("    - number_of_care_givers >= 2 (multiple caregivers needed)")
+        logger.info("    - Overlapping time slots on same day for same client")
+        logger.info("")
+        logger.info("  Additional filtering:")
+        logger.info("    - CSV visits with Service Requirement Duration < %s min excluded", MINIMUM_DURATION_MINUTES)
         logger.info("=" * 60)
 
         if state:

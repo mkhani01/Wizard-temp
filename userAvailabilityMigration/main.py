@@ -17,6 +17,7 @@ Rules:
 import os
 import sys
 import logging
+import datetime as dt
 from pathlib import Path
 from datetime import datetime, timedelta, date, time
 from collections import defaultdict
@@ -196,7 +197,7 @@ def parse_time_value(time_val) -> Optional[time]:
                 hours = int(parts[0])
                 minutes = int(parts[1])
                 seconds = int(parts[2]) if len(parts) > 2 else 0
-                return time(hours, minutes, seconds)
+                return dt.time(hours, minutes, seconds)
         except (ValueError, IndexError):
             pass
     
@@ -457,17 +458,17 @@ def generate_availability_records(records: List[Dict]) -> List[Dict]:
                 is_last_day = (current_date == end_date)
 
                 # Calculate chunk times
-                chunk_start = start_time if is_first_day else time(0, 0, 0)
-                chunk_end = end_time if is_last_day else time(23, 59, 59)
+                chunk_start = start_time if is_first_day else dt.time(0, 0, 0)
+                chunk_end = end_time if is_last_day else dt.time(23, 59, 59)
 
                 # Adjust for exact overnight edge case (e.g. ends at 00:00 next day)
-                if is_last_day and end_time == time(0, 0, 0):
+                if is_last_day and end_time == dt.time(0, 0, 0):
                     # 00:00 means end of previous day, so this day is empty or full?
                     # If it's the ONLY day (start==end), 00:00 to 00:00 is invalid, treat as full day?
                     # Or ignore. Let's assume full day for 00:00-00:00 single day.
                     if start_date == end_date:
-                        chunk_start = time(0,0,0)
-                        chunk_end = time(23,59,59)
+                        chunk_start = dt.time(0,0,0)
+                        chunk_end = dt.time(23,59,59)
                     else:
                         # It's a subsequent day that ends at 00:00, meaning it ended at midnight.
                         # No record needed for this day.
