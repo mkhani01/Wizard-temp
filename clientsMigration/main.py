@@ -11,7 +11,7 @@ from datetime import datetime, date
 import psycopg2
 
 from migration_support import get_assets_dir
-from encoding_utils import fix_utf8_mojibake, normalize_name_for_match
+from encoding_utils import fix_utf8_mojibake, normalize_name_for_match, normalize_name_for_client_match
 from psycopg2.extras import RealDictCursor, execute_values
 from psycopg2 import OperationalError, InterfaceError
 
@@ -406,9 +406,14 @@ def seed_areas_from_csv(connection, csv_path):
 
 
 def extract_clients_from_csv(csv_path, lookups):
-    """Extract client data from CSV and map to database fields"""
+    """Extract client data from CSV and map to database fields.
+    Returns (clients_to_seed, all_keys_in_csv). all_keys_in_csv includes every row
+    that has first+last name (even if skipped for termination) so we don't deactivate
+    clients who appear in the file but were skipped.
+    """
     clients = []
-    
+    all_keys_in_csv = set()
+
     logger.info(f"Reading CSV: {csv_path}")
     
     with open(csv_path, 'r', encoding='utf-8') as f:
@@ -446,6 +451,11 @@ def extract_clients_from_csv(csv_path, lookups):
                         row_num, first_name, last_name, safe_get('Email')
                     )
                 continue
+
+            # Record this row's key for deactivation logic: don't deactivate if they appear in CSV
+            # (even when we skip them below for termination date)
+            key_in_file = f"{normalize_name_for_client_match(first_name)}|{normalize_name_for_client_match(last_name)}"
+            all_keys_in_csv.add(key_in_file)
 
             # Generate unique identifier for this client
             pin_number = clean_excel_value(safe_get('PIN Number'))
@@ -582,17 +592,18 @@ def extract_clients_from_csv(csv_path, lookups):
             }
 
             clients.append(client_data)
-            logger.info(
-                "Row %d: ADDED | name=%r, lastname=%r, email=%r, area=%r, status=%s, pin=%r",
-                row_num, first_name, last_name, client_data.get('email'), group_name, client_data.get('status'), pin_number
-            )
 
-    logger.info("Extracted %d clients from CSV", len(clients))
-    return clients
+    logger.info("Extracted %d clients from CSV (%d keys in file for deactivation check)", len(clients), len(all_keys_in_csv))
+    return clients, all_keys_in_csv
 
 
-def seed_clients(connection, clients):
-    """Insert or update clients using manual upsert"""
+def seed_clients(connection, clients, all_keys_in_csv=None):
+    """Insert or update clients using manual upsert.
+    Only clients with no termination date (or termination >= today) are in `clients`.
+    keys_in_file = keys of those clients only → we deactivate DB clients not in that set,
+    and we set Active for DB clients that are in that set.
+    all_keys_in_csv is ignored (kept for backward compatibility).
+    """
     if not clients:
         logger.warning("No clients extracted from CSV. Aborting sync to prevent database wipe.")
         logger.warning("Please check CSV file format and delimiters.")
@@ -602,13 +613,13 @@ def seed_clients(connection, clients):
     
     cursor = connection.cursor()
     try:
-        # Load existing clients by (name, lastname)
-        # Normalize (lowercase + apostrophe variants) so encoding doesn't create duplicates.
+        # Load existing clients by (name, lastname). Use client-match normalization so
+        # "Hawkshaw (DS)" and "Hawkshaw" match (trailing parentheticals stripped).
         # When multiple rows normalize to the same key, keep the highest id (most recent).
         cursor.execute("SELECT id, name, lastname FROM client WHERE deleted_at IS NULL")
         existing = {}
         for row in cursor.fetchall():
-            key = f"{normalize_name_for_match(row['name'])}|{normalize_name_for_match(row['lastname'])}"
+            key = f"{normalize_name_for_client_match(row['name'])}|{normalize_name_for_client_match(row['lastname'])}"
             if key and (key not in existing or row['id'] > existing[key]):
                 existing[key] = row['id']
         
@@ -618,13 +629,16 @@ def seed_clients(connection, clients):
         to_insert = []
         to_update = []
         
-        # Create a set of keys in the CSV file (normalized)
+        # Keys that count as "in file" = only clients we're seeding (no termination date).
+        # So: terminated in CSV + match in DB → key not in keys_in_file → deactivate.
+        #     no termination + in DB → key in keys_in_file → keep/activate.
         keys_in_file = set()
+        for client in clients:
+            key = f"{normalize_name_for_client_match(client['name'])}|{normalize_name_for_client_match(client['lastname'])}"
+            keys_in_file.add(key)
         
         for client in clients:
-            # Normalize key for matching (same as existing: lowercase + apostrophe normalized)
-            key = f"{normalize_name_for_match(client['name'])}|{normalize_name_for_match(client['lastname'])}"
-            keys_in_file.add(key)
+            key = f"{normalize_name_for_client_match(client['name'])}|{normalize_name_for_client_match(client['lastname'])}"
             
             if key in existing:
                 to_update.append((client, existing[key]))
@@ -634,8 +648,7 @@ def seed_clients(connection, clients):
         logger.info(f"  - {len(to_insert)} new clients to insert")
         logger.info(f"  - {len(to_update)} existing clients to update")
         
-        # Clients in DB but not in file(s) -> set status to Deactive
-        # Only if we actually parsed clients successfully
+        # Clients in DB but not in keys_in_file (not in CSV as active / no termination) -> Deactive.
         to_deactivate_ids = []
         for key in existing:
             if key not in keys_in_file:
@@ -643,6 +656,11 @@ def seed_clients(connection, clients):
                 
         if to_deactivate_ids:
             logger.info(f"  - {len(to_deactivate_ids)} existing clients not in file(s) will be deactivated")
+            if len(to_deactivate_ids) > len(existing) / 2:
+                logger.warning(
+                    "Most existing clients would be deactivated — possible CSV column/delimiter or encoding mismatch. "
+                    "Check that CSV has 'First Name' and 'Last Name' columns and encoding is correct."
+                )
         
         processed = []
         
@@ -727,7 +745,7 @@ def seed_clients(connection, clients):
                 logger.info("  SEEDED client INSERT id=%s name=%r lastname=%r", row['id'], row['name'], row['lastname'])
             logger.info("Inserted %d new clients", len(inserted))
 
-        # UPDATE existing clients
+        # UPDATE existing clients (set status = Active so previously deactivated records are reactivated)
         for client, client_id in to_update:
             update_query = """
                 UPDATE client SET
@@ -747,7 +765,7 @@ def seed_clients(connection, clients):
                     consent_status = %s,
                     consent_date = %s,
                     consent_notes = %s,
-                    status = %s,
+                    status = 'Active',
                     gender = %s,
                     service_priority = %s,
                     start_date = %s,
@@ -792,7 +810,7 @@ def seed_clients(connection, clients):
                 client['consent_status'],
                 client['consent_date'],
                 client['consent_notes'],
-                client['status'],
+                # status set to 'Active' in SQL so deactivated records are reactivated
                 client['gender'],
                 client['service_priority'],
                 client['start_date'],
@@ -837,6 +855,16 @@ def seed_clients(connection, clients):
                 (to_deactivate_ids,),
             )
             logger.info(f"✓ Deactivated {len(to_deactivate_ids)} clients not present in file(s)")
+        
+        # Activate all clients that appear in the CSV (key in keys_in_file), so previously
+        # deactivated or mismatched records become Active when we re-run migration.
+        to_activate_ids = [existing[k] for k in keys_in_file if k in existing]
+        if to_activate_ids:
+            cursor.execute(
+                "UPDATE client SET status = 'Active', last_modified_date = NOW() WHERE id = ANY(%s)",
+                (to_activate_ids,),
+            )
+            logger.info(f"✓ Set status = Active for {len(to_activate_ids)} clients present in CSV")
         
         # Link clients to groups (many-to-many)
         if processed:
@@ -960,7 +988,7 @@ def run(connection_manager=None, state=None):
         logger.info("\n" + "="*60)
         logger.info("STEP 5: EXTRACT CLIENTS FROM CSV")
         logger.info("="*60)
-        clients = extract_clients_from_csv(csv_path, lookups)
+        clients, all_keys_in_csv = extract_clients_from_csv(csv_path, lookups)
         
         if not clients:
             logger.error("Halting migration: No clients parsed from CSV.")
@@ -969,7 +997,7 @@ def run(connection_manager=None, state=None):
         logger.info("\n" + "="*60)
         logger.info("STEP 6: SEED CLIENTS TO DATABASE")
         logger.info("="*60)
-        success = seed_clients(connection, clients)
+        success = seed_clients(connection, clients, all_keys_in_csv)
         
         if success:
             if state:

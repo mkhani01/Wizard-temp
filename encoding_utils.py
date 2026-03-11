@@ -7,6 +7,7 @@ mismatches or duplicates across clients, users, availability, and checks.
 
 - fix_utf8_mojibake: repair mojibake from wrong encoding (apply to every string from CSV/Excel).
 - normalize_name_for_match: canonical form for matching (lowercase, apostrophe variants -> ', collapse spaces).
+- normalize_name_for_client_match: alias for normalize_name_for_match (same key for client matching; no stripping).
 """
 
 from typing import Optional
@@ -58,3 +59,12 @@ def normalize_name_for_match(value: Optional[str]) -> str:
     for char in ("\u2019", "\u2018", "\u2032", "\u00b4"):  # ', ', ′, ´
         s = s.replace(char, "'")
     return " ".join(s.split())
+
+
+def normalize_name_for_client_match(value: Optional[str]) -> str:
+    """
+    Normalize name for client matching. Same as normalize_name_for_match (exact match
+    after lowercasing and apostrophe normalization). Use when building client lookup
+    keys so CSV and DB keys match when the name/lastname are the same (e.g. "Hawkshaw (DS)").
+    """
+    return normalize_name_for_match(value)
