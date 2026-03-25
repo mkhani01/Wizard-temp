@@ -7,6 +7,7 @@ Tracks caregiver-client visit frequencies
 import os
 import csv
 import logging
+import math
 import sys
 from pathlib import Path
 from datetime import datetime
@@ -220,39 +221,6 @@ def load_clients_lookup(connection):
         cursor.close()
 
 
-def load_existing_feasible_pairs(connection):
-    """
-    Load existing feasible pairs from database.
-    Returns a dictionary: (caregiver_id, client_id) -> {id, frequency}
-    
-    Used for updating existing records instead of inserting duplicates.
-    """
-    cursor = connection.cursor()
-    try:
-        logger.info("Loading existing feasible pairs...")
-        
-        cursor.execute("""
-            SELECT id, cgid, client_id, frequency 
-            FROM feasible_pairs
-        """)
-        
-        pairs = cursor.fetchall()
-        lookup = {}
-        
-        for pair in pairs:
-            key = (pair['cgid'], pair['client_id'])
-            lookup[key] = {
-                'id': pair['id'],
-                'frequency': pair['frequency']
-            }
-        
-        logger.info(f"✓ Loaded {len(lookup)} existing feasible pairs")
-        return lookup
-        
-    finally:
-        cursor.close()
-
-
 def is_personal_care_row(row):
     """
     Check if the row represents a Personal Care service.
@@ -265,6 +233,114 @@ def is_personal_care_row(row):
     return service_type == 'Personal Care' and requirement_type == 'Personal Care'
 
 
+def parse_visit_datetime(row):
+    """
+    Parse visit start datetime from CSV row.
+    Uses day-first parsing fallback to align with feasibility script behavior.
+    """
+    candidate_columns = [
+        'Service Requirement Start Date And Time',
+        'Planned Service Requirement Start Date And Time',
+        'Actual Service Start Date And Time',
+    ]
+    date_formats = [
+        '%d/%m/%Y %H:%M',
+        '%d/%m/%Y %H:%M:%S',
+        '%d/%m/%Y %I:%M %p',
+        '%d/%m/%Y %I:%M:%S %p',
+        '%Y-%m-%d %H:%M',
+        '%Y-%m-%d %H:%M:%S',
+        '%Y-%m-%dT%H:%M:%S',
+        '%Y-%m-%dT%H:%M:%S.%f',
+    ]
+
+    for column in candidate_columns:
+        raw_value = safe_strip(row.get(column, ''))
+        if not raw_value:
+            continue
+
+        normalized = raw_value.replace('T', ' ')
+
+        for fmt in date_formats:
+            try:
+                return datetime.strptime(normalized, fmt)
+            except ValueError:
+                continue
+
+        iso_value = raw_value.replace('Z', '+00:00')
+        try:
+            parsed = datetime.fromisoformat(iso_value)
+            return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
+        except ValueError:
+            continue
+
+    return None
+
+
+def identify_carer_status(overall_pct, days_since_last_visit):
+    """Apply status mapping from feasibility scripts."""
+    if days_since_last_visit > 50:
+        return "Former / Relief"
+    if overall_pct >= 40:
+        return "Current Primary"
+    return "Support / Relief"
+
+
+def calculate_pair_weights(frequencies, pair_last_visit, customer_totals, dataset_end):
+    """
+    Calculate normalized weights (0-1) per caregiver-client pair.
+    Mirrors set_roster.py + feaibility_percentage.py logic.
+    """
+    if not dataset_end:
+        return {}
+
+    window_days = 16 * 7  # 112
+    status_factors = {
+        'Current Primary': 1.0,
+        'Support / Relief': 0.5,
+        'Former / Relief': 0.2,
+    }
+
+    raw_weights = {}
+    max_raw_by_client = defaultdict(float)
+
+    for pair_key, total_pair_visits in frequencies.items():
+        _, client_id = pair_key
+        total_cust_visits = customer_totals.get(client_id, 0)
+        if total_cust_visits <= 0:
+            raw_weights[pair_key] = 0.0
+            continue
+
+        last_visit = pair_last_visit.get(pair_key)
+        days_since_last_visit = 999
+        if last_visit:
+            days_since_last_visit = max((dataset_end - last_visit).days, 0)
+
+        overall_pct = round((total_pair_visits / total_cust_visits) * 100, 1)
+        carer_status = identify_carer_status(overall_pct, days_since_last_visit)
+
+        consistency = overall_pct / 100.0
+        calls_per_day = total_cust_visits / float(window_days)
+        freq_factor = 1 + math.log1p(calls_per_day)
+        recency_decay = math.exp(-days_since_last_visit / 21.0)
+        status_factor = status_factors.get(carer_status, 0.3)
+
+        raw_weight = consistency * freq_factor * recency_decay * status_factor
+        raw_weights[pair_key] = raw_weight
+
+        if raw_weight > max_raw_by_client[client_id]:
+            max_raw_by_client[client_id] = raw_weight
+
+    weights = {}
+    for pair_key, raw_weight in raw_weights.items():
+        _, client_id = pair_key
+        client_max = max_raw_by_client.get(client_id, 0.0)
+        normalized = 0.0 if client_max <= 0 else raw_weight / client_max
+        weights[pair_key] = round(normalized, 4)
+
+    return weights
+
+
 def extract_visit_frequencies_from_csv(csv_path, users_lookup, clients_lookup):
     """
     Extract visit frequencies from CSV file.
@@ -274,11 +350,19 @@ def extract_visit_frequencies_from_csv(csv_path, users_lookup, clients_lookup):
        AND "Planned Service Requirement Type Description" equal "Personal Care"
     2. Parse "Planned Employee Name" to find caregiver (User) - format: "lastname, firstname"
     3. Parse "Service Location Name" to find client - format: "lastname, firstname"
-    4. Count occurrences of each (caregiver, client) pair
-    
-    Returns a dictionary: (caregiver_id, client_id) -> frequency
+    4. Parse visit date/time to compute recency-based weight
+    5. Count occurrences of each (caregiver, client) pair and compute weight
+
+    Returns:
+      - frequencies: (caregiver_id, client_id) -> frequency
+      - weights: (caregiver_id, client_id) -> weight (0..1, rounded to 4 decimals)
+      - stats
     """
     frequencies = defaultdict(int)
+    pair_last_visit = {}
+    customer_totals = defaultdict(int)
+    dataset_end = None
+
     stats = {
         'total_rows': 0,
         'personal_care_rows': 0,
@@ -287,6 +371,7 @@ def extract_visit_frequencies_from_csv(csv_path, users_lookup, clients_lookup):
         'unmatched_caregivers': set(),
         'unmatched_clients': set(),
         'skipped_non_personal_care': 0,
+        'skipped_invalid_datetime': 0,
     }
     
     logger.info(f"Reading CSV: {csv_path}")
@@ -339,6 +424,15 @@ def extract_visit_frequencies_from_csv(csv_path, users_lookup, clients_lookup):
                 )
                 continue
 
+            visit_start = parse_visit_datetime(row)
+            if not visit_start:
+                stats['skipped_invalid_datetime'] += 1
+                logger.warning(
+                    "Row %d: SKIPPED - invalid visit datetime | Employee=%r, Location=%r",
+                    row_num, employee_name, service_location_name
+                )
+                continue
+
             # Parse employee name into first name and last name
             employee_first, employee_last = parse_full_name(employee_name)
             # Parse service location name into first name and last name
@@ -380,6 +474,11 @@ def extract_visit_frequencies_from_csv(csv_path, users_lookup, clients_lookup):
             if caregiver_id and client_id:
                 pair_key = (caregiver_id, client_id)
                 frequencies[pair_key] += 1
+                customer_totals[client_id] += 1
+                if pair_key not in pair_last_visit or visit_start > pair_last_visit[pair_key]:
+                    pair_last_visit[pair_key] = visit_start
+                if dataset_end is None or visit_start > dataset_end:
+                    dataset_end = visit_start
                 stats['valid_rows'] += 1
                 logger.info(
                     "Row %d: ADDED | caregiver=%r (id=%s), client=%r (id=%s), frequency=%d",
@@ -402,13 +501,17 @@ def extract_visit_frequencies_from_csv(csv_path, users_lookup, clients_lookup):
     # Calculate total matched pairs (sum of all frequencies)
     stats['matched_pairs'] = len(frequencies)
     stats['total_visits'] = sum(frequencies.values())
+    weights = calculate_pair_weights(frequencies, pair_last_visit, customer_totals, dataset_end)
+    stats['weighted_pairs'] = len(weights)
     
     logger.info(f"\nProcessing complete!")
     logger.info(f"  Total rows processed: {stats['total_rows']}")
     logger.info(f"  Rows skipped (non-Personal Care): {stats['skipped_non_personal_care']}")
+    logger.info(f"  Rows skipped (invalid datetime): {stats['skipped_invalid_datetime']}")
     logger.info(f"  Personal Care rows: {stats['personal_care_rows']}")
     logger.info(f"  Valid visit records: {stats['valid_rows']}")
     logger.info(f"  Unique caregiver-client pairs: {stats['matched_pairs']}")
+    logger.info(f"  Pairs with calculated weight: {stats['weighted_pairs']}")
     logger.info(f"  Total visits recorded: {stats['total_visits']}")
     logger.info(f"  Unique unmatched caregivers: {len(stats['unmatched_caregivers'])}")
     logger.info(f"  Unique unmatched clients: {len(stats['unmatched_clients'])}")
@@ -423,47 +526,29 @@ def extract_visit_frequencies_from_csv(csv_path, users_lookup, clients_lookup):
         for name in list(stats['unmatched_clients'])[:10]:
             logger.info(f"  - {name}")
     
-    return frequencies, stats
+    return frequencies, weights, stats
 
 
-def ensure_unique_constraint(connection):
-    """Ensure unique constraint exists on feasible_pairs (cgid, client_id)."""
+def truncate_feasible_pairs(connection):
+    """Truncate feasible_pairs so CSV is the complete source of truth."""
     cursor = connection.cursor()
     try:
-        # Check if unique constraint already exists
-        cursor.execute("""
-            SELECT constraint_name
-            FROM information_schema.table_constraints
-            WHERE table_name = 'feasible_pairs'
-              AND constraint_type = 'UNIQUE'
-              AND constraint_name = 'feasible_pairs_cgid_client_id_unique'
-        """)
-        if cursor.fetchone():
-            logger.info("✓ Unique constraint on (cgid, client_id) already exists")
-            return
-
-        # Create unique constraint
-        logger.info("Creating unique constraint on feasible_pairs (cgid, client_id)...")
-        cursor.execute("""
-            ALTER TABLE feasible_pairs
-            ADD CONSTRAINT feasible_pairs_cgid_client_id_unique
-            UNIQUE (cgid, client_id)
-        """)
+        logger.info("Truncating feasible_pairs table...")
+        cursor.execute("TRUNCATE TABLE feasible_pairs RESTART IDENTITY")
         connection.commit()
-        logger.info("✓ Created unique constraint on (cgid, client_id)")
+        logger.info("✓ Truncated feasible_pairs")
     except Exception as e:
         connection.rollback()
-        # If constraint creation fails, we'll fall back to manual upsert logic
-        logger.warning(f"Could not create unique constraint (will use manual upsert): {e}")
+        logger.error(f"✗ Failed to truncate feasible_pairs: {e}")
+        raise
     finally:
         cursor.close()
 
 
-def seed_feasible_pairs(connection, frequencies, existing_pairs):
+def seed_feasible_pairs(connection, frequencies, weights):
     """
-    Insert or update feasible pairs. Idempotent: CSV is source of truth.
-    For new pairs: INSERT. For existing pairs: SET frequency = value (not add).
-    Re-running after connection loss will not double frequencies.
+    Insert feasible pairs after table truncate.
+    Each row includes frequency and normalized weight.
     """
     if not frequencies:
         logger.warning("No frequency data to insert.")
@@ -471,58 +556,21 @@ def seed_feasible_pairs(connection, frequencies, existing_pairs):
 
     cursor = connection.cursor()
     try:
-        # Build list of (cgid, client_id, frequency) for upsert
-        pairs_data = [(cgid, cid, freq) for (cgid, cid), freq in frequencies.items()]
-        logger.info(f"\nSeeding feasible pairs to database (idempotent upsert)...")
-        logger.info(f"  Pairs to insert/update: {len(pairs_data)}")
+        pairs_data = [
+            (cgid, cid, freq, float(weights.get((cgid, cid), 0.0)))
+            for (cgid, cid), freq in frequencies.items()
+        ]
+        logger.info("\nSeeding feasible pairs to database (fresh insert after truncate)...")
+        logger.info(f"  Pairs to insert: {len(pairs_data)}")
 
-        # Try ON CONFLICT approach first (requires unique constraint)
-        try:
-            upsert_query = """
-                INSERT INTO feasible_pairs (cgid, client_id, frequency, wait)
-                VALUES %s
-                ON CONFLICT (cgid, client_id) DO UPDATE SET
-                    frequency = EXCLUDED.frequency
-            """
-            execute_values(cursor, upsert_query, pairs_data, template="(%s, %s, %s, 0)")
-            connection.commit()
-            logger.info(f"✓ Successfully processed {len(pairs_data)} feasible pairs (using ON CONFLICT)")
-            return True
-        except Exception as on_conflict_error:
-            # ON CONFLICT failed (likely missing constraint), fall back to manual upsert
-            connection.rollback()
-            logger.warning(f"ON CONFLICT failed, using manual upsert approach: {on_conflict_error}")
-
-            # Manual upsert: separate INSERT and UPDATE
-            inserts = []
-            updates = []
-
-            for cgid, cid, freq in pairs_data:
-                if (cgid, cid) in existing_pairs:
-                    updates.append((freq, cgid, cid))
-                else:
-                    inserts.append((cgid, cid, freq, 0))
-
-            if inserts:
-                logger.info(f"  Inserting {len(inserts)} new pairs...")
-                insert_query = """
-                    INSERT INTO feasible_pairs (cgid, client_id, frequency, wait)
-                    VALUES %s
-                """
-                execute_values(cursor, insert_query, inserts, template="(%s, %s, %s, %s)")
-
-            if updates:
-                logger.info(f"  Updating {len(updates)} existing pairs...")
-                for freq, cgid, cid in updates:
-                    cursor.execute("""
-                        UPDATE feasible_pairs
-                        SET frequency = %s
-                        WHERE cgid = %s AND client_id = %s
-                    """, (freq, cgid, cid))
-
-            connection.commit()
-            logger.info(f"✓ Successfully processed {len(pairs_data)} feasible pairs (manual upsert)")
-            return True
+        insert_query = """
+            INSERT INTO feasible_pairs (cgid, client_id, frequency, weight)
+            VALUES %s
+        """
+        execute_values(cursor, insert_query, pairs_data, template="(%s, %s, %s, %s)")
+        connection.commit()
+        logger.info(f"✓ Successfully inserted {len(pairs_data)} feasible pairs")
+        return True
 
     except (OperationalError, InterfaceError) as e:
         connection.rollback()
@@ -587,24 +635,20 @@ def run(csv_path=None, connection_manager=None, state=None):
         logger.info("="*60)
         clients_lookup = load_clients_lookup(connection)
         logger.info("\n" + "="*60)
-        logger.info("STEP 4: LOAD EXISTING FEASIBLE PAIRS")
+        logger.info("STEP 4: EXTRACT VISIT FREQUENCIES AND WEIGHTS FROM CSV")
         logger.info("="*60)
-        existing_pairs = load_existing_feasible_pairs(connection)
-        logger.info("\n" + "="*60)
-        logger.info("STEP 5: EXTRACT VISIT FREQUENCIES FROM CSV")
-        logger.info("="*60)
-        frequencies, stats = extract_visit_frequencies_from_csv(csv_path, users_lookup, clients_lookup)
+        frequencies, weights, stats = extract_visit_frequencies_from_csv(csv_path, users_lookup, clients_lookup)
         if not frequencies:
             logger.warning("No valid visit frequencies found in CSV")
             return False
         logger.info("\n" + "="*60)
-        logger.info("STEP 6: ENSURE UNIQUE CONSTRAINT")
+        logger.info("STEP 5: TRUNCATE FEASIBLE PAIRS TABLE")
         logger.info("="*60)
-        ensure_unique_constraint(connection)
+        truncate_feasible_pairs(connection)
         logger.info("\n" + "="*60)
-        logger.info("STEP 7: SEED FEASIBLE PAIRS TO DATABASE")
+        logger.info("STEP 6: SEED FEASIBLE PAIRS TO DATABASE")
         logger.info("="*60)
-        success = seed_feasible_pairs(connection, frequencies, existing_pairs)
+        success = seed_feasible_pairs(connection, frequencies, weights)
         if success:
             if state:
                 state.update("feasible_pairs", status="completed")
@@ -615,9 +659,11 @@ def run(csv_path=None, connection_manager=None, state=None):
             print(f"\nSummary:")
             print(f"  - Total CSV rows processed: {stats['total_rows']}")
             print(f"  - Rows skipped (non-Personal Care): {stats['skipped_non_personal_care']}")
+            print(f"  - Rows skipped (invalid datetime): {stats['skipped_invalid_datetime']}")
             print(f"  - Personal Care rows: {stats['personal_care_rows']}")
             print(f"  - Valid visit records: {stats['valid_rows']}")
             print(f"  - Unique caregiver-client pairs: {stats['matched_pairs']}")
+            print(f"  - Pairs with calculated weight: {stats['weighted_pairs']}")
             print(f"  - Total visits recorded: {stats['total_visits']}")
             print(f"  - Unmatched caregivers: {len(stats['unmatched_caregivers'])}")
             print(f"  - Unmatched clients: {len(stats['unmatched_clients'])}")
