@@ -8,11 +8,18 @@ Persistent migration progress state for resume-after-connection-loss.
 import json
 import os
 import threading
+import time
 from pathlib import Path
 
 
 def get_state_path():
     """State file path: project_root/.cache/migration_state.json"""
+    cache_root = os.environ.get("AOS_MIGRATION_STATE_DIR")
+    if cache_root:
+        cache_dir = Path(cache_root).expanduser().resolve()
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return cache_dir / "migration_state.json"
+
     root = os.environ.get("AOS_MIGRATION_PROJECT_ROOT")
     if root:
         base = Path(root).resolve()
@@ -50,18 +57,32 @@ class MigrationState:
     def _save(self):
         """Atomic write: temp file then os.replace."""
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self._path.with_suffix(self._path.suffix + ".tmp")
-        try:
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self._data, f, indent=2)
-            os.replace(tmp, self._path)
-        except OSError:
-            if tmp.exists():
-                try:
-                    tmp.unlink()
-                except OSError:
-                    pass
-            raise
+        tmp = self._path.with_name(f"{self._path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        payload = json.dumps(self._data, indent=2)
+        max_attempts = 10
+
+        for attempt in range(max_attempts):
+            try:
+                with open(tmp, "w", encoding="utf-8") as f:
+                    f.write(payload)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, self._path)
+                return
+            except OSError as e:
+                if tmp.exists():
+                    try:
+                        tmp.unlink()
+                    except OSError:
+                        pass
+
+                win_err = getattr(e, "winerror", None)
+                transient_windows_lock = win_err in (5, 32)
+                if transient_windows_lock and attempt < max_attempts - 1:
+                    # Typical on Windows synced folders (Dropbox/OneDrive/AV): brief file lock.
+                    time.sleep(0.15 * (attempt + 1))
+                    continue
+                raise
 
     def update(self, step_key, **kwargs):
         """Merge kwargs into step state and persist."""

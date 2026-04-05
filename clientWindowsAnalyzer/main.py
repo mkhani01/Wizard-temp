@@ -184,7 +184,7 @@ def _times_overlap(start1_str: str, end1_str: str, start2_str: str, end2_str: st
 
 
 def load_client_availabilities(connection) -> Tuple[List[Dict], Dict[int, str]]:
-    """Load existing client_availabilities: id, client_id, requested_start_time, requested_end_time, number_of_care_givers.
+    """Load existing client_availabilities: id, client_id, requested_start_time, requested_end_time, duration, number_of_care_givers.
     Skip records that have:
     1. number_of_care_givers >= 2 (multiple caregivers needed)
     2. Overlapping time slots on the same day for the same client
@@ -204,7 +204,7 @@ def load_client_availabilities(connection) -> Tuple[List[Dict], Dict[int, str]]:
         # Load ALL records first to detect overlaps (now including start_date and occurs_every for matching)
         cursor.execute("""
             SELECT id, client_id, requested_start_time, requested_end_time,
-                   number_of_care_givers, days, start_date, occurs_every
+                   duration, number_of_care_givers, days, start_date, occurs_every
             FROM client_availabilities
             WHERE deleted_at IS NULL
         """)
@@ -232,6 +232,7 @@ def load_client_availabilities(connection) -> Tuple[List[Dict], Dict[int, str]]:
                 "client_id": r["client_id"],
                 "requested_start_time": rs,
                 "requested_end_time": re_,
+                "duration": r.get("duration"),
                 "number_of_care_givers": r.get("number_of_care_givers", 1),
                 "days": days_list,
                 "start_date": r.get("start_date"),
@@ -342,6 +343,18 @@ def min_to_time_str(minutes_from_midnight: int) -> str:
     h = minutes_from_midnight // 60
     m = minutes_from_midnight % 60
     return f"{h:02d}:{m:02d}:00"
+
+
+def _time_str_to_minutes(t_str: str) -> Optional[int]:
+    """Convert HH:MM[:SS] string to minutes from midnight."""
+    normalized = _normalize_time_to_hhmmss(t_str)
+    if not normalized:
+        return None
+    try:
+        parts = normalized.split(":")
+        return int(parts[0]) * 60 + int(parts[1])
+    except (TypeError, ValueError, IndexError):
+        return None
 
 
 def normalize_time_for_slot(h: int, m: int) -> Tuple[int, int]:
@@ -562,7 +575,77 @@ def stage1_load_and_clean(csv_path: str) -> pd.DataFrame:
         logger.warning(f"  Column '{col_act_dur}' not found; computing from Actual Start/End. Columns: {list(df.columns)[:15]}...")
 
     logger.info(f"  Stage 1 output: {len(df)} rows → {df['Formatted_Name'].nunique() if len(df) else 0} unique clients")
+    df = apply_productivity_scaling_algorithm(df)
     return df
+
+
+def apply_productivity_scaling_algorithm(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Apply duration scaling logic inspired by duration_reduction_visitexport.py:
+    per carer/day route, scale actual visit durations by:
+        scaling_factor = (shift_window - waiting_gaps) / total_reported_care
+    clamped to [0, 1].
+    Travel time is treated as 0 here because this migration does not load distance matrices.
+    """
+    col_carer = "Actual Employee Name"
+    col_act_start = "Actual Start Date And Time"
+
+    out = df.copy()
+    out["Adjusted Duration Estimate"] = np.nan
+
+    if col_carer not in out.columns:
+        logger.warning("  Column '%s' not found; scaling durations without carer grouping.", col_carer)
+        out[col_carer] = "__UNKNOWN_CARER__"
+
+    out["_route_date"] = out[col_act_start].dt.date
+    groups = out.groupby([col_carer, "_route_date"], dropna=False)
+
+    scaled_routes = 0
+    for (_, _), grp in groups:
+        if grp.empty:
+            continue
+
+        grp_sorted = grp.sort_values(col_act_start)
+        total_waiting_gaps = 0
+        total_reported_care_time = 0
+        first_start = None
+        last_end = None
+        prev_end = None
+        calc_duration_by_idx: Dict[int, int] = {}
+
+        for idx, row in grp_sorted.iterrows():
+            start_min = int(row["Actual_start_min"])
+            end_min = int(row["Actual_end_min"])
+            if end_min < start_min:
+                end_min += 24 * 60
+
+            calc_duration = max(0, end_min - start_min)
+            calc_duration_by_idx[idx] = calc_duration
+            total_reported_care_time += calc_duration
+
+            if first_start is None:
+                first_start = start_min
+            last_end = end_min
+
+            if prev_end is not None:
+                gap = start_min - prev_end
+                if gap > 0:
+                    total_waiting_gaps += gap
+            prev_end = end_min
+
+        shift_window = (last_end - first_start) if first_start is not None and last_end is not None else 0
+        available_time = shift_window - total_waiting_gaps
+        scaling_factor = (available_time / total_reported_care_time) if total_reported_care_time > 0 else 1
+        scaling_factor = max(0, min(1, scaling_factor))
+
+        for idx, calc_duration in calc_duration_by_idx.items():
+            out.at[idx, "Adjusted Duration Estimate"] = int(round(calc_duration * scaling_factor))
+
+        scaled_routes += 1
+
+    out.drop(columns=["_route_date"], inplace=True)
+    logger.info("  Applied productivity scaling to %d carer/day routes", scaled_routes)
+    return out
 
 
 # ============================================================================
@@ -1033,6 +1116,7 @@ def run(csv_path: Optional[str] = None, connection_manager=None, state=None) -> 
             actual_start_min = row.get("Actual_start_min")
             actual_end_min = row.get("Actual_end_min")
             actual_duration = row.get("Actual Duration")
+            adjusted_duration = row.get("Adjusted Duration Estimate")
 
             csv_by_client[client_id].append({
                 "date": visit_date,
@@ -1041,6 +1125,7 @@ def run(csv_path: Optional[str] = None, connection_manager=None, state=None) -> 
                 "actual_start_min": actual_start_min,
                 "actual_end_min": actual_end_min,
                 "actual_duration": actual_duration,
+                "adjusted_duration": adjusted_duration,
             })
 
         logger.info(f"  CSV visits grouped by {len(csv_by_client)} clients")
@@ -1078,58 +1163,47 @@ def run(csv_path: Optional[str] = None, connection_manager=None, state=None) -> 
                 skip_reasons[avail_id] = "No CSV visits match this availability pattern (day/time/recurrence)"
                 continue
 
-            # Calculate suggested window from matching visits
-            start_mins = [v["actual_start_min"] for v in matching_visits if not pd.isna(v["actual_start_min"])]
-            end_mins = [v["actual_end_min"] for v in matching_visits if not pd.isna(v["actual_end_min"])]
-            durations = [v["actual_duration"] for v in matching_visits if not pd.isna(v["actual_duration"])]
-
-            if not start_mins or not end_mins:
-                skip_reasons[avail_id] = f"Found {len(matching_visits)} matching visits but missing actual time data"
+            # Apply productivity-scaled duration algorithm to derive minDuration and window.
+            # We intentionally keep DB duration/requested_start_time/requested_end_time untouched.
+            adjusted_durations = [
+                int(round(v["adjusted_duration"]))
+                for v in matching_visits
+                if not pd.isna(v.get("adjusted_duration"))
+            ]
+            if not adjusted_durations:
+                skip_reasons[avail_id] = (
+                    f"Found {len(matching_visits)} matching visits but no adjusted durations from scaling algorithm"
+                )
                 continue
 
-            # Calculate suggested start/end using percentiles
-            if len(start_mins) == 1:
-                sugg_start_min = start_mins[0] - TOLERANCE_MINS
-                sugg_end_min = end_mins[0] + TOLERANCE_MINS
-            else:
-                sugg_start_min = np.percentile(start_mins, LOWER_PERCENTILE * 100) - TOLERANCE_MINS
-                sugg_end_min = np.percentile(end_mins, UPPER_PERCENTILE * 100) + TOLERANCE_MINS
+            req_start_min = _time_str_to_minutes(avail.get("requested_start_time"))
+            req_end_min = _time_str_to_minutes(avail.get("requested_end_time"))
+            if req_start_min is None or req_end_min is None or req_end_min <= req_start_min:
+                skip_reasons[avail_id] = "Invalid requested start/end time; cannot derive window"
+                continue
 
-            # Enforce minimum window width
-            width = sugg_end_min - sugg_start_min
-            if width < MIN_WINDOW_WIDTH_MINS:
-                extra = (MIN_WINDOW_WIDTH_MINS - width) / 2
-                sugg_start_min -= extra
-                sugg_end_min += extra
+            requested_window = req_end_min - req_start_min
+            min_duration = int(round(np.median(adjusted_durations)))
 
-            sugg_start_min = max(0, int(round(sugg_start_min)))
-            sugg_end_min = min(24 * 60 - 1, int(round(sugg_end_min)))
+            db_duration = avail.get("duration")
+            if db_duration is not None and not pd.isna(db_duration):
+                min_duration = min(min_duration, int(db_duration))
+            min_duration = min(min_duration, requested_window)
 
-            # Calculate minDuration (using 10% significance threshold)
-            min_duration = None
-            if durations:
-                dur_counts = defaultdict(int)
-                for d in durations:
-                    dur_counts[int(d)] += 1
+            if min_duration <= 0:
+                skip_reasons[avail_id] = "Scaled duration collapsed to 0; skipping update"
+                continue
 
-                total_visits = len(durations)
-                threshold_count = max(1, int(round(total_visits * DURATION_SIGNIFICANCE_THRESHOLD)))
-
-                # Find significant durations
-                significant_durs = [d for d, cnt in dur_counts.items() if cnt >= threshold_count]
-                if significant_durs:
-                    min_duration = max(significant_durs)
-                else:
-                    min_duration = int(min(durations))
-
-            # Convert to time strings
-            start_time_str = min_to_time_str(sugg_start_min)
-            end_time_str = min_to_time_str(sugg_end_min)
+            start_time_str = _normalize_time_to_hhmmss(avail.get("requested_start_time"))
+            end_time_str = min_to_time_str(req_start_min + min_duration)
 
             # Add to update batch
             update_args.append((start_time_str, end_time_str, min_duration, avail_id))
             updated_ids.add(avail_id)
-            update_reasons[avail_id] = f"Successfully updated from {len(matching_visits)} matching CSV visits (start_time={start_time_str}, end_time={end_time_str}, minDuration={min_duration})"
+            update_reasons[avail_id] = (
+                f"Successfully updated from {len(matching_visits)} matching CSV visits "
+                f"using scaled durations (start_time={start_time_str}, end_time={end_time_str}, minDuration={min_duration})"
+            )
             updated += 1
 
         logger.info(f"  Matched {updated} availabilities to CSV visits")
