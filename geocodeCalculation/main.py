@@ -309,10 +309,27 @@ def get_h3_hexagon_for_dense_check(lat, lng, cities):
     return rural_hex, RURAL_H3_RESOLUTION, None
 
 
-def get_users_with_postcodes(connection):
-    """Get all users with postcodes but without lat/long (null coordinates)"""
+def _env_flag(name):
+    """Parse boolean env flag (1/true/yes/on)."""
+    value = os.getenv(name, "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def get_users_with_postcodes(connection, include_with_coordinates=False):
+    """Get users with postcodes. Default only missing coordinates; optional full refresh."""
     cursor = connection.cursor()
     try:
+        if include_with_coordinates:
+            query = """
+                SELECT id, name, lastname, postcode
+                FROM "user"
+                WHERE postcode IS NOT NULL AND postcode != ''
+                ORDER BY id
+            """
+            cursor.execute(query)
+            users = cursor.fetchall()
+            logger.info(f"Found {len(users)} users with postcodes (full re-geocode mode)")
+            return users
         query = """
             SELECT id, name, lastname, postcode
             FROM "user"
@@ -328,10 +345,21 @@ def get_users_with_postcodes(connection):
         cursor.close()
 
 
-def get_clients_with_postcodes(connection):
-    """Get all clients with postcodes but without lat/long (null coordinates)"""
+def get_clients_with_postcodes(connection, include_with_coordinates=False):
+    """Get clients with postcodes. Default only missing coordinates; optional full refresh."""
     cursor = connection.cursor()
     try:
+        if include_with_coordinates:
+            query = """
+                SELECT id, name, lastname, postcode
+                FROM client
+                WHERE postcode IS NOT NULL AND postcode != ''
+                ORDER BY id
+            """
+            cursor.execute(query)
+            clients = cursor.fetchall()
+            logger.info(f"Found {len(clients)} clients with postcodes (full re-geocode mode)")
+            return clients
         query = """
             SELECT id, name, lastname, postcode
             FROM client
@@ -560,11 +588,13 @@ def process_clients(connection, geocoder, clients, cities):
 def run(connection_manager=None, state=None):
     """Main execution function. connection_manager and state used from wizard for resume support."""
     import psycopg2
+    geocode_all_users = _env_flag("GEOCODE_ALL_USERS")
+    geocode_all_clients = _env_flag("GEOCODE_ALL_CLIENTS")
     print("""
     ╔══════════════════════════════════════════════════════════╗
     ║         Geocode Calculation Migration                    ║
     ║         Postcode → Lat/Lng → H3 Hexagon                  ║
-    ║         (Only for records with null coordinates)         ║
+    ║         (Missing coords or full re-geocode mode)         ║
     ╚══════════════════════════════════════════════════════════╝
     """)
     if state and state.is_completed("geocode_api"):
@@ -607,12 +637,18 @@ def run(connection_manager=None, state=None):
         logger.info("\n" + "="*60)
         logger.info("STEP 3: FETCH RECORDS")
         logger.info("="*60)
-        logger.info("Fetching users and clients that need geocoding:")
-        logger.info("  - WITH postcode but WITHOUT coordinates → will be geocoded")
+        logger.info("Fetching users and clients that need geocoding...")
+        if geocode_all_users or geocode_all_clients:
+            logger.info("Full re-geocode mode enabled:")
+            logger.info("  - Users:   %s", "ALL with postcode" if geocode_all_users else "ONLY missing coordinates")
+            logger.info("  - Clients: %s", "ALL with postcode" if geocode_all_clients else "ONLY missing coordinates")
+        else:
+            logger.info("Default mode:")
+            logger.info("  - WITH postcode but WITHOUT coordinates → will be geocoded")
         logger.info("  - WITHOUT postcode and WITHOUT coordinates → will be logged as warnings")
         logger.info("")
-        users = get_users_with_postcodes(connection)
-        clients = get_clients_with_postcodes(connection)
+        users = get_users_with_postcodes(connection, include_with_coordinates=geocode_all_users)
+        clients = get_clients_with_postcodes(connection, include_with_coordinates=geocode_all_clients)
         users_no_postcode = get_users_without_postcodes(connection)
         clients_no_postcode = get_clients_without_postcodes(connection)
 
