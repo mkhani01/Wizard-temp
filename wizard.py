@@ -69,6 +69,9 @@ STEP_SUMMARY = 4
 STEP_RUN = 5
 TOTAL_STEPS = 6
 
+# Wizard release version (shown in UI and window title on all platforms / frozen builds)
+WIZARD_VERSION = "0.0.1"
+
 # Migration option keys (must match checkbox keys and file keys)
 OPT_CAREGIVERS = "caregivers"
 OPT_AVAILABILITY_TYPES = "availability_types"
@@ -184,7 +187,7 @@ def try_load_logo(root, path, size=(64, 64)):
 class MigrationWizard:
     def __init__(self):
         self.root = Tk()
-        self.root.title("AOS System – Migration Wizard")
+        self.root.title("AOS System – Migration Wizard ({})".format(WIZARD_VERSION))
         self.root.minsize(640, 520)
         self.root.geometry("720x580")
 
@@ -252,9 +255,11 @@ class MigrationWizard:
         main.columnconfigure(0, weight=1)
         main.rowconfigure(1, weight=1)
 
-        # Progress
+        # Progress + version (constant row visible on every step)
         self.step_label = ttk.Label(main, text="Step 1 of 6 – Welcome", font=("", 10, "bold"))
-        self.step_label.grid(row=0, column=0, columnspan=2, sticky=W, pady=(0, 8))
+        self.step_label.grid(row=0, column=0, sticky=W, pady=(0, 8))
+        self.version_label = ttk.Label(main, text="Version {}".format(WIZARD_VERSION), font=("", 9))
+        self.version_label.grid(row=0, column=1, sticky=E, pady=(0, 8))
 
         # Content area
         self.content = ttk.Frame(main)
