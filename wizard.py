@@ -78,6 +78,8 @@ OPT_CLIENTS_AVAILABILITY = "clients_availability"
 OPT_GEOCODE_API = "geocode_api"
 OPT_GEOCODE_CLIENT_FILE = "geocode_client_file"
 OPT_GEOCODE_CAREGIVER_FILE = "geocode_caregiver_file"
+OPT_GEOCODE_ALL_CLIENTS = "geocode_all_clients"
+OPT_GEOCODE_ALL_USERS = "geocode_all_users"
 OPT_CALCULATE_DISTANCES = "calculate_distances"
 OPT_FVISIT_HISTORY = "fvisit_history"
 OPT_CLIENT_WINDOWS = "client_windows"
@@ -217,6 +219,7 @@ class MigrationWizard:
             OPT_CAREGIVERS, OPT_AVAILABILITY_TYPES, OPT_CAREGIVERS_AVAILABILITY,
             OPT_CLIENTS, OPT_CLIENTS_AVAILABILITY, OPT_GEOCODE_API,
             OPT_GEOCODE_CLIENT_FILE, OPT_GEOCODE_CAREGIVER_FILE,
+            OPT_GEOCODE_ALL_CLIENTS, OPT_GEOCODE_ALL_USERS,
             OPT_CALCULATE_DISTANCES, OPT_FVISIT_HISTORY, OPT_CLIENT_WINDOWS,
         ]}
         self.file_paths = {}  # option -> path string (file or folder)
@@ -446,6 +449,8 @@ class MigrationWizard:
             (OPT_GEOCODE_CLIENT_FILE, "Get clients location from file", "Update client latitude/longitude from a JSON backup file (e.g. clientbackup.json). File must contain \"latitude\", \"longitude\", \"name\", \"lastname\" for each record. This is useful for manually seeding known coordinates before using the Google API."),
             (OPT_GEOCODE_CAREGIVER_FILE, "Get users location from file", "Update user (caregiver) latitude/longitude from a JSON backup file (e.g. usersBackup.json). File must contain \"latitude\", \"longitude\", \"name\", \"lastname\" for each record. This is useful for manually seeding known coordinates before using the Google API."),
             (OPT_GEOCODE_API, "Calculated Geocode (Google API)", "Use Google Maps API to fill in latitude/longitude from postcodes for users and clients that have NULL coordinates. This runs AFTER file-based location imports (if selected), only geocoding records with postcodes but missing lat/long. You need a Google Maps API key and the Irish cities file (IE.txt). Can be combined with file-based options."),
+            (OPT_GEOCODE_ALL_CLIENTS, "Geocode all Clients", "Re-geocode ALL clients with a postcode, including records that already have latitude/longitude. Use this to refresh all client coordinates from postcode before distance migration."),
+            (OPT_GEOCODE_ALL_USERS, "Geocode all Users", "Re-geocode ALL users with a postcode, including records that already have latitude/longitude. Use this to refresh all user coordinates from postcode before distance migration."),
             (OPT_CALCULATE_DISTANCES, "Calculate distances", "Compute travel distances between caregivers and clients using OSRM. Reads user and client lat/long from the database, calls OSRM for each pair and travel method (driving, cycling, walking), then inserts or updates the travel_distances table. Runs a verification step when done. Requires network access to OSRM."),
             (OPT_FVISIT_HISTORY, "Feasible pairs (visit history)", "Seed feasible_pairs from visit data CSV (Assignee = caregiver, Customer = client). Pick a CSV with columns Assignee and Customer in the next step."),
             (OPT_CLIENT_WINDOWS, "Client windows analyzer", "Update existing client availability records with optimized start/end windows and minDuration from historical visit data (VisitExport-style CSV). Requires Clients Availability. Pick the visit export CSV in the next step."),
@@ -458,7 +463,10 @@ class MigrationWizard:
             block.columnconfigure(0, weight=1)
             cb = ttk.Checkbutton(block, text=title, variable=self.check_vars[key], command=self._sync_checkbox_dependencies)
             cb.grid(row=0, column=0, sticky=W)
-            if key in (OPT_GEOCODE_CLIENT_FILE, OPT_GEOCODE_CAREGIVER_FILE):
+            if key in (
+                OPT_GEOCODE_CLIENT_FILE, OPT_GEOCODE_CAREGIVER_FILE,
+                OPT_GEOCODE_API, OPT_GEOCODE_ALL_CLIENTS, OPT_GEOCODE_ALL_USERS,
+            ):
                 setattr(self, "_cb_%s" % key, cb)
             if key in (OPT_CAREGIVERS_AVAILABILITY, OPT_CLIENTS_AVAILABILITY, OPT_CLIENT_WINDOWS):
                 setattr(self, "_cb_%s" % key, cb)
@@ -481,7 +489,7 @@ class MigrationWizard:
         )
 
     def _sync_checkbox_dependencies(self):
-        """Apply dependencies: Caregivers/Clients availability only when Availability types selected; Client windows only when Clients Availability selected."""
+        """Apply dependencies and mutual exclusions for migration options."""
         # Availability: enable Caregivers/Clients availability only when Availability types is selected
         has_availability_types = self.check_vars[OPT_AVAILABILITY_TYPES].get()
         for opt in (OPT_CAREGIVERS_AVAILABILITY, OPT_CLIENTS_AVAILABILITY):
@@ -497,6 +505,43 @@ class MigrationWizard:
             cb_cw.config(state="normal" if has_clients_availability else "disabled")
             if not has_clients_availability:
                 self.check_vars[OPT_CLIENT_WINDOWS].set(False)
+
+        # Geocode options are mutually exclusive:
+        # - Full re-geocode mode: geocode all users/clients
+        # - Partial geocode mode: file-based imports and "missing coordinates" geocode
+        geocode_all_selected = (
+            self.check_vars[OPT_GEOCODE_ALL_CLIENTS].get() or
+            self.check_vars[OPT_GEOCODE_ALL_USERS].get()
+        )
+        geocode_partial_selected = (
+            self.check_vars[OPT_GEOCODE_API].get() or
+            self.check_vars[OPT_GEOCODE_CLIENT_FILE].get() or
+            self.check_vars[OPT_GEOCODE_CAREGIVER_FILE].get()
+        )
+
+        if geocode_all_selected:
+            self.check_vars[OPT_GEOCODE_API].set(False)
+            self.check_vars[OPT_GEOCODE_CLIENT_FILE].set(False)
+            self.check_vars[OPT_GEOCODE_CAREGIVER_FILE].set(False)
+
+        if geocode_partial_selected:
+            self.check_vars[OPT_GEOCODE_ALL_CLIENTS].set(False)
+            self.check_vars[OPT_GEOCODE_ALL_USERS].set(False)
+
+        for key in (
+            OPT_GEOCODE_API,
+            OPT_GEOCODE_CLIENT_FILE,
+            OPT_GEOCODE_CAREGIVER_FILE,
+            OPT_GEOCODE_ALL_CLIENTS,
+            OPT_GEOCODE_ALL_USERS,
+        ):
+            cb = getattr(self, "_cb_%s" % key, None)
+            if cb is None:
+                continue
+            if key in (OPT_GEOCODE_ALL_CLIENTS, OPT_GEOCODE_ALL_USERS):
+                cb.config(state="disabled" if geocode_partial_selected else "normal")
+            else:
+                cb.config(state="disabled" if geocode_all_selected else "normal")
 
     def _build_step_files(self, parent):
         parent.columnconfigure(0, weight=1)
@@ -562,8 +607,12 @@ class MigrationWizard:
         parent = getattr(self, "_files_scroll_frame", self.frames[STEP_FILES])
         row = getattr(self, "_files_start_row", 0)
         selected = [k for k, v in self.check_vars.items() if v.get()]
-        # Geocode API: show IE.txt and optional API key
-        if OPT_GEOCODE_API in selected:
+        # Geocode settings: show IE.txt and optional API key
+        if (
+            OPT_GEOCODE_API in selected or
+            OPT_GEOCODE_ALL_CLIENTS in selected or
+            OPT_GEOCODE_ALL_USERS in selected
+        ):
             ttk.Label(parent, text="Irish cities file (IE.txt) for Calculated Geocode:").grid(row=row, column=0, sticky=W, padx=(0, 8), pady=4)
             e = Entry(parent, textvariable=self.geocode_ie_txt_path, width=40)
             e.grid(row=row, column=1, sticky=(E, W), pady=4)
@@ -664,7 +713,7 @@ class MigrationWizard:
                 path = self.file_paths[key].get()
                 if path:
                     lines.append("  File: " + path)
-            if key == OPT_GEOCODE_API:
+            if key in (OPT_GEOCODE_API, OPT_GEOCODE_ALL_CLIENTS, OPT_GEOCODE_ALL_USERS):
                 ie = self.geocode_ie_txt_path.get()
                 if ie:
                     lines.append("  IE.txt: " + ie)
@@ -912,9 +961,14 @@ class MigrationWizard:
 
     def _validate_files(self):
         selected = [k for k, v in self.check_vars.items() if v.get()]
-        if OPT_GEOCODE_API in selected:
+        geocode_modes_selected = (
+            OPT_GEOCODE_API in selected or
+            OPT_GEOCODE_ALL_CLIENTS in selected or
+            OPT_GEOCODE_ALL_USERS in selected
+        )
+        if geocode_modes_selected:
             if not self.geocode_ie_txt_path.get().strip():
-                messagebox.showwarning("Files", "Please select the Irish cities file (IE.txt) for Calculated Geocode.")
+                messagebox.showwarning("Files", "Please select the Irish cities file (IE.txt) for geocode migration.")
                 return False
             api_key = self.geocode_api_key.get().strip()
             if not api_key and not os.getenv("GOOGLE_MAPS_API_KEY"):
@@ -1349,6 +1403,8 @@ class MigrationWizard:
         api_key = self.geocode_api_key.get().strip()
         if api_key:
             os.environ["GOOGLE_MAPS_API_KEY"] = api_key
+        os.environ["GEOCODE_ALL_CLIENTS"] = "1" if self.check_vars[OPT_GEOCODE_ALL_CLIENTS].get() else "0"
+        os.environ["GEOCODE_ALL_USERS"] = "1" if self.check_vars[OPT_GEOCODE_ALL_USERS].get() else "0"
 
     def _empty_assets(self):
         """Remove all contents of assets so each run starts with a clean slate."""
@@ -1370,7 +1426,11 @@ class MigrationWizard:
         (ASSETS / "availabilitytypes").mkdir(parents=True, exist_ok=True)
         (ASSETS / "clientsAvailabilities").mkdir(parents=True, exist_ok=True)
 
-        if self.check_vars[OPT_GEOCODE_API].get():
+        if (
+            self.check_vars[OPT_GEOCODE_API].get() or
+            self.check_vars[OPT_GEOCODE_ALL_CLIENTS].get() or
+            self.check_vars[OPT_GEOCODE_ALL_USERS].get()
+        ):
             ie_src = self.geocode_ie_txt_path.get().strip()
             if ie_src:
                 shutil.copy2(ie_src, ASSETS / "IE.txt")
@@ -1416,7 +1476,11 @@ class MigrationWizard:
         if self.check_vars[OPT_GEOCODE_CAREGIVER_FILE].get():
             order.append(("Caregiver Geocode (file)", self._run_user_locations))
         # Google API geocoding runs after file-based (fills in remaining nulls)
-        if self.check_vars[OPT_GEOCODE_API].get():
+        if (
+            self.check_vars[OPT_GEOCODE_API].get() or
+            self.check_vars[OPT_GEOCODE_ALL_CLIENTS].get() or
+            self.check_vars[OPT_GEOCODE_ALL_USERS].get()
+        ):
             order.append(("Calculated Geocode (API)", self._run_geocode_api))
         if self.check_vars[OPT_CALCULATE_DISTANCES].get():
             order.append(("Calculate distances", self._run_travel_distances))
