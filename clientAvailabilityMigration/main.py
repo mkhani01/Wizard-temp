@@ -53,11 +53,7 @@ WEEK_ROTATION = 2
 AUTO_DETECT_WEEK_ROTATION = True
 
 DEFAULT_NUMBER_OF_CARE_GIVERS = 1
-DEFAULT_FLEX_START = 0
-DEFAULT_FLEX_END = 0
-DEFAULT_FIX_WINDOW = False
 DEFAULT_MIN_DURATION = None
-DEFAULT_DURATION = None
 
 AVAILABILITY_TYPE_NAME = 'Core'
 
@@ -227,6 +223,21 @@ def normalize_time_for_slot(t: time) -> time:
 
 def format_date_str(d: date) -> str:
     return d.strftime('%Y-%m-%d')
+
+
+def requested_duration_minutes(
+    start_time: time,
+    end_time: time,
+    duration_minutes: Optional[int],
+) -> int:
+    """Resolve requested_duration; fall back to time span when Excel duration is missing."""
+    if duration_minutes is not None and duration_minutes > 0:
+        return duration_minutes
+    start_m = start_time.hour * 60 + start_time.minute
+    end_m = end_time.hour * 60 + end_time.minute
+    if end_m <= start_m:
+        end_m += 24 * 60
+    return max(1, end_m - start_m)
 
 
 def get_week_number(date_obj: date, reference_date: date) -> int:
@@ -673,34 +684,41 @@ def generate_availability_records(
         
         for schedule in schedules:
             num_care_givers = schedule.get('number_of_care_givers', DEFAULT_NUMBER_OF_CARE_GIVERS)
-            duration = schedule.get('duration', DEFAULT_DURATION)
+            requested_start = format_time_str(schedule['start_time'])
+            requested_end = format_time_str(schedule['end_time'])
+            requested_duration = requested_duration_minutes(
+                schedule['start_time'],
+                schedule['end_time'],
+                schedule.get('duration'),
+            )
             availabilities.append({
                 'client_id': client_id,
                 'days': [schedule['day']],
-                'requested_start_time': format_time_str(schedule['start_time']),
-                'requested_end_time': format_time_str(schedule['end_time']),
-                'start_time': format_time_str(schedule['start_time']),
-                'end_time': format_time_str(schedule['end_time']),
-                'is_temp': False,
-                'is_unavailability': is_unavailability,
-                'type_id': type_id,
+                'requested_start_time': requested_start,
+                'requested_end_time': requested_end,
+                'requested_duration': requested_duration,
                 'number_of_care_givers': num_care_givers,
-                'flex_start': DEFAULT_FLEX_START,
-                'flex_end': DEFAULT_FLEX_END,
-                'fix_window': DEFAULT_FIX_WINDOW,
-                'min_duration': DEFAULT_MIN_DURATION,
-                'duration': duration,
-                'note': None,
                 'start_date': format_date_str(schedule['start_date']),
                 'end_date': None,
                 'occurs_every': schedule['occurs_every'],
+                'window_start': requested_start,
+                'window_end': requested_end,
+                'min_duration': DEFAULT_MIN_DURATION,
+                'is_temp': False,
+                'is_unavailability': is_unavailability,
+                'type_id': type_id,
+                'note': None,
                 'effective_date_from': None,
                 'effective_date_to': None,
             })
 
-            logger.info(f"  → {schedule['day']} {format_time_str(schedule['start_time'])}-{format_time_str(schedule['end_time'])}, "
-                       f"start={format_date_str(schedule['start_date'])}, occurs_every={schedule['occurs_every']}, "
-                       f"number_of_care_givers={num_care_givers}, duration={duration}")
+            logger.info(
+                "  → %s %s-%s, start=%s, occurs_every=%s, "
+                "number_of_care_givers=%s, requested_duration=%s",
+                schedule['day'], requested_start, requested_end,
+                format_date_str(schedule['start_date']), schedule['occurs_every'],
+                num_care_givers, requested_duration,
+            )
     
     logger.info(f"\nGenerated {len(availabilities)} total availability records")
     return availabilities
@@ -714,8 +732,8 @@ def deduplicate_availabilities(availabilities: List[Dict]) -> List[Dict]:
         key = (
             avail['client_id'],
             tuple(avail['days']),
-            avail['start_time'],
-            avail['end_time'],
+            avail['requested_start_time'],
+            avail['requested_end_time'],
             avail['start_date'],
             avail['occurs_every'],
         )
@@ -732,95 +750,127 @@ def deduplicate_availabilities(availabilities: List[Dict]) -> List[Dict]:
     return list(unique_map.values())
 
 
-def clear_client_availabilities(connection) -> None:
-    """Remove all existing rows from client_availabilities before seeding."""
+def clear_client_schedules(connection) -> None:
+    """Remove all existing client schedule data before seeding."""
     cursor = connection.cursor()
     try:
-        cursor.execute("DELETE FROM client_availabilities")
-        deleted = cursor.rowcount
+        for table in (
+            "client_schedule_preferences_preferred_users",
+            "client_schedule_preferences_must_users",
+            "client_schedule_preferences_only_users",
+            "client_schedule_preferences_disliked_users",
+            "client_schedule_clients_groups",
+            "client_schedule_exceptions",
+            "client_schedule_preferences",
+            "client_schedules",
+        ):
+            cursor.execute(f"DELETE FROM {table}")
+            logger.info("Cleared %s: %d row(s) removed", table, cursor.rowcount)
         connection.commit()
-        logger.info(f"Cleared client_availabilities: {deleted} existing row(s) removed")
     except Exception as e:
         connection.rollback()
-        logger.error(f"Failed to clear client_availabilities: {e}")
-        raise MigrationError(f"Failed to clear client_availabilities: {e}")
+        logger.error(f"Failed to clear client schedule tables: {e}")
+        raise MigrationError(f"Failed to clear client schedule tables: {e}")
     finally:
         cursor.close()
 
 
 def seed_availabilities(connection, availabilities: List[Dict]) -> int:
+    """Insert client_schedules rows and their client_schedule_preferences."""
     logger.info(f"\n{'='*60}")
     logger.info("SEEDING DATABASE")
     logger.info(f"{'='*60}")
     
-    clear_client_availabilities(connection)
+    clear_client_schedules(connection)
     
     if not availabilities:
-        logger.warning("No availabilities to insert")
+        logger.warning("No schedules to insert")
         return 0
     
     cursor = connection.cursor()
     try:
-        cursor.execute("SELECT typname FROM pg_type WHERE typname = 'client_availabilities_days_enum'")
+        cursor.execute("SELECT typname FROM pg_type WHERE typname = 'client_schedules_days_enum'")
         enum_exists = cursor.fetchone()
+        array_cast = '::text[]::client_schedules_days_enum[]' if enum_exists else '::text[]'
         
-        array_cast = '::text[]::client_availabilities_days_enum[]' if enum_exists else '::text[]'
-        
-        # Note: minDuration and duration use camelCase in DB (no explicit name mapping in entity)
-        insert_query = f"""
-            INSERT INTO client_availabilities (
+        schedule_insert = f"""
+            INSERT INTO client_schedules (
                 client_id, days, requested_start_time, requested_end_time,
-                start_time, end_time, is_temp, is_unavailability, type_id,
-                number_of_care_givers, flex_start, flex_end, fix_window,
-                "minDuration", duration, note,
-                start_date, end_date, occurs_every,
-                effective_date_from, effective_date_to,
-                created_date, last_modified_date
+                requested_duration, start_date, end_date, occurs_every,
+                number_of_care_givers, created_date, last_modified_date
             ) VALUES %s
             RETURNING id
         """
         
-        availability_tuples = [
+        schedule_tuples = [
             (
                 avail['client_id'],
                 avail['days'],
                 avail['requested_start_time'],
                 avail['requested_end_time'],
-                avail['start_time'],
-                avail['end_time'],
-                avail['is_temp'],
-                avail['is_unavailability'],
-                avail['type_id'],
-                avail['number_of_care_givers'],
-                avail['flex_start'],
-                avail['flex_end'],
-                avail['fix_window'],
-                avail['min_duration'],
-                avail['duration'],
-                avail['note'],
+                avail['requested_duration'],
                 avail['start_date'],
                 avail['end_date'],
                 avail['occurs_every'],
-                avail['effective_date_from'],
-                avail['effective_date_to'],
+                avail['number_of_care_givers'],
             )
             for avail in availabilities
         ]
         
-        logger.info(f"Inserting {len(availability_tuples)} records...")
+        logger.info(f"Inserting {len(schedule_tuples)} client_schedules records...")
         
         execute_values(
             cursor,
-            insert_query,
-            availability_tuples,
-            template=f"(%s, %s{array_cast}, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())"
+            schedule_insert,
+            schedule_tuples,
+            template=f"(%s, %s{array_cast}, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())",
+            fetch=True,
         )
         
-        inserted = cursor.fetchall()
-        connection.commit()
+        inserted_ids = [row['id'] for row in cursor.fetchall()]
+        if len(inserted_ids) != len(availabilities):
+            raise MigrationError(
+                f"Expected {len(availabilities)} schedule IDs, got {len(inserted_ids)}"
+            )
         
-        logger.info(f"✓ Successfully inserted {len(inserted)} client availability records")
-        return len(inserted)
+        preferences_insert = """
+            INSERT INTO client_schedule_preferences (
+                client_schedule_id, window_start, window_end, min_duration,
+                is_temporary, effective_date_from, effective_date_to,
+                note, not_send_to_engine, is_unavailability, type_id,
+                created_date, last_modified_date
+            ) VALUES %s
+        """
+        
+        preferences_tuples = [
+            (
+                schedule_id,
+                avail['window_start'],
+                avail['window_end'],
+                avail['min_duration'],
+                avail['is_temp'],
+                avail['effective_date_from'],
+                avail['effective_date_to'],
+                avail['note'],
+                False,
+                avail['is_unavailability'],
+                avail['type_id'],
+            )
+            for schedule_id, avail in zip(inserted_ids, availabilities)
+        ]
+        
+        logger.info(f"Inserting {len(preferences_tuples)} client_schedule_preferences records...")
+        
+        execute_values(
+            cursor,
+            preferences_insert,
+            preferences_tuples,
+            template="(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())",
+        )
+        
+        connection.commit()
+        logger.info(f"✓ Successfully inserted {len(inserted_ids)} client schedule records with preferences")
+        return len(inserted_ids)
         
     except Exception as e:
         connection.rollback()

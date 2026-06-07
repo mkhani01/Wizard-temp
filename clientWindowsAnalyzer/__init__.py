@@ -1,1 +1,1 @@
-# Client Windows Analyzer: updates client_availabilities start_time, end_time, minDuration from historical visit data
+# Client Windows Analyzer: updates client_schedule_preferences window_start, window_end, min_duration from historical visit data
