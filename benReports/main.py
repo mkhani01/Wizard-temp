@@ -95,7 +95,8 @@ def discover_table_names(conn):
     # Map logical names to actual table names
     table_mapping = {
         'client': ['client', 'Client'],
-        'client_availabilities': ['client_availabilities', 'client_availability', 'clientAvailabilities', 'ClientAvailabilities'],
+        'client_schedules': ['client_schedules', 'client_schedule', 'clientSchedules', 'ClientSchedules',
+                             'client_availabilities', 'client_availability', 'clientAvailabilities', 'ClientAvailabilities'],
     }
     
     for logical_name, possible_names in table_mapping.items():
@@ -182,18 +183,20 @@ def get_clients_from_db(conn) -> Dict[int, Dict]:
     return clients_dict, clients_by_name
 
 def get_client_availabilities(conn, client_id: int) -> List[Dict]:
-    """Fetch all availabilities for a specific client."""
+    """Fetch all schedules for a specific client."""
+    schedules_table = TABLE_NAMES.get('client_schedules') or TABLE_NAMES.get('client_availabilities')
     query = f"""
         SELECT 
-            id,
-            client_id,
-            days,
-            requested_start_time,
-            requested_end_time,
-            is_unavailability
-        FROM {TABLE_NAMES['client_availabilities']}
-        WHERE client_id = %s
-        AND deleted_at IS NULL
+            cs.id,
+            cs.client_id,
+            cs.days,
+            cs.requested_start_time,
+            cs.requested_end_time,
+            COALESCE(csp.is_unavailability, false) AS is_unavailability
+        FROM {schedules_table} cs
+        LEFT JOIN client_schedule_preferences csp ON csp.client_schedule_id = cs.id
+        WHERE cs.client_id = %s
+        AND cs.deleted_at IS NULL
     """
     
     with conn.cursor(cursor_factory=RealDictCursor) as cur:

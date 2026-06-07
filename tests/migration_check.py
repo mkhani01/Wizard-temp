@@ -566,10 +566,10 @@ def check_client_availability(connection) -> Tuple[bool, List[str]]:
     cursor = connection.cursor()
     try:
         cursor.execute("""
-            SELECT ca.client_id, ca.days, ca.requested_start_time, ca.requested_end_time,
-                   ca.start_date, ca.occurs_every, ca.duration
-            FROM client_availabilities ca
-            WHERE ca.deleted_at IS NULL
+            SELECT cs.client_id, cs.days, cs.requested_start_time, cs.requested_end_time,
+                   cs.start_date, cs.occurs_every, cs.requested_duration
+            FROM client_schedules cs
+            WHERE cs.deleted_at IS NULL
         """)
         db_rows = cursor.fetchall()
     finally:
@@ -587,7 +587,7 @@ def check_client_availability(connection) -> Tuple[bool, List[str]]:
             'end_time': str(row['requested_end_time']) if row['requested_end_time'] else '00:00:00',
             'start_date': row['start_date'],
             'occurs_every': row['occurs_every'] or 1,
-            'duration': row.get('duration')
+            'duration': row.get('requested_duration')
         })
 
     # Check each CSV occurrence

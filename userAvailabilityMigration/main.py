@@ -5,11 +5,13 @@ Migrates user availability data from Excel file to database.
 
 Rules:
 - "Core" records: Recurring availability (Start Date - 28 days, occurs_every=4).
+  Stored in user_availabilities; preferences row has is_temporary=False.
 - Other Types (found in seeded availability_types): Treated as availability or unavailability
   based on the type's classification in DB (search Type in availability_types).
+  Stored in user_availability_preferences:
   - is_unavailability = from type (availability vs unavailability)
-  - is_temp = True
-  - No recurrence: start_date/end_date/occurs_every = None
+  - is_temporary = True
+  - No recurrence on user_availabilities: start_date/end_date/occurs_every = None
   - effective_date_from = effective_date_to = that specific date only
   - Handles multi-day and overnight shifts by splitting into daily records.
 """
@@ -536,23 +538,33 @@ def deduplicate_availabilities(availabilities: List[Dict]) -> List[Dict]:
 
 
 def clear_user_availabilities(connection) -> None:
-    """Remove all existing rows from user_availabilities before seeding."""
+    """Remove all existing user availability data before seeding."""
     cursor = connection.cursor()
     try:
-        cursor.execute("DELETE FROM user_availabilities")
-        deleted = cursor.rowcount
+        # Clear join tables first (no FK cascade from preferences in all setups)
+        for table in (
+            "user_availability_preferences_preferred_clients",
+            "user_availability_preferences_must_clients",
+            "user_availability_preferences_only_clients",
+            "user_availability_preferences_disliked_clients",
+            "user_availability_roles",
+            "user_availability_exceptions",
+            "user_availability_preferences",
+            "user_availabilities",
+        ):
+            cursor.execute(f"DELETE FROM {table}")
+            logger.info("Cleared %s: %d row(s) removed", table, cursor.rowcount)
         connection.commit()
-        logger.info(f"Cleared user_availabilities: {deleted} existing row(s) removed")
     except Exception as e:
         connection.rollback()
-        logger.error(f"Failed to clear user_availabilities: {e}")
-        raise MigrationError(f"Failed to clear user_availabilities: {e}")
+        logger.error(f"Failed to clear user availability tables: {e}")
+        raise MigrationError(f"Failed to clear user availability tables: {e}")
     finally:
         cursor.close()
 
 
 def seed_availabilities(connection, availabilities: List[Dict]) -> int:
-    """Insert user availabilities into database"""
+    """Insert user availabilities and their preferences into database."""
     logger.info(f"\n{'='*60}")
     logger.info("SEEDING DATABASE")
     logger.info(f"{'='*60}")
@@ -565,18 +577,15 @@ def seed_availabilities(connection, availabilities: List[Dict]) -> int:
     
     cursor = connection.cursor()
     try:
-        # Check enum
         cursor.execute("SELECT typname FROM pg_type WHERE typname = 'user_availabilities_days_enum'")
         enum_exists = cursor.fetchone()
         array_cast = '::text[]::user_availabilities_days_enum[]' if enum_exists else '::text[]'
         
-        insert_query = f"""
+        availability_insert = f"""
             INSERT INTO user_availabilities (
-                user_id, days, start_time, end_time, 
-                is_temp, is_unavailability, type_id,
-                start_date, end_date, occurs_every, 
-                effective_date_from, effective_date_to,
-                note, created_date, last_modified_date
+                user_id, days, start_time, end_time,
+                start_date, end_date, occurs_every,
+                created_date, last_modified_date
             ) VALUES %s
             RETURNING id
         """
@@ -587,32 +596,68 @@ def seed_availabilities(connection, availabilities: List[Dict]) -> int:
                 avail['days'],
                 avail['start_time'],
                 avail['end_time'],
-                avail['is_temp'],
-                avail['is_unavailability'],
-                avail['type_id'],
                 avail['start_date'],
                 avail['end_date'],
                 avail['occurs_every'],
-                avail['effective_date_from'],
-                avail['effective_date_to'],
-                avail['note'],
             )
             for avail in availabilities
         ]
         
-        logger.info(f"Inserting {len(availability_tuples)} records...")
+        logger.info(f"Inserting {len(availability_tuples)} user_availabilities records...")
         
         execute_values(
             cursor,
-            insert_query,
+            availability_insert,
             availability_tuples,
-            template=f"(%s, %s{array_cast}, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())"
+            template=f"(%s, %s{array_cast}, %s, %s, %s, %s, %s, NOW(), NOW())",
+            fetch=True,
         )
         
-        inserted = cursor.fetchall()
+        inserted_ids = [row['id'] for row in cursor.fetchall()]
+        if len(inserted_ids) != len(availabilities):
+            raise MigrationError(
+                f"Expected {len(availabilities)} availability IDs, got {len(inserted_ids)}"
+            )
+        
+        preferences_insert = """
+            INSERT INTO user_availability_preferences (
+                user_availability_id, is_temporary,
+                effective_date_from, effective_date_to,
+                note, not_send_to_engine, is_unavailability, type_id,
+                created_date, last_modified_date
+            ) VALUES %s
+        """
+        
+        preferences_tuples = [
+            (
+                availability_id,
+                avail['is_temp'],
+                avail['effective_date_from'],
+                avail['effective_date_to'],
+                avail['note'],
+                False,
+                avail['is_unavailability'],
+                avail['type_id'],
+            )
+            for availability_id, avail in zip(inserted_ids, availabilities)
+        ]
+        
+        logger.info(f"Inserting {len(preferences_tuples)} user_availability_preferences records...")
+        
+        execute_values(
+            cursor,
+            preferences_insert,
+            preferences_tuples,
+            template="(%s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())",
+        )
+        
         connection.commit()
-        logger.info("SEEDED %d availability records (see Excel row ADDED/SKIPPED logs above for which rows produced them)", len(inserted))
-        return len(inserted)
+        logger.info(
+            "SEEDED %d availability records with preferences "
+            "(see Excel row ADDED/SKIPPED logs above for which rows produced them)",
+            len(inserted_ids),
+        )
+        return len(inserted_ids)
         
     except Exception as e:
         connection.rollback()

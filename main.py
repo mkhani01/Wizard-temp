@@ -42,8 +42,9 @@ def print_usage():
         userlocations        Update user lat/lng from JSON backup
         clientlocations      Update client lat/lng from JSON backup
         travel-distances     Compute user<->client distances via OSRM, upsert travel_distances, then verify
+        csv-distances [args] Geocode carer/customer CSVs and export OSRM walking/driving/cycling JSON
         feasible-pairs [path]   Seed feasible_pairs from visit data CSV (default: assets/visit_data.csv)
-        client-windows [path]   Update client_availabilities start/end/minDuration from visit CSV (default: assets/client_windows_data.csv)
+        client-windows [path]   Update client_schedule_preferences window_start/window_end/min_duration from visit CSV (default: assets/client_windows_data.csv)
         test                 Run pre-run checks and optional distance test (run before migrating)
         all                  Run all migrations (TODO)
     
@@ -139,6 +140,10 @@ def main():
         run_client_locations_migration()
     elif command == 'travel-distances':
         run_travel_distances_migration()
+    elif command == 'csv-distances':
+        from csv_distance_export.main import main as run_csv_distances
+        argv = sys.argv[2:] if len(sys.argv) > 2 else None
+        sys.exit(run_csv_distances(argv))
     elif command == 'feasible-pairs':
         csv_path = sys.argv[2] if len(sys.argv) > 2 else None
         from feasible_pairs_migration.feasible_pairs_migration import run as run_feasible_pairs

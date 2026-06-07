@@ -97,116 +97,8 @@ def connect_to_database(config):
         raise
 
 
-class GeocodeCache:
-    """Manages geocoding cache in .cache/geocode (under project/exe root so it works when frozen)."""
-    
-    def __init__(self, cache_dir=None):
-        if cache_dir is None:
-            from migration_support import get_project_root
-            cache_dir = get_project_root() / ".cache" / "geocode"
-        self.cache_dir = Path(cache_dir)
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        logger.info(f"Cache directory: {self.cache_dir.absolute()}")
-    
-    def _get_cache_key(self, postcode):
-        """Generate cache key from postcode"""
-        normalized = postcode.strip().upper().replace(' ', '')
-        return hashlib.md5(normalized.encode()).hexdigest()
-    
-    def get(self, postcode):
-        """Get cached geocoding result"""
-        cache_key = self._get_cache_key(postcode)
-        cache_file = self.cache_dir / f"{cache_key}.json"
-        
-        if cache_file.exists():
-            try:
-                with open(cache_file, 'r') as f:
-                    return json.load(f)
-            except Exception as e:
-                logger.warning(f"Failed to read cache for {postcode}: {e}")
-        
-        return None
-    
-    def set(self, postcode, geocode_data):
-        """Cache geocoding result"""
-        cache_key = self._get_cache_key(postcode)
-        cache_file = self.cache_dir / f"{cache_key}.json"
-        
-        try:
-            data = {
-                'postcode': postcode,
-                'full_response': geocode_data,
-                'timestamp': time.time()
-            }
-            with open(cache_file, 'w') as f:
-                json.dump(data, f, indent=2)
-        except Exception as e:
-            logger.warning(f"Failed to cache {postcode}: {e}")
+from geocodeCalculation.geocoder import GeocodeCache, GoogleGeocoder
 
-
-class GoogleGeocoder:
-    """Geocodes postcodes using Google Maps Geocoding API"""
-    
-    def __init__(self, api_key, cache):
-        self.api_key = api_key
-        self.cache = cache
-        self.request_count = 0
-        self.cache_hits = 0
-    
-    def geocode(self, postcode, country='IE'):
-        """Geocode a postcode (Ireland by default)"""
-        if not postcode or postcode.strip() == '':
-            return None
-
-        # Check cache first
-        cached = self.cache.get(postcode)
-        if cached:
-            self.cache_hits += 1
-            full_response = cached.get('full_response', {})
-            # Only use cache if it was successful
-            if full_response.get('status') == 'OK' and full_response.get('results'):
-                return full_response
-            # If cached response was an error, try again (don't return None)
-            elif full_response.get('status') in ['REQUEST_DENIED', 'INVALID_REQUEST', 'UNKNOWN_ERROR']:
-                logger.info(f"Cached error for {postcode}, retrying...")
-                # Continue to API call below instead of returning None
-            else:
-                return None
-
-        # Check for shutdown request
-        if shutdown_requested:
-            logger.warning(f"Shutdown requested, skipping geocoding for: {postcode}")
-            return None
-
-        # Make API request
-        try:
-            url = "https://maps.googleapis.com/maps/api/geocode/json"
-            params = {
-                'address': postcode,
-                'components': f'country:{country}',
-                'key': self.api_key
-            }
-            
-            response = requests.get(url, params=params, timeout=10)
-            response.raise_for_status()
-            
-            data = response.json()
-            self.request_count += 1
-            
-            # Only cache successful responses
-            if data['status'] == 'OK' and len(data['results']) > 0:
-                self.cache.set(postcode, data)
-                # Rate limiting
-                time.sleep(0.1)
-                return data
-            else:
-                # Don't cache errors - log and return None
-                logger.warning(f"Geocoding failed for {postcode}: {data.get('status')} - {data.get('error_message', 'No error message')}")
-                return None
-                
-        except Exception as e:
-            logger.error(f"Error geocoding {postcode}: {e}")
-            return None
 
 def load_irish_cities(ie_file_path):
     """Load Irish cities with population >= threshold from IE.txt"""
@@ -619,7 +511,7 @@ def run(connection_manager=None, state=None):
         logger.error("IE.txt not found: %s", ie_file)
         return False
     cache = GeocodeCache()
-    geocoder = GoogleGeocoder(google_api_key, cache)
+    geocoder = GoogleGeocoder(google_api_key, cache, shutdown_check=lambda: shutdown_requested)
     connection = None
     try:
         logger.info("\n" + "="*60)

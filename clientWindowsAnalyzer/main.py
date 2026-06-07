@@ -1,10 +1,10 @@
 """
 Client Windows Analyzer
-Updates existing client_availabilities records with optimized start_time, end_time, and minDuration
-computed from historical visit data (VisitExport-style CSV).
+Updates existing client_schedule_preferences records with optimized window_start, window_end,
+and min_duration computed from historical visit data (VisitExport-style CSV).
 
 Matching Logic:
-For each client_availability record, finds all CSV visits that are "covered" by it using:
+For each client_schedule record, finds all CSV visits that are "covered" by it using:
 1. Client ID match
 2. Day of week match (CSV visit day must be in availability.days array)
 3. Time slot match (with 10-minute tolerance)
@@ -13,7 +13,7 @@ For each client_availability record, finds all CSV visits that are "covered" by 
 This ensures CSV visits are properly matched even if they occur on different dates within
 the same recurrence pattern (e.g., weekly or bi-weekly schedules).
 
-Important Rules - Records are SKIPPED and left with NULL start_time, end_time, and minDuration if:
+Important Rules - Records are SKIPPED and left with default window_start/window_end and NULL min_duration if:
 1. number_of_care_givers >= 2 (multiple caregivers needed simultaneously)
 2. Time slots overlap on the same day for the same client (detected by checking if two time ranges
    on shared days overlap)
@@ -183,8 +183,8 @@ def _times_overlap(start1_str: str, end1_str: str, start2_str: str, end2_str: st
     return start1 < end2 and start2 < end1
 
 
-def load_client_availabilities(connection) -> Tuple[List[Dict], Dict[int, str]]:
-    """Load existing client_availabilities: id, client_id, requested_start_time, requested_end_time, duration, number_of_care_givers.
+def load_client_schedules(connection) -> Tuple[List[Dict], Dict[int, str]]:
+    """Load existing client_schedules: id, client_id, requested_start_time, requested_end_time, requested_duration, number_of_care_givers.
     Skip records that have:
     1. number_of_care_givers >= 2 (multiple caregivers needed)
     2. Overlapping time slots on the same day for the same client
@@ -197,15 +197,15 @@ def load_client_availabilities(connection) -> Tuple[List[Dict], Dict[int, str]]:
     try:
         # Count total records
         cursor.execute("""
-            SELECT COUNT(*) as total FROM client_availabilities WHERE deleted_at IS NULL
+            SELECT COUNT(*) as total FROM client_schedules WHERE deleted_at IS NULL
         """)
         total_count = cursor.fetchone()["total"]
 
         # Load ALL records first to detect overlaps (now including start_date and occurs_every for matching)
         cursor.execute("""
             SELECT id, client_id, requested_start_time, requested_end_time,
-                   duration, number_of_care_givers, days, start_date, occurs_every
-            FROM client_availabilities
+                   requested_duration, number_of_care_givers, days, start_date, occurs_every
+            FROM client_schedules
             WHERE deleted_at IS NULL
         """)
         all_rows = cursor.fetchall()
@@ -232,7 +232,7 @@ def load_client_availabilities(connection) -> Tuple[List[Dict], Dict[int, str]]:
                 "client_id": r["client_id"],
                 "requested_start_time": rs,
                 "requested_end_time": re_,
-                "duration": r.get("duration"),
+                "requested_duration": r.get("requested_duration"),
                 "number_of_care_givers": r.get("number_of_care_givers", 1),
                 "days": days_list,
                 "start_date": r.get("start_date"),
@@ -304,12 +304,12 @@ def load_client_availabilities(connection) -> Tuple[List[Dict], Dict[int, str]]:
             if rec["number_of_care_givers"] <= 1:
                 out.append(rec)
 
-        logger.info(f"✓ Loaded {len(out)} client_availabilities records for analysis")
+        logger.info(f"✓ Loaded {len(out)} client_schedules records for analysis")
         if skipped_multiple > 0:
             logger.info(f"  Skipped {skipped_multiple} records with multiple caregivers (number_of_care_givers >= 2)")
         if skipped_overlap > 0:
             logger.info(f"  Skipped {skipped_overlap} records with overlapping time slots on the same day")
-        logger.info(f"  Total client_availabilities: {total_count}")
+        logger.info(f"  Total client_schedules: {total_count}")
 
         return out, skip_reasons
     finally:
@@ -1048,13 +1048,13 @@ def build_availability_lookup(availabilities: List[Dict]) -> Dict[Tuple[int, str
 
 def run(csv_path: Optional[str] = None, connection_manager=None, state=None) -> bool:
     """
-    Entry point: run 3-stage analysis on CSV, then UPDATE client_availabilities.
+    Entry point: run 3-stage analysis on CSV, then UPDATE client_schedule_preferences.
     connection_manager and state used from wizard for resume support.
     """
     print("""
     ╔════════════════════════════════════════════════════════════════╗
     ║   CLIENT WINDOWS ANALYZER                                      ║
-    ║   Updates start_time, end_time, minDuration from visit CSV     ║
+    ║   Updates window_start, window_end, min_duration from visit CSV ║
     ╚════════════════════════════════════════════════════════════════╝
     """)
     if state and state.is_completed("client_windows"):
@@ -1081,9 +1081,9 @@ def run(csv_path: Optional[str] = None, connection_manager=None, state=None) -> 
             connection = connect_to_database(config)
 
         clients_map = get_all_clients(connection)
-        avail_list, skip_reasons = load_client_availabilities(connection)
+        avail_list, skip_reasons = load_client_schedules(connection)
 
-        logger.info(f"  Loaded {len(avail_list)} client_availabilities records for analysis")
+        logger.info(f"  Loaded {len(avail_list)} client_schedules records for analysis")
         logger.info(f"  Loaded {len(clients_map)} clients from database")
 
         # Build reverse lookup: client_id -> list of availability records
@@ -1185,7 +1185,7 @@ def run(csv_path: Optional[str] = None, connection_manager=None, state=None) -> 
             requested_window = req_end_min - req_start_min
             min_duration = int(round(np.median(adjusted_durations)))
 
-            db_duration = avail.get("duration")
+            db_duration = avail.get("requested_duration")
             if db_duration is not None and not pd.isna(db_duration):
                 min_duration = min(min_duration, int(db_duration))
             min_duration = min(min_duration, requested_window)
@@ -1194,15 +1194,15 @@ def run(csv_path: Optional[str] = None, connection_manager=None, state=None) -> 
                 skip_reasons[avail_id] = "Scaled duration collapsed to 0; skipping update"
                 continue
 
-            start_time_str = _normalize_time_to_hhmmss(avail.get("requested_start_time"))
-            end_time_str = min_to_time_str(req_start_min + min_duration)
+            window_start_str = _normalize_time_to_hhmmss(avail.get("requested_start_time"))
+            window_end_str = min_to_time_str(req_start_min + min_duration)
 
             # Add to update batch
-            update_args.append((start_time_str, end_time_str, min_duration, avail_id))
+            update_args.append((window_start_str, window_end_str, min_duration, avail_id))
             updated_ids.add(avail_id)
             update_reasons[avail_id] = (
                 f"Successfully updated from {len(matching_visits)} matching CSV visits "
-                f"using scaled durations (start_time={start_time_str}, end_time={end_time_str}, minDuration={min_duration})"
+                f"using scaled durations (window_start={window_start_str}, window_end={window_end_str}, min_duration={min_duration})"
             )
             updated += 1
 
@@ -1213,9 +1213,9 @@ def run(csv_path: Optional[str] = None, connection_manager=None, state=None) -> 
             if update_args:
                 execute_batch(
                     cursor,
-                    """UPDATE client_availabilities
-                       SET start_time = %s, end_time = %s, "minDuration" = %s, last_modified_date = NOW()
-                       WHERE id = %s""",
+                    """UPDATE client_schedule_preferences
+                       SET window_start = %s, window_end = %s, min_duration = %s, last_modified_date = NOW()
+                       WHERE client_schedule_id = %s""",
                     update_args,
                     page_size=500,
                 )
@@ -1237,17 +1237,18 @@ def run(csv_path: Optional[str] = None, connection_manager=None, state=None) -> 
                 # This record was eligible for analysis but no pattern matched
                 skip_reasons[rec_id] = "No matching time slot pattern found in CSV analysis"
 
-        # Reload ALL client_availabilities from DB to get complete data for report
+        # Reload ALL client_schedules from DB to get complete data for report
         cursor = connection.cursor()
         try:
             cursor.execute("""
-                SELECT ca.id, ca.client_id, c.name as client_name, c.lastname as client_lastname,
-                       ca.requested_start_time, ca.requested_end_time, ca.days,
-                       ca.number_of_care_givers, ca.start_time, ca.end_time, ca."minDuration"
-                FROM client_availabilities ca
-                LEFT JOIN client c ON ca.client_id = c.id
-                WHERE ca.deleted_at IS NULL
-                ORDER BY c.lastname, c.name, ca.requested_start_time
+                SELECT cs.id, cs.client_id, c.name as client_name, c.lastname as client_lastname,
+                       cs.requested_start_time, cs.requested_end_time, cs.days,
+                       cs.number_of_care_givers, csp.window_start, csp.window_end, csp.min_duration
+                FROM client_schedules cs
+                LEFT JOIN client c ON cs.client_id = c.id
+                LEFT JOIN client_schedule_preferences csp ON csp.client_schedule_id = cs.id
+                WHERE cs.deleted_at IS NULL
+                ORDER BY c.lastname, c.name, cs.requested_start_time
             """)
             all_availabilities = cursor.fetchall()
         finally:
@@ -1258,9 +1259,9 @@ def run(csv_path: Optional[str] = None, connection_manager=None, state=None) -> 
         # ======================================================================
         logger.info("")
         logger.info("=" * 80)
-        logger.info("CLIENT AVAILABILITY DETAILED REPORT")
+        logger.info("CLIENT SCHEDULE DETAILED REPORT")
         logger.info("=" * 80)
-        logger.info("This report shows each client_availability record and why its fields")
+        logger.info("This report shows each client_schedule record and why its preference fields")
         logger.info("were filled (UPDATED) or not filled (SKIPPED).")
         logger.info("=" * 80)
         logger.info("")
@@ -1298,9 +1299,9 @@ def run(csv_path: Optional[str] = None, connection_manager=None, state=None) -> 
                 num_caregivers = rec.get("number_of_care_givers", 1)
 
                 # Get current values from DB
-                start_time = _normalize_time_to_hhmmss(rec["start_time"]) if rec["start_time"] else "NULL"
-                end_time = _normalize_time_to_hhmmss(rec["end_time"]) if rec["end_time"] else "NULL"
-                min_duration = rec["minDuration"] if rec["minDuration"] is not None else "NULL"
+                window_start = _normalize_time_to_hhmmss(rec["window_start"]) if rec["window_start"] else "NULL"
+                window_end = _normalize_time_to_hhmmss(rec["window_end"]) if rec["window_end"] else "NULL"
+                min_duration = rec["min_duration"] if rec["min_duration"] is not None else "NULL"
 
                 # Determine status and reason
                 if rec_id in updated_ids:
@@ -1310,13 +1311,13 @@ def run(csv_path: Optional[str] = None, connection_manager=None, state=None) -> 
                     status = "SKIPPED"
                     reason = skip_reasons.get(rec_id, "Not analyzed (unknown reason)")
 
-                logger.info(f"  Availability ID: {rec_id}")
+                logger.info(f"  Schedule ID: {rec_id}")
                 logger.info(f"    Requested Time:     {req_start} - {req_end}")
                 logger.info(f"    Days:               {days}")
                 logger.info(f"    Caregivers Needed:  {num_caregivers}")
-                logger.info(f"    start_time:         {start_time}")
-                logger.info(f"    end_time:           {end_time}")
-                logger.info(f"    minDuration:        {min_duration}")
+                logger.info(f"    window_start:       {window_start}")
+                logger.info(f"    window_end:         {window_end}")
+                logger.info(f"    min_duration:       {min_duration}")
                 logger.info(f"    Status:             {status}")
                 logger.info(f"    Reason:             {reason}")
                 logger.info("")
@@ -1326,7 +1327,7 @@ def run(csv_path: Optional[str] = None, connection_manager=None, state=None) -> 
         logger.info("=" * 60)
         logger.info("CLIENT WINDOWS ANALYZER SUMMARY")
         logger.info("=" * 60)
-        logger.info("  Total client_availabilities in database: %d", len(avail_list) + len(skip_reasons))
+        logger.info("  Total client_schedules in database: %d", len(avail_list) + len(skip_reasons))
         logger.info("  Analyzed (eligible for matching): %d", len(avail_list))
         logger.info("  Successfully updated: %d", updated)
         logger.info("  Skipped: %d", len(skip_reasons))
