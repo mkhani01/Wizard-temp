@@ -819,7 +819,7 @@ def seed_availabilities(connection, availabilities: List[Dict]) -> int:
         
         logger.info(f"Inserting {len(schedule_tuples)} client_schedules records...")
         
-        execute_values(
+        inserted_rows = execute_values(
             cursor,
             schedule_insert,
             schedule_tuples,
@@ -827,7 +827,7 @@ def seed_availabilities(connection, availabilities: List[Dict]) -> int:
             fetch=True,
         )
         
-        inserted_ids = [row['id'] for row in cursor.fetchall()]
+        inserted_ids = [row['id'] for row in inserted_rows]
         if len(inserted_ids) != len(availabilities):
             raise MigrationError(
                 f"Expected {len(availabilities)} schedule IDs, got {len(inserted_ids)}"
