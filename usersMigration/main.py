@@ -429,8 +429,7 @@ def seed_users(connection, users, state=None):
     cursor = connection.cursor()
     try:
         if state is None:
-            execute_values(cursor, insert_query, user_tuples, template=template, fetch=True)
-            processed = cursor.fetchall()
+            processed = execute_values(cursor, insert_query, user_tuples, template=template, fetch=True)
             if processed:
                 user_ids = [row['id'] for row in processed]
                 cursor.execute("DELETE FROM user_users_groups WHERE user_id = ANY(%s)", (user_ids,))
@@ -446,8 +445,7 @@ def seed_users(connection, users, state=None):
             batch = user_tuples[batch_start:batch_start + batch_size]
             batch_index = batch_start // batch_size
             try:
-                execute_values(cursor, insert_query, batch, template=template, fetch=True)
-                processed = cursor.fetchall()
+                processed = execute_values(cursor, insert_query, batch, template=template, fetch=True)
                 all_processed.extend(processed)
                 if processed:
                     user_ids = [row['id'] for row in processed]

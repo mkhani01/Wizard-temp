@@ -540,7 +540,6 @@ def extract_clients_from_csv(csv_path, lookups):
             race_sensitivity = False
             language_sensitivity = False
             continuity_required = False
-            only_preferred = False
             
             # Build client data
             client_data = {
@@ -580,7 +579,6 @@ def extract_clients_from_csv(csv_path, lookups):
                 'race_sensitivity': race_sensitivity,
                 'language_sensitivity': language_sensitivity,
                 'continuity_required': continuity_required,
-                'only_preferred': only_preferred,
                 'title_id': title_id,
                 'nationality_id': nationality_id,
                 'religion_id': religion_id,
@@ -673,14 +671,14 @@ def seed_clients(connection, clients, all_keys_in_csv=None):
                     access_details, consent_status, consent_date, consent_notes, status, gender,
                     service_priority, start_date, birth_date, address_lines, town, postcode,
                     disability, palliative_care, cognitive_status, incontinency, exercise_need, dysphagia_need,
-                    living_circumstances, race_sensitivity, language_sensitivity, continuity_required, only_preferred,
+                    living_circumstances, race_sensitivity, language_sensitivity, continuity_required,
                     title_id, nationality_id, religion_id, origin_id, area_id,
                     created_date, last_modified_date
                 ) VALUES %s
                 RETURNING id, name, lastname
             """
             
-            template = ", ".join(["%s"] * 44)
+            template = ", ".join(["%s"] * 43)
             
             client_tuples = [
                 (
@@ -720,7 +718,6 @@ def seed_clients(connection, clients, all_keys_in_csv=None):
                     client['race_sensitivity'],
                     client['language_sensitivity'],
                     client['continuity_required'],
-                    client['only_preferred'],
                     client['title_id'],
                     client['nationality_id'],
                     client['religion_id'],
@@ -783,7 +780,6 @@ def seed_clients(connection, clients, all_keys_in_csv=None):
                     race_sensitivity = %s,
                     language_sensitivity = %s,
                     continuity_required = %s,
-                    only_preferred = %s,
                     title_id = %s,
                     nationality_id = %s,
                     religion_id = %s,
@@ -828,7 +824,6 @@ def seed_clients(connection, clients, all_keys_in_csv=None):
                 client['race_sensitivity'],
                 client['language_sensitivity'],
                 client['continuity_required'],
-                client['only_preferred'],
                 client['title_id'],
                 client['nationality_id'],
                 client['religion_id'],
