@@ -836,6 +836,7 @@ def seed_availabilities(connection, availabilities: List[Dict]) -> int:
         preferences_insert = """
             INSERT INTO client_schedule_preferences (
                 client_schedule_id, window_start, window_end, min_duration,
+                suggested_duration,
                 is_temporary, effective_date_from, effective_date_to,
                 note, not_send_to_engine, is_unavailability, type_id,
                 created_date, last_modified_date
@@ -848,6 +849,7 @@ def seed_availabilities(connection, availabilities: List[Dict]) -> int:
                 avail['window_start'],
                 avail['window_end'],
                 avail['min_duration'],
+                None,
                 avail['is_temp'],
                 avail['effective_date_from'],
                 avail['effective_date_to'],
@@ -865,7 +867,7 @@ def seed_availabilities(connection, availabilities: List[Dict]) -> int:
             cursor,
             preferences_insert,
             preferences_tuples,
-            template="(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())",
+            template="(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())",
         )
         
         connection.commit()

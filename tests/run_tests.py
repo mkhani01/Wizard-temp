@@ -18,8 +18,11 @@ def main():
     if not run_pre_run_checks():
         return 1
     import unittest
-    analytics_suite = unittest.defaultTestLoader.loadTestsFromName("tests.test_analytics")
-    analytics_result = unittest.TextTestRunner(verbosity=1).run(analytics_suite)
+    loader = unittest.defaultTestLoader()
+    analytics_suite = loader.loadTestsFromName("tests.test_analytics")
+    travel_suite = loader.loadTestsFromName("tests.test_travel_limits")
+    combined = unittest.TestSuite([analytics_suite, travel_suite])
+    analytics_result = unittest.TextTestRunner(verbosity=1).run(combined)
     if not analytics_result.wasSuccessful():
         return 1
     print("Optional: distance test (requires caregivers.json / patient.json)")

@@ -86,6 +86,7 @@ OPT_GEOCODE_ALL_USERS = "geocode_all_users"
 OPT_CALCULATE_DISTANCES = "calculate_distances"
 OPT_FVISIT_HISTORY = "fvisit_history"
 OPT_CLIENT_WINDOWS = "client_windows"
+OPT_CARER_TRAVEL_LIMITS = "carer_travel_limits"
 
 # Options that require a file in step 4 (excluding geocode_api and calculate_distances)
 FILE_OPTIONS = [
@@ -98,6 +99,7 @@ FILE_OPTIONS = [
     OPT_GEOCODE_CAREGIVER_FILE,
     OPT_FVISIT_HISTORY,
     OPT_CLIENT_WINDOWS,
+    OPT_CARER_TRAVEL_LIMITS,
 ]
 # Geocode API needs IE.txt (and optional API key in env)
 GEOCODE_API_FILES = ["geocode_ie_txt", "geocode_api_key"]
@@ -113,6 +115,7 @@ OPT_FILE_TYPE = {
     OPT_GEOCODE_CAREGIVER_FILE: "file",
     OPT_FVISIT_HISTORY: "file",
     OPT_CLIENT_WINDOWS: "file",
+    OPT_CARER_TRAVEL_LIMITS: "file",
 }
 
 # Where to copy each option's file(s) (relative to ASSETS)
@@ -126,6 +129,7 @@ OPT_ASSET_PATH = {
     OPT_GEOCODE_CAREGIVER_FILE: "usersBackup.json",
     OPT_FVISIT_HISTORY: "visit_data.csv",
     OPT_CLIENT_WINDOWS: "client_windows_data.csv",
+    OPT_CARER_TRAVEL_LIMITS: "carer_travel_limits_data.csv",
 }
 
 AOS_URL = "https://aossystem.com/"
@@ -224,6 +228,7 @@ class MigrationWizard:
             OPT_GEOCODE_CLIENT_FILE, OPT_GEOCODE_CAREGIVER_FILE,
             OPT_GEOCODE_ALL_CLIENTS, OPT_GEOCODE_ALL_USERS,
             OPT_CALCULATE_DISTANCES, OPT_FVISIT_HISTORY, OPT_CLIENT_WINDOWS,
+            OPT_CARER_TRAVEL_LIMITS,
         ]}
         self.file_paths = {}  # option -> path string (file or folder)
         self.geocode_api_key = StringVar(value=os.getenv("GOOGLE_MAPS_API_KEY", ""))
@@ -457,8 +462,9 @@ class MigrationWizard:
             (OPT_GEOCODE_ALL_CLIENTS, "Geocode all Clients", "Re-geocode ALL clients with a postcode, including records that already have latitude/longitude. Use this to refresh all client coordinates from postcode before distance migration."),
             (OPT_GEOCODE_ALL_USERS, "Geocode all Users", "Re-geocode ALL users with a postcode, including records that already have latitude/longitude. Use this to refresh all user coordinates from postcode before distance migration."),
             (OPT_CALCULATE_DISTANCES, "Calculate distances", "Compute travel distances between caregivers and clients using OSRM. Reads user and client lat/long from the database, calls OSRM for each pair and travel method (driving, cycling, walking), then inserts or updates the travel_distances table. Runs a verification step when done. Requires network access to OSRM."),
-            (OPT_FVISIT_HISTORY, "Feasible pairs (visit history)", "Seed feasible_pairs with weighted caregiver–client pairs from VisitExport CSV (Personal Care, last 16 weeks, Actual Employee Name). You can use the same VisitExport file as Client windows."),
-            (OPT_CLIENT_WINDOWS, "Client windows analyzer", "Update client_schedule_preferences (window_start, window_end, min_duration) from full VisitExport history using the Patient_Analyzer pipeline. Requires Clients Availability. Same VisitExport file as Feasible pairs is fine."),
+            (OPT_FVISIT_HISTORY, "Feasible pairs (visit history)", "Seed feasible_pairs and client_preferred_users from VisitExport CSV (Personal Care, last 16 weeks, Actual Employee Name). You can use the same VisitExport file as Client windows."),
+            (OPT_CLIENT_WINDOWS, "Client windows analyzer", "Update client_schedule_preferences (window_start, window_end, suggested_duration, min_duration) from full VisitExport history using the Patient_Analyzer pipeline. Requires Clients Availability. Same VisitExport file as Feasible pairs is fine."),
+            (OPT_CARER_TRAVEL_LIMITS, "Carer travel limits (max distance)", "Set user.max_distance_km and max_p2p_distance_km from VisitExport daily routes and the travel_distances table. Requires Calculate distances first. Same VisitExport file as Feasible pairs is fine."),
         ]
         row = 0
         for key, title, hint in opts:
@@ -643,6 +649,7 @@ class MigrationWizard:
                 OPT_GEOCODE_CAREGIVER_FILE: "Caregiver geocode JSON:",
                 OPT_FVISIT_HISTORY: "Feasible pairs (visit data) CSV:",
                 OPT_CLIENT_WINDOWS: "Client windows analyzer CSV:",
+                OPT_CARER_TRAVEL_LIMITS: "Carer travel limits (VisitExport) CSV:",
             }.get(key, key)
             existing = self.file_paths.get(key)
             if hasattr(existing, "get"):
@@ -1440,14 +1447,17 @@ class MigrationWizard:
             if ie_src:
                 shutil.copy2(ie_src, ASSETS / "IE.txt")
 
-        # VisitExport can be the same file for feasible pairs and client windows
+        # VisitExport can be the same file for feasible pairs, client windows, and travel limits
         shared_visit_src = None
-        if self.check_vars[OPT_FVISIT_HISTORY].get():
-            fv = self.file_paths.get(OPT_FVISIT_HISTORY)
-            if fv and hasattr(fv, "get"):
-                p = fv.get().strip()
+        for shared_key in (OPT_FVISIT_HISTORY, OPT_CLIENT_WINDOWS, OPT_CARER_TRAVEL_LIMITS):
+            if not self.check_vars[shared_key].get():
+                continue
+            path_var = self.file_paths.get(shared_key)
+            if path_var and hasattr(path_var, "get"):
+                p = path_var.get().strip()
                 if p and Path(p).exists():
                     shared_visit_src = Path(p)
+                    break
 
         for key in FILE_OPTIONS:
             if not self.check_vars[key].get():
@@ -1458,7 +1468,7 @@ class MigrationWizard:
                 p = path_var.get().strip()
                 if p and Path(p).exists():
                     src = Path(p)
-            if src is None and key == OPT_CLIENT_WINDOWS and shared_visit_src is not None:
+            if src is None and key in (OPT_CLIENT_WINDOWS, OPT_CARER_TRAVEL_LIMITS) and shared_visit_src is not None:
                 src = shared_visit_src
             if src is None:
                 continue
@@ -1502,6 +1512,8 @@ class MigrationWizard:
             order.append(("Calculated Geocode (API)", self._run_geocode_api))
         if self.check_vars[OPT_CALCULATE_DISTANCES].get():
             order.append(("Calculate distances", self._run_travel_distances))
+        if self.check_vars[OPT_CARER_TRAVEL_LIMITS].get():
+            order.append(("Carer travel limits", self._run_carer_travel_limits))
         if self.check_vars[OPT_FVISIT_HISTORY].get():
             order.append(("Feasible pairs (visit history)", self._run_feasible_pairs))
         return order
@@ -1551,6 +1563,14 @@ class MigrationWizard:
         sys.path.insert(0, str(BUNDLE_ROOT))
         from distance_migration.travel_distances_migration import run
         return run(connection_manager=connection_manager, state=state)
+
+    def _run_carer_travel_limits(self, connection_manager=None, state=None):
+        sys.path.insert(0, str(BUNDLE_ROOT))
+        from carerTravelLimitsMigration.main import run as run_carer_travel_limits
+        csv_path = ASSETS / OPT_ASSET_PATH[OPT_CARER_TRAVEL_LIMITS]
+        if not csv_path.exists():
+            csv_path = ASSETS / "visit_data.csv"
+        return run_carer_travel_limits(csv_path=str(csv_path), connection_manager=connection_manager, state=state)
 
     def _run_feasible_pairs(self, connection_manager=None, state=None):
         sys.path.insert(0, str(BUNDLE_ROOT))

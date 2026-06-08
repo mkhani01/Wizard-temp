@@ -70,6 +70,7 @@ def check_migration_imports():
         ("areaMigration.main", "Area migration"),
         ("feasible_pairs_migration.feasible_pairs_migration", "Feasible pairs"),
         ("clientWindowsAnalyzer.main", "Client windows analyzer"),
+        ("carerTravelLimitsMigration.main", "Carer travel limits"),
         ("distance_migration.travel_distances_migration", "Travel distances"),
     ]
     failed = []
