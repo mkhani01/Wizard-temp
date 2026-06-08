@@ -457,8 +457,8 @@ class MigrationWizard:
             (OPT_GEOCODE_ALL_CLIENTS, "Geocode all Clients", "Re-geocode ALL clients with a postcode, including records that already have latitude/longitude. Use this to refresh all client coordinates from postcode before distance migration."),
             (OPT_GEOCODE_ALL_USERS, "Geocode all Users", "Re-geocode ALL users with a postcode, including records that already have latitude/longitude. Use this to refresh all user coordinates from postcode before distance migration."),
             (OPT_CALCULATE_DISTANCES, "Calculate distances", "Compute travel distances between caregivers and clients using OSRM. Reads user and client lat/long from the database, calls OSRM for each pair and travel method (driving, cycling, walking), then inserts or updates the travel_distances table. Runs a verification step when done. Requires network access to OSRM."),
-            (OPT_FVISIT_HISTORY, "Feasible pairs (visit history)", "Seed feasible_pairs from visit data CSV (Assignee = caregiver, Customer = client). Pick a CSV with columns Assignee and Customer in the next step."),
-            (OPT_CLIENT_WINDOWS, "Client windows analyzer", "Update existing client availability records with optimized start/end windows and minDuration from historical visit data (VisitExport-style CSV). Requires Clients Availability. Pick the visit export CSV in the next step."),
+            (OPT_FVISIT_HISTORY, "Feasible pairs (visit history)", "Seed feasible_pairs with weighted caregiver–client pairs from VisitExport CSV (Personal Care, last 16 weeks, Actual Employee Name). You can use the same VisitExport file as Client windows."),
+            (OPT_CLIENT_WINDOWS, "Client windows analyzer", "Update client_schedule_preferences (window_start, window_end, min_duration) from full VisitExport history using the Patient_Analyzer pipeline. Requires Clients Availability. Same VisitExport file as Feasible pairs is fine."),
         ]
         row = 0
         for key, title, hint in opts:
@@ -1440,14 +1440,27 @@ class MigrationWizard:
             if ie_src:
                 shutil.copy2(ie_src, ASSETS / "IE.txt")
 
+        # VisitExport can be the same file for feasible pairs and client windows
+        shared_visit_src = None
+        if self.check_vars[OPT_FVISIT_HISTORY].get():
+            fv = self.file_paths.get(OPT_FVISIT_HISTORY)
+            if fv and hasattr(fv, "get"):
+                p = fv.get().strip()
+                if p and Path(p).exists():
+                    shared_visit_src = Path(p)
+
         for key in FILE_OPTIONS:
             if not self.check_vars[key].get():
                 continue
             path_var = self.file_paths.get(key)
-            if not path_var or not hasattr(path_var, "get"):
-                continue
-            src = Path(path_var.get().strip())
-            if not src.exists():
+            src = None
+            if path_var and hasattr(path_var, "get"):
+                p = path_var.get().strip()
+                if p and Path(p).exists():
+                    src = Path(p)
+            if src is None and key == OPT_CLIENT_WINDOWS and shared_visit_src is not None:
+                src = shared_visit_src
+            if src is None:
                 continue
             dest_rel = OPT_ASSET_PATH.get(key)
             if not dest_rel:

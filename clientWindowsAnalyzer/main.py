@@ -1,26 +1,14 @@
+from __future__ import annotations
+
 """
 Client Windows Analyzer
-Updates existing client_schedule_preferences records with optimized window_start, window_end,
-and min_duration computed from historical visit data (VisitExport-style CSV).
+Updates client_schedule_preferences (window_start, window_end, min_duration) from VisitExport CSV
+using the Patient_Analyzer + anomalies pipeline on all rows in the input file.
 
-Matching Logic:
-For each client_schedule record, finds all CSV visits that are "covered" by it using:
-1. Client ID match
-2. Day of week match (CSV visit day must be in availability.days array)
-3. Time slot match (with 10-minute tolerance)
-4. Date falls within recurrence pattern (using start_date and occurs_every)
+Pipeline: Stage 1 (load/dedupe) → 2 (percentile windows) → 3 (conflict resolution) →
+3.5 (duration anomaly removal) → 3.7 (10%% suggested duration).
 
-This ensures CSV visits are properly matched even if they occur on different dates within
-the same recurrence pattern (e.g., weekly or bi-weekly schedules).
-
-Important Rules - Records are SKIPPED and left with default window_start/window_end and NULL min_duration if:
-1. number_of_care_givers >= 2 (multiple caregivers needed simultaneously)
-2. Time slots overlap on the same day for the same client (detected by checking if two time ranges
-   on shared days overlap)
-3. No CSV visits match the availability pattern (day/time/recurrence mismatch)
-
-Only non-overlapping records with number_of_care_givers = 1 are analyzed and updated.
-minDuration is always clamped to not exceed the Service Requirement Duration.
+Skipped DB records: number_of_care_givers >= 2, overlapping slots on same day, no CSV pattern match.
 """
 
 import os
@@ -30,6 +18,7 @@ import logging
 from pathlib import Path
 from datetime import datetime, time
 from collections import defaultdict
+from itertools import groupby
 from typing import Optional, Dict, List, Tuple, Any
 
 try:
@@ -37,10 +26,12 @@ try:
     import numpy as np
     import psycopg2
     from psycopg2.extras import RealDictCursor, execute_batch
-except ImportError as e:
-    print("Missing required package: %s" % e)
-    print("Please install: pip install psycopg2-binary pandas numpy")
-    sys.exit(1)
+except ImportError:
+    pd = None  # type: ignore
+    np = None  # type: ignore
+    psycopg2 = None  # type: ignore
+    RealDictCursor = None  # type: ignore
+    execute_batch = None  # type: ignore
 
 try:
     from connection_manager import ConnectionLostError
@@ -519,12 +510,20 @@ def stage1_load_and_clean(csv_path: str) -> pd.DataFrame:
     # Fix encoding (e.g. O‚ÄôCeallaigh -> O'Ceallaigh) so matching to DB works
     df["Formatted_Name"] = df[col_loc].astype(str).apply(lambda x: fix_utf8_mojibake(x).strip())
 
-    # Keep latest per (patient, Service Requirement Start Date And Time) by Service Location Updated Date & Time desc
+    # Keep latest per (patient, Service Requirement Start) — Patient_Analyzer sort order
     col_req_start = "Service Requirement Start Date And Time"
     col_updated = "Service Location Updated Date & Time"
     if col_updated in df.columns:
-        df = df.sort_values(col_updated, ascending=False)
-    df = df.drop_duplicates(subset=[col_loc, col_req_start], keep="first")
+        before_upd = len(df)
+        df = df[df[col_updated].notna()]
+        dropped_upd = before_upd - len(df)
+        if dropped_upd:
+            logger.info(f"  Dropped {dropped_upd} rows missing Service Location Updated Date & Time")
+        df = df.sort_values(
+            by=["Formatted_Name", col_req_start, col_updated],
+            ascending=[True, True, False],
+        )
+    df = df.drop_duplicates(subset=["Formatted_Name", col_req_start], keep="first")
     logger.info(f"  After dedupe (latest per patient, req start): {len(df)} rows")
 
     # Day of week for Stage 3 (0=Monday, 6=Sunday - match Python weekday)
@@ -575,77 +574,7 @@ def stage1_load_and_clean(csv_path: str) -> pd.DataFrame:
         logger.warning(f"  Column '{col_act_dur}' not found; computing from Actual Start/End. Columns: {list(df.columns)[:15]}...")
 
     logger.info(f"  Stage 1 output: {len(df)} rows → {df['Formatted_Name'].nunique() if len(df) else 0} unique clients")
-    df = apply_productivity_scaling_algorithm(df)
     return df
-
-
-def apply_productivity_scaling_algorithm(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Apply duration scaling logic inspired by duration_reduction_visitexport.py:
-    per carer/day route, scale actual visit durations by:
-        scaling_factor = (shift_window - waiting_gaps) / total_reported_care
-    clamped to [0, 1].
-    Travel time is treated as 0 here because this migration does not load distance matrices.
-    """
-    col_carer = "Actual Employee Name"
-    col_act_start = "Actual Start Date And Time"
-
-    out = df.copy()
-    out["Adjusted Duration Estimate"] = np.nan
-
-    if col_carer not in out.columns:
-        logger.warning("  Column '%s' not found; scaling durations without carer grouping.", col_carer)
-        out[col_carer] = "__UNKNOWN_CARER__"
-
-    out["_route_date"] = out[col_act_start].dt.date
-    groups = out.groupby([col_carer, "_route_date"], dropna=False)
-
-    scaled_routes = 0
-    for (_, _), grp in groups:
-        if grp.empty:
-            continue
-
-        grp_sorted = grp.sort_values(col_act_start)
-        total_waiting_gaps = 0
-        total_reported_care_time = 0
-        first_start = None
-        last_end = None
-        prev_end = None
-        calc_duration_by_idx: Dict[int, int] = {}
-
-        for idx, row in grp_sorted.iterrows():
-            start_min = int(row["Actual_start_min"])
-            end_min = int(row["Actual_end_min"])
-            if end_min < start_min:
-                end_min += 24 * 60
-
-            calc_duration = max(0, end_min - start_min)
-            calc_duration_by_idx[idx] = calc_duration
-            total_reported_care_time += calc_duration
-
-            if first_start is None:
-                first_start = start_min
-            last_end = end_min
-
-            if prev_end is not None:
-                gap = start_min - prev_end
-                if gap > 0:
-                    total_waiting_gaps += gap
-            prev_end = end_min
-
-        shift_window = (last_end - first_start) if first_start is not None and last_end is not None else 0
-        available_time = shift_window - total_waiting_gaps
-        scaling_factor = (available_time / total_reported_care_time) if total_reported_care_time > 0 else 1
-        scaling_factor = max(0, min(1, scaling_factor))
-
-        for idx, calc_duration in calc_duration_by_idx.items():
-            out.at[idx, "Adjusted Duration Estimate"] = int(round(calc_duration * scaling_factor))
-
-        scaled_routes += 1
-
-    out.drop(columns=["_route_date"], inplace=True)
-    logger.info("  Applied productivity scaling to %d carer/day routes", scaled_routes)
-    return out
 
 
 # ============================================================================
@@ -749,6 +678,88 @@ def _clamp_suggested_window_to_required(
     return lo, hi
 
 
+def _process_day_patterns(patterns: List[Dict]) -> List[Dict]:
+    """
+    Patient_Analyzer Stage 3 logic for one patient-day:
+    sub-group contiguous/concurrent visits, resolve inter-group overlaps, clamp to required bounds.
+    """
+    if not patterns:
+        return []
+    patterns = sorted(patterns, key=lambda p: p["req_start_min"])
+    if len(patterns) == 1:
+        p = patterns[0]
+        sugg_start, sugg_end = _clamp_suggested_window_to_required(
+            int(p["sugg_start_min"]), int(p["sugg_end_min"]),
+            int(p["req_start_min"]), int(p["req_end_min"]),
+        )
+        p = dict(p)
+        p["sugg_start_min"] = sugg_start
+        p["sugg_end_min"] = sugg_end
+        return [p]
+
+    patterns[0]["group_index"] = 0
+    group_index = 0
+    for i in range(1, len(patterns)):
+        prev_p, curr_p = patterns[i - 1], patterns[i]
+        if (
+            curr_p["req_start_min"] == prev_p["req_end_min"]
+            or curr_p["req_start_min"] == prev_p["req_start_min"]
+        ):
+            curr_p["group_index"] = prev_p["group_index"]
+        else:
+            group_index += 1
+            curr_p["group_index"] = group_index
+
+    adjusted: List[Dict] = []
+    for _, group_iter in groupby(patterns, key=lambda p: p["group_index"]):
+        group_patterns = list(group_iter)
+        group_sugg_start = min(int(p["sugg_start_min"]) for p in group_patterns)
+        group_sugg_end = max(int(p["sugg_end_min"]) for p in group_patterns)
+        is_concurrent = (
+            len(group_patterns) > 1
+            and len({p["req_start_min"] for p in group_patterns}) == 1
+        )
+
+        if is_concurrent:
+            for p in group_patterns:
+                adjusted.append({
+                    **p,
+                    "sugg_start_min": group_sugg_start,
+                    "sugg_end_min": group_sugg_end,
+                })
+        elif len(group_patterns) > 1:
+            current_start = group_sugg_start
+            for p in group_patterns:
+                req_dur = int(p.get("Service Requirement Duration") or (p["req_end_min"] - p["req_start_min"]))
+                adjusted.append({
+                    **p,
+                    "sugg_start_min": current_start,
+                    "sugg_end_min": current_start + req_dur,
+                })
+                current_start += req_dur
+        else:
+            adjusted.append(dict(group_patterns[0]))
+
+    for i in range(1, len(adjusted)):
+        prev_p, curr_p = adjusted[i - 1], adjusted[i]
+        if prev_p.get("group_index") == curr_p.get("group_index"):
+            continue
+        if prev_p["sugg_end_min"] > curr_p["sugg_start_min"]:
+            overlap = prev_p["sugg_end_min"] - curr_p["sugg_start_min"]
+            shift = (overlap / 2) + 5
+            prev_p["sugg_end_min"] -= shift
+            curr_p["sugg_start_min"] += shift
+
+    rows_out = []
+    for p in adjusted:
+        sugg_start, sugg_end = _clamp_suggested_window_to_required(
+            int(p["sugg_start_min"]), int(p["sugg_end_min"]),
+            int(p["req_start_min"]), int(p["req_end_min"]),
+        )
+        rows_out.append({**p, "sugg_start_min": sugg_start, "sugg_end_min": sugg_end})
+    return rows_out
+
+
 def stage3_context_aware_suggestion(stage2: pd.DataFrame) -> pd.DataFrame:
     """
     Per patient, per day of week: find all patterns, sort by required start.
@@ -758,22 +769,14 @@ def stage3_context_aware_suggestion(stage2: pd.DataFrame) -> pd.DataFrame:
     """
     logger.info("Stage 3: Context-Aware Suggestion Engine")
 
-    # Per (Formatted_Name, day_of_week) get list of patterns with req_start_min, req_end_min, sugg_start_min, sugg_end_min
+    stage2 = stage2.copy()
     stage2["req_start_min"] = stage2["req_start_hour"] * 60 + stage2["req_start_minute"]
     stage2["req_end_min"] = stage2["req_end_hour"] * 60 + stage2["req_end_minute"]
 
     rows_out = []
     for (name, day), grp in stage2.groupby(["Formatted_Name", "day_of_week"]):
-        patterns = grp.sort_values("req_start_min").to_dict("records")
-        if not patterns:
-            continue
-        # Single pattern: clamp and use
-        if len(patterns) == 1:
-            p = patterns[0]
-            sugg_start, sugg_end = _clamp_suggested_window_to_required(
-                int(p["sugg_start_min"]), int(p["sugg_end_min"]),
-                int(p["req_start_min"]), int(p["req_end_min"]),
-            )
+        patterns = grp.to_dict("records")
+        for p in _process_day_patterns(patterns):
             rows_out.append({
                 "Formatted_Name": name,
                 "day_of_week": day,
@@ -781,72 +784,8 @@ def stage3_context_aware_suggestion(stage2: pd.DataFrame) -> pd.DataFrame:
                 "req_start_minute": p["req_start_minute"],
                 "req_end_hour": p["req_end_hour"],
                 "req_end_minute": p["req_end_minute"],
-                "sugg_start_min": sugg_start,
-                "sugg_end_min": sugg_end,
-                "minDuration": p["minDuration"],
-                "Service Requirement Duration": p.get("Service Requirement Duration"),
-            })
-            continue
-        # Multiple: group into contiguous/concurrent and assign group_index
-        adjusted = []
-        group_idx = 0
-        i = 0
-        while i < len(patterns):
-            p = patterns[i]
-            s_start = p["sugg_start_min"]
-            s_end = p["sugg_end_min"]
-            # Look for concurrent (same req_start_min)
-            j = i + 1
-            while j < len(patterns) and patterns[j]["req_start_min"] == p["req_start_min"]:
-                j += 1
-            if j > i + 1:
-                # Concurrent: same wide window; all share group_index
-                group = patterns[i:j]
-                s_start = min(px["sugg_start_min"] for px in group)
-                s_end = max(px["sugg_end_min"] for px in group)
-                for px in group:
-                    adjusted.append({
-                        **px,
-                        "sugg_start_min": s_start,
-                        "sugg_end_min": s_end,
-                        "group_index": group_idx,
-                    })
-                group_idx += 1
-                i = j
-                continue
-            # Single pattern (or contiguous); own group
-            adjusted.append({**p, "group_index": group_idx})
-            group_idx += 1
-            i += 1
-        # Inter-group conflict: only between different group_index; pinch inward (prev end down, curr start up; curr end unchanged)
-        for k in range(len(adjusted)):
-            if k == 0:
-                continue
-            prev = adjusted[k - 1]
-            curr = adjusted[k]
-            if prev["group_index"] == curr["group_index"]:
-                continue
-            overlap = prev["sugg_end_min"] - curr["sugg_start_min"]
-            if overlap > 0:
-                shift = (overlap / 2) + 5
-                prev["sugg_end_min"] = prev["sugg_end_min"] - shift
-                curr["sugg_start_min"] = curr["sugg_start_min"] + shift
-                # curr["sugg_end_min"] stays unchanged
-        # Clamp each pattern to required boundaries before appending
-        for p in adjusted:
-            sugg_start, sugg_end = _clamp_suggested_window_to_required(
-                int(p["sugg_start_min"]), int(p["sugg_end_min"]),
-                int(p["req_start_min"]), int(p["req_end_min"]),
-            )
-            rows_out.append({
-                "Formatted_Name": name,
-                "day_of_week": day,
-                "req_start_hour": p["req_start_hour"],
-                "req_start_minute": p["req_start_minute"],
-                "req_end_hour": p["req_end_hour"],
-                "req_end_minute": p["req_end_minute"],
-                "sugg_start_min": sugg_start,
-                "sugg_end_min": sugg_end,
+                "sugg_start_min": p["sugg_start_min"],
+                "sugg_end_min": p["sugg_end_min"],
                 "minDuration": p["minDuration"],
                 "Service Requirement Duration": p.get("Service Requirement Duration"),
             })
@@ -949,6 +888,25 @@ def stage3_5_remove_anomalies(df: pd.DataFrame) -> pd.DataFrame:
 # STAGE 3.7 — Suggested Duration Refinement
 # ============================================================================
 
+def get_balanced_suggestion(required_dur: int, distribution_counts: Dict[int, int]) -> int:
+    """
+    anomalies.py Part 3: highest significant duration strictly below required_dur (10%% threshold).
+    distribution_counts maps duration minutes -> occurrence count.
+    """
+    if not distribution_counts or required_dur <= 0:
+        return required_dur
+
+    dist_data = {int(d): int(c) for d, c in distribution_counts.items() if int(d) <= required_dur}
+    if not dist_data:
+        return required_dur
+
+    total_records = sum(dist_data.values())
+    threshold = DURATION_SIGNIFICANCE_THRESHOLD * total_records
+    significant = [d for d, c in dist_data.items() if c >= threshold]
+    reductions = [d for d in significant if d < required_dur]
+    return max(reductions) if reductions else required_dur
+
+
 def stage3_7_refine_duration(pattern_df: pd.DataFrame, stage1_df: pd.DataFrame) -> pd.DataFrame:
     """
     For each pattern, use actual duration distribution from Stage 1. Build frequency map
@@ -991,23 +949,12 @@ def stage3_7_refine_duration(pattern_df: pd.DataFrame, stage1_df: pd.DataFrame) 
         if subset.empty:
             suggested.append(req_dur)
             continue
-        # Frequency map: duration -> count, only durations <= req_dur
         dur_counts: Dict[int, int] = defaultdict(int)
         for d in subset[col_act_dur].dropna():
             d = int(d)
             if d <= req_dur:
                 dur_counts[d] += 1
-        total = subset.shape[0]
-        if total == 0:
-            suggested.append(req_dur)
-            continue
-        threshold_count = max(1, int(round(total * DURATION_SIGNIFICANCE_THRESHOLD)))
-        significant = [d for d, cnt in dur_counts.items() if cnt >= threshold_count and d < req_dur]
-        if significant:
-            chosen = max(significant)
-            suggested.append(chosen)
-        else:
-            suggested.append(req_dur)
+        suggested.append(get_balanced_suggestion(req_dur, dur_counts))
 
     out = pattern_df.copy()
     out["suggested_duration"] = suggested
@@ -1035,15 +982,48 @@ def stage3_7_refine_duration(pattern_df: pd.DataFrame, stage1_df: pd.DataFrame) 
 # MATCH AND UPDATE
 # ============================================================================
 
-def build_availability_lookup(availabilities: List[Dict]) -> Dict[Tuple[int, str, str], List[Dict]]:
-    """Key: (client_id, requested_start_time, requested_end_time) -> list of records (same slot can exist per day)."""
-    lookup = {}
-    for a in availabilities:
-        key = (a["client_id"], a["requested_start_time"], a["requested_end_time"])
-        if key not in lookup:
-            lookup[key] = []
-        lookup[key].append(a)
+def build_client_id_to_name_key(clients_map: Dict[str, int]) -> Dict[int, str]:
+    """First name-key per client id (for pattern lookup)."""
+    out: Dict[int, str] = {}
+    for name_key, client_id in clients_map.items():
+        if client_id not in out:
+            out[client_id] = name_key
+    return out
+
+
+def build_pattern_lookup(patterns_df: pd.DataFrame) -> Dict[Tuple[str, str, str], Dict[str, Any]]:
+    """Key: (normalized_name, requested_start, requested_end) -> pattern row dict."""
+    lookup: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    for _, row in patterns_df.iterrows():
+        name_key = normalize_name_for_match(str(row.get("Formatted_Name", "")).strip())
+        rs = _normalize_time_to_hhmmss(row.get("requested_start_str", ""))
+        re_ = _normalize_time_to_hhmmss(row.get("requested_end_str", ""))
+        if not name_key or not rs or not re_:
+            continue
+        lookup[(name_key, rs, re_)] = row.to_dict()
     return lookup
+
+
+def run_analysis_pipeline(csv_path: str) -> pd.DataFrame:
+    """Run Stages 1–3.7; returns final pattern DataFrame (empty if no data)."""
+    df1 = stage1_load_and_clean(csv_path)
+    if df1.empty:
+        return pd.DataFrame()
+    stage2 = stage2_initial_pattern_intelligence(df1)
+    if stage2.empty:
+        return pd.DataFrame()
+    stage3 = stage3_context_aware_suggestion(stage2)
+    if stage3.empty:
+        return pd.DataFrame()
+    stage3_clean = stage3_5_remove_anomalies(stage3)
+    return stage3_7_refine_duration(stage3_clean, df1)
+
+
+def _require_runtime_deps():
+    if pd is None or np is None or psycopg2 is None:
+        raise MigrationError(
+            "Missing required packages. Install: pip install psycopg2-binary pandas numpy"
+        )
 
 
 def run(csv_path: Optional[str] = None, connection_manager=None, state=None) -> bool:
@@ -1051,6 +1031,7 @@ def run(csv_path: Optional[str] = None, connection_manager=None, state=None) -> 
     Entry point: run 3-stage analysis on CSV, then UPDATE client_schedule_preferences.
     connection_manager and state used from wizard for resume support.
     """
+    _require_runtime_deps()
     print("""
     ╔════════════════════════════════════════════════════════════════╗
     ║   CLIENT WINDOWS ANALYZER                                      ║
@@ -1065,15 +1046,14 @@ def run(csv_path: Optional[str] = None, connection_manager=None, state=None) -> 
         return False
     connection = None
     try:
-        # Load and clean CSV data
-        df1 = stage1_load_and_clean(csv_path)
-        if df1.empty:
-            logger.warning("No data after Stage 1; nothing to update.")
+        patterns = run_analysis_pipeline(csv_path)
+        if patterns.empty:
+            logger.warning("No patterns after analysis pipeline; nothing to update.")
             return True
 
-        logger.info(f"  Stage 1 complete: {len(df1)} CSV visit records loaded")
+        logger.info("  Analysis pipeline complete: %d slot patterns", len(patterns))
+        pattern_lookup = build_pattern_lookup(patterns)
 
-        # Connect to database
         config = get_db_config()
         if connection_manager:
             connection = connection_manager.get_connection()
@@ -1081,132 +1061,70 @@ def run(csv_path: Optional[str] = None, connection_manager=None, state=None) -> 
             connection = connect_to_database(config)
 
         clients_map = get_all_clients(connection)
+        client_id_to_name = build_client_id_to_name_key(clients_map)
         avail_list, skip_reasons = load_client_schedules(connection)
 
-        logger.info(f"  Loaded {len(avail_list)} client_schedules records for analysis")
-        logger.info(f"  Loaded {len(clients_map)} clients from database")
+        logger.info("  Loaded %d client_schedules records for analysis", len(avail_list))
+        logger.info("  Loaded %d clients from database", len(clients_map))
+        logger.info("  Pattern lookup entries: %d", len(pattern_lookup))
 
-        # Build reverse lookup: client_id -> list of availability records
-        client_avails = defaultdict(list)
-        for avail in avail_list:
-            client_avails[avail["client_id"]].append(avail)
-
-        # Build CSV lookup: client name -> list of visit records (with dates)
-        csv_by_client = defaultdict(list)
-        for _, row in df1.iterrows():
-            raw_name = (row.get("Formatted_Name") or "").strip()
-            name_key = normalize_name_for_match(raw_name) if raw_name else ""
-            if not name_key:
-                continue
-            client_id = clients_map.get(name_key)
-            if not client_id:
-                continue
-
-            # Extract visit information
-            visit_date = row.get("Service Requirement Start Date And Time")
-            if pd.isna(visit_date):
-                continue
-
-            visit_start_time = visit_date.strftime("%H:%M:%S")
-            visit_end_datetime = row.get("Service Requirement End Date And Time")
-            if pd.isna(visit_end_datetime):
-                continue
-            visit_end_time = visit_end_datetime.strftime("%H:%M:%S")
-
-            actual_start_min = row.get("Actual_start_min")
-            actual_end_min = row.get("Actual_end_min")
-            actual_duration = row.get("Actual Duration")
-            adjusted_duration = row.get("Adjusted Duration Estimate")
-
-            csv_by_client[client_id].append({
-                "date": visit_date,
-                "start_time": visit_start_time,
-                "end_time": visit_end_time,
-                "actual_start_min": actual_start_min,
-                "actual_end_min": actual_end_min,
-                "actual_duration": actual_duration,
-                "adjusted_duration": adjusted_duration,
-            })
-
-        logger.info(f"  CSV visits grouped by {len(csv_by_client)} clients")
-
-        # ======================================================================
-        # NEW MATCHING LOGIC: For each availability, find matching CSV visits
-        # ======================================================================
         updated = 0
         updated_ids = set()
-        update_reasons = {}
-        update_args = []
+        update_reasons: Dict[int, str] = {}
+        update_args: List[Tuple[str, str, int, int]] = []
 
         for avail in avail_list:
-            client_id = avail["client_id"]
             avail_id = avail["id"]
-
-            # Get all CSV visits for this client
-            visits = csv_by_client.get(client_id, [])
-            if not visits:
-                skip_reasons[avail_id] = "No CSV visits found for this client"
+            client_id = avail["client_id"]
+            name_key = client_id_to_name.get(client_id)
+            if not name_key:
+                skip_reasons[avail_id] = "Client not found in name lookup"
                 continue
 
-            # Find visits covered by this availability
-            matching_visits = []
-            for visit in visits:
-                if _occurrence_is_covered(
-                    visit["date"],
-                    visit["start_time"],
-                    visit["end_time"],
-                    avail
-                ):
-                    matching_visits.append(visit)
-
-            if not matching_visits:
-                skip_reasons[avail_id] = "No CSV visits match this availability pattern (day/time/recurrence)"
+            rs = _normalize_time_to_hhmmss(avail.get("requested_start_time"))
+            re_ = _normalize_time_to_hhmmss(avail.get("requested_end_time"))
+            pattern = pattern_lookup.get((name_key, rs, re_))
+            if pattern is None:
+                skip_reasons[avail_id] = "No CSV pattern for this client/time slot"
                 continue
 
-            # Apply productivity-scaled duration algorithm to derive minDuration and window.
-            # We intentionally keep DB duration/requested_start_time/requested_end_time untouched.
-            adjusted_durations = [
-                int(round(v["adjusted_duration"]))
-                for v in matching_visits
-                if not pd.isna(v.get("adjusted_duration"))
-            ]
-            if not adjusted_durations:
-                skip_reasons[avail_id] = (
-                    f"Found {len(matching_visits)} matching visits but no adjusted durations from scaling algorithm"
-                )
+            window_start_str = _normalize_time_to_hhmmss(pattern.get("start_time_str", ""))
+            window_end_str = _normalize_time_to_hhmmss(pattern.get("end_time_str", ""))
+            min_duration_val = pattern.get("minDuration")
+            if pd.isna(min_duration_val):
+                skip_reasons[avail_id] = "Pattern has no minDuration"
                 continue
 
-            req_start_min = _time_str_to_minutes(avail.get("requested_start_time"))
-            req_end_min = _time_str_to_minutes(avail.get("requested_end_time"))
+            min_duration = int(min_duration_val)
+            req_start_min = _time_str_to_minutes(rs)
+            req_end_min = _time_str_to_minutes(re_)
             if req_start_min is None or req_end_min is None or req_end_min <= req_start_min:
-                skip_reasons[avail_id] = "Invalid requested start/end time; cannot derive window"
+                skip_reasons[avail_id] = "Invalid requested start/end time on schedule record"
                 continue
-
-            requested_window = req_end_min - req_start_min
-            min_duration = int(round(np.median(adjusted_durations)))
 
             db_duration = avail.get("requested_duration")
             if db_duration is not None and not pd.isna(db_duration):
                 min_duration = min(min_duration, int(db_duration))
-            min_duration = min(min_duration, requested_window)
+            min_duration = min(min_duration, req_end_min - req_start_min)
 
+            win_start_min = _time_str_to_minutes(window_start_str)
+            win_end_min = _time_str_to_minutes(window_end_str)
+            if win_start_min is None or win_end_min is None or win_end_min <= win_start_min:
+                skip_reasons[avail_id] = "Invalid suggested window from analysis"
+                continue
             if min_duration <= 0:
-                skip_reasons[avail_id] = "Scaled duration collapsed to 0; skipping update"
+                skip_reasons[avail_id] = "Suggested duration is zero; skipping update"
                 continue
 
-            window_start_str = _normalize_time_to_hhmmss(avail.get("requested_start_time"))
-            window_end_str = min_to_time_str(req_start_min + min_duration)
-
-            # Add to update batch
             update_args.append((window_start_str, window_end_str, min_duration, avail_id))
             updated_ids.add(avail_id)
             update_reasons[avail_id] = (
-                f"Successfully updated from {len(matching_visits)} matching CSV visits "
-                f"using scaled durations (window_start={window_start_str}, window_end={window_end_str}, min_duration={min_duration})"
+                f"Patient_Analyzer pipeline "
+                f"(window_start={window_start_str}, window_end={window_end_str}, min_duration={min_duration})"
             )
             updated += 1
 
-        logger.info(f"  Matched {updated} availabilities to CSV visits")
+        logger.info("  Matched %d schedules to CSV patterns", updated)
 
         cursor = connection.cursor()
         try:
@@ -1341,12 +1259,10 @@ def run(csv_path: Optional[str] = None, connection_manager=None, state=None) -> 
                 reason_counts["Multiple caregivers required"] += 1
             elif "Overlapping time slots" in reason:
                 reason_counts["Overlapping time slots"] += 1
-            elif "No CSV visits found" in reason:
-                reason_counts["No CSV visits for client"] += 1
-            elif "No CSV visits match" in reason:
-                reason_counts["No matching visits (day/time/recurrence mismatch)"] += 1
-            elif "missing actual time data" in reason:
-                reason_counts["Missing actual time data in CSV"] += 1
+            elif "No CSV pattern" in reason:
+                reason_counts["No CSV pattern for time slot"] += 1
+            elif "not found in name lookup" in reason:
+                reason_counts["Client name not in lookup"] += 1
             else:
                 reason_counts["Other"] += 1
 
@@ -1355,11 +1271,8 @@ def run(csv_path: Optional[str] = None, connection_manager=None, state=None) -> 
 
         logger.info("")
         logger.info("  Matching logic:")
-        logger.info("    - CSV visits matched to availabilities using:")
-        logger.info("      1. Client ID")
-        logger.info("      2. Day of week (from availability.days array)")
-        logger.info("      3. Time slot (with 10-minute tolerance)")
-        logger.info("      4. Date falls within recurrence pattern (start_date + occurs_every)")
+        logger.info("    - Patient_Analyzer pipeline on full CSV history")
+        logger.info("    - DB match: client name + requested_start_time + requested_end_time")
         logger.info("")
         logger.info("  Records excluded from analysis:")
         logger.info("    - number_of_care_givers >= 2 (multiple caregivers needed)")
@@ -1370,6 +1283,7 @@ def run(csv_path: Optional[str] = None, connection_manager=None, state=None) -> 
         logger.info("=" * 60)
 
         if state:
+            state.update("client_windows", status="completed")
             state.clear_step("client_windows")
         return True
     except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:

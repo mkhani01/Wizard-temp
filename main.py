@@ -43,8 +43,8 @@ def print_usage():
         clientlocations      Update client lat/lng from JSON backup
         travel-distances     Compute user<->client distances via OSRM, upsert travel_distances, then verify
         csv-distances [args] Geocode carer/customer CSVs and export OSRM walking/driving/cycling JSON
-        feasible-pairs [path]   Seed feasible_pairs from visit data CSV (default: assets/visit_data.csv)
-        client-windows [path]   Update client_schedule_preferences window_start/window_end/min_duration from visit CSV (default: assets/client_windows_data.csv)
+        feasible-pairs [path]   Seed feasible_pairs (16-week VisitExport, Actual Employee Name; default: assets/visit_data.csv)
+        client-windows [path]   Patient_Analyzer windows from full VisitExport (default: assets/client_windows_data.csv)
         test                 Run pre-run checks and optional distance test (run before migrating)
         all                  Run all migrations (TODO)
     

@@ -10,11 +10,29 @@ import logging
 import math
 import sys
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import defaultdict
-import psycopg2
-from psycopg2.extras import RealDictCursor, execute_values
-from psycopg2 import OperationalError, InterfaceError
+
+ROSTER_WEEKS = 16
+ROSTER_WINDOW_DAYS = ROSTER_WEEKS * 7
+
+EXCLUDED_SERVICE_SUBSTRINGS = (
+    'break',
+    'travel time',
+    'traveltime',
+    'time journey',
+    'office time',
+)
+try:
+    import psycopg2
+    from psycopg2.extras import RealDictCursor, execute_values
+    from psycopg2 import OperationalError, InterfaceError
+except ImportError:
+    psycopg2 = None
+    RealDictCursor = None
+    execute_values = None
+    OperationalError = Exception
+    InterfaceError = Exception
 
 try:
     from connection_manager import ConnectionLostError
@@ -221,16 +239,48 @@ def load_clients_lookup(connection):
         cursor.close()
 
 
+def is_excluded_service_type(row):
+    """Exclude Break/Travel/Office rows per feasability.pdf."""
+    columns = [
+        'Service Requirement Service Type Description',
+        'Planned Service Type Description',
+        'Planned Service Requirement Type Description',
+    ]
+    for column in columns:
+        value = safe_strip(row.get(column, '')).lower()
+        if not value:
+            continue
+        normalized = value.replace(',', ' ')
+        for substring in EXCLUDED_SERVICE_SUBSTRINGS:
+            if substring in normalized:
+                return True
+    return False
+
+
 def is_personal_care_row(row):
     """
-    Check if the row represents a Personal Care service.
+    Check if the row represents a Personal Care service (VisitExport planned columns).
     Both 'Planned Service Type Description' AND 'Planned Service Requirement Type Description'
     must equal "Personal Care".
     """
     service_type = safe_strip(row.get('Planned Service Type Description', ''))
     requirement_type = safe_strip(row.get('Planned Service Requirement Type Description', ''))
-    
     return service_type == 'Personal Care' and requirement_type == 'Personal Care'
+
+
+def is_valid_feasibility_row(row):
+    """Personal Care visit with no excluded service type."""
+    if is_excluded_service_type(row):
+        return False
+    svc_req = safe_strip(row.get('Service Requirement Service Type Description', ''))
+    if svc_req:
+        return svc_req.lower() == 'personal care'
+    return is_personal_care_row(row)
+
+
+def get_actual_employee_name(row):
+    """Carer from Actual Employee Name (feasability.pdf)."""
+    return safe_strip(row.get('Actual Employee Name', ''))
 
 
 def parse_visit_datetime(row):
@@ -240,6 +290,7 @@ def parse_visit_datetime(row):
     """
     candidate_columns = [
         'Service Requirement Start Date And Time',
+        'Actual Start Date And Time',
         'Planned Service Requirement Start Date And Time',
         'Actual Service Start Date And Time',
     ]
@@ -341,17 +392,35 @@ def calculate_pair_weights(frequencies, pair_last_visit, customer_totals, datase
     return weights
 
 
+def find_roster_cutoff_date(csv_path):
+    """
+    Scan CSV for the latest valid visit date, then return cutoff for the last ROSTER_WEEKS.
+    Returns None if no valid dates found.
+    """
+    dataset_end = None
+    with open(csv_path, 'r', encoding='utf-8') as file:
+        reader = csv.DictReader(file)
+        for row in reader:
+            if not is_valid_feasibility_row(row):
+                continue
+            visit_start = parse_visit_datetime(row)
+            if visit_start and (dataset_end is None or visit_start > dataset_end):
+                dataset_end = visit_start
+    if dataset_end is None:
+        return None
+    return dataset_end - timedelta(days=ROSTER_WINDOW_DAYS)
+
+
 def extract_visit_frequencies_from_csv(csv_path, users_lookup, clients_lookup):
     """
     Extract visit frequencies from CSV file.
     
     For each row:
-    1. Filter: Only process rows where both "Planned Service Type Description" 
-       AND "Planned Service Requirement Type Description" equal "Personal Care"
-    2. Parse "Planned Employee Name" to find caregiver (User) - format: "lastname, firstname"
-    3. Parse "Service Location Name" to find client - format: "lastname, firstname"
-    4. Parse visit date/time to compute recency-based weight
-    5. Count occurrences of each (caregiver, client) pair and compute weight
+    1. Filter: Personal Care, excluding Break/Travel/Office service types
+    2. Limit to the last 16 weeks of data in the file
+    3. Parse "Actual Employee Name" for caregiver
+    4. Parse "Service Location Name" for client
+    5. Count (caregiver, client) pairs and compute normalized weight
 
     Returns:
       - frequencies: (caregiver_id, client_id) -> frequency
@@ -372,23 +441,26 @@ def extract_visit_frequencies_from_csv(csv_path, users_lookup, clients_lookup):
         'unmatched_clients': set(),
         'skipped_non_personal_care': 0,
         'skipped_invalid_datetime': 0,
+        'skipped_outside_roster_window': 0,
+        'skipped_missing_carer': 0,
     }
-    
-    logger.info(f"Reading CSV: {csv_path}")
-    logger.info("Processing visit data (this may take a while for large files)...")
-    logger.info("Filter: Only 'Personal Care' service types will be processed")
-    
-    # Process in batches to handle large files efficiently
+
+    cutoff_date = find_roster_cutoff_date(csv_path)
+    if cutoff_date is None:
+        logger.warning("No valid visit dates found in CSV; nothing to process.")
+        return {}, {}, stats
+
+    logger.info("Reading CSV: %s", csv_path)
+    logger.info(
+        "Processing visit data (Personal Care, last %d weeks from %s)...",
+        ROSTER_WEEKS,
+        cutoff_date.strftime('%d/%m/%Y'),
+    )
+
     batch_size = 10000
     processed = 0
-    
-    def get_employee_name(row):
-        """Get employee name from 'Planned Employee Name' column (format: lastname, firstname)"""
-        v = row.get('Planned Employee Name')
-        return safe_strip(v) if v else ''
-    
+
     def get_service_location_name(row):
-        """Get client name from 'Service Location Name' column (format: lastname, firstname)"""
         v = row.get('Service Location Name')
         return safe_strip(v) if v else ''
 
@@ -401,36 +473,28 @@ def extract_visit_frequencies_from_csv(csv_path, users_lookup, clients_lookup):
             stats['total_rows'] += 1
             processed += 1
 
-            # Filter: Only process Personal Care rows
-            if not is_personal_care_row(row):
+            if not is_valid_feasibility_row(row):
                 stats['skipped_non_personal_care'] += 1
-                logger.warning(
-                    "Row %d: SKIPPED - not Personal Care | Employee=%r, Location=%r, ServiceType=%r",
-                    row_num, row.get('Planned Employee Name'), row.get('Service Location Name'), row.get('Planned Service Type Description')
-                )
                 continue
 
             stats['personal_care_rows'] += 1
 
-            # Get employee name (caregiver) from "Planned Employee Name"
-            employee_name = get_employee_name(row)
-            # Get client name from "Service Location Name"
+            employee_name = get_actual_employee_name(row)
             service_location_name = get_service_location_name(row)
 
-            if not employee_name or not service_location_name:
-                logger.warning(
-                    "Row %d: SKIPPED - missing employee or client name | Employee=%r, Location=%r",
-                    row_num, employee_name, service_location_name
-                )
+            if not employee_name:
+                stats['skipped_missing_carer'] += 1
+                continue
+            if not service_location_name:
                 continue
 
             visit_start = parse_visit_datetime(row)
             if not visit_start:
                 stats['skipped_invalid_datetime'] += 1
-                logger.warning(
-                    "Row %d: SKIPPED - invalid visit datetime | Employee=%r, Location=%r",
-                    row_num, employee_name, service_location_name
-                )
+                continue
+
+            if visit_start < cutoff_date:
+                stats['skipped_outside_roster_window'] += 1
                 continue
 
             # Parse employee name into first name and last name
@@ -440,18 +504,10 @@ def extract_visit_frequencies_from_csv(csv_path, users_lookup, clients_lookup):
 
             if not employee_first or not employee_last:
                 stats['unmatched_caregivers'].add(employee_name)
-                logger.warning(
-                    "Row %d: SKIPPED - could not parse caregiver name | Employee=%r, Location=%r",
-                    row_num, employee_name, service_location_name
-                )
                 continue
 
             if not client_first or not client_last:
                 stats['unmatched_clients'].add(service_location_name)
-                logger.warning(
-                    "Row %d: SKIPPED - could not parse client name | Employee=%r, Location=%r",
-                    row_num, employee_name, service_location_name
-                )
                 continue
 
             # Look up caregiver in users table
@@ -480,19 +536,11 @@ def extract_visit_frequencies_from_csv(csv_path, users_lookup, clients_lookup):
                 if dataset_end is None or visit_start > dataset_end:
                     dataset_end = visit_start
                 stats['valid_rows'] += 1
-                logger.info(
-                    "Row %d: ADDED | caregiver=%r (id=%s), client=%r (id=%s), frequency=%d",
-                    row_num, employee_name, caregiver_id, service_location_name, client_id, frequencies[pair_key]
-                )
             else:
                 if not caregiver_id:
                     stats['unmatched_caregivers'].add(employee_name)
                 if not client_id:
                     stats['unmatched_clients'].add(service_location_name)
-                logger.warning(
-                    "Row %d: SKIPPED - unmatched | caregiver=%r (found=%s), client=%r (found=%s)",
-                    row_num, employee_name, caregiver_id is not None, service_location_name, client_id is not None
-                )
 
             # Log progress every batch
             if processed % batch_size == 0:
@@ -506,7 +554,9 @@ def extract_visit_frequencies_from_csv(csv_path, users_lookup, clients_lookup):
     
     logger.info(f"\nProcessing complete!")
     logger.info(f"  Total rows processed: {stats['total_rows']}")
-    logger.info(f"  Rows skipped (non-Personal Care): {stats['skipped_non_personal_care']}")
+    logger.info(f"  Rows skipped (non-Personal Care / excluded types): {stats['skipped_non_personal_care']}")
+    logger.info(f"  Rows skipped (outside {ROSTER_WEEKS}-week window): {stats['skipped_outside_roster_window']}")
+    logger.info(f"  Rows skipped (missing Actual Employee Name): {stats['skipped_missing_carer']}")
     logger.info(f"  Rows skipped (invalid datetime): {stats['skipped_invalid_datetime']}")
     logger.info(f"  Personal Care rows: {stats['personal_care_rows']}")
     logger.info(f"  Valid visit records: {stats['valid_rows']}")
@@ -587,6 +637,9 @@ def seed_feasible_pairs(connection, frequencies, weights):
 
 def run(csv_path=None, connection_manager=None, state=None):
     """Main execution function. connection_manager and state used from wizard for resume support."""
+    if psycopg2 is None:
+        logger.error("Missing psycopg2. Install: pip install psycopg2-binary")
+        return False
     print("""
     ╔══════════════════════════════════════════════════════════╗
     ║         Feasible Pairs Migration                         ║
@@ -658,7 +711,9 @@ def run(csv_path=None, connection_manager=None, state=None):
             print("="*60)
             print(f"\nSummary:")
             print(f"  - Total CSV rows processed: {stats['total_rows']}")
-            print(f"  - Rows skipped (non-Personal Care): {stats['skipped_non_personal_care']}")
+            print(f"  - Rows skipped (non-Personal Care / excluded): {stats['skipped_non_personal_care']}")
+            print(f"  - Rows skipped (outside {ROSTER_WEEKS}-week window): {stats['skipped_outside_roster_window']}")
+            print(f"  - Rows skipped (missing carer): {stats['skipped_missing_carer']}")
             print(f"  - Rows skipped (invalid datetime): {stats['skipped_invalid_datetime']}")
             print(f"  - Personal Care rows: {stats['personal_care_rows']}")
             print(f"  - Valid visit records: {stats['valid_rows']}")
