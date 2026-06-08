@@ -118,8 +118,9 @@ python main.py <command> [options]
 | `userlocations` | Update user lat/lng from JSON backup |
 | `clientlocations` | Update client lat/lng from JSON backup |
 | `travel-distances` | Compute user↔client distances via OSRM, upsert `travel_distances`, verify |
-| `feasible-pairs [path]` | Seed `feasible_pairs` with weighted caregiver–client pairs from VisitExport CSV (Personal Care, last 16 weeks, **Actual Employee Name**; default: `assets/visit_data.csv`). |
-| `client-windows [path]` | Patient_Analyzer pipeline on full VisitExport history → `client_schedule_preferences` window_start / window_end / min_duration (default: `assets/client_windows_data.csv`). |
+| `feasible-pairs [path]` | Seed `feasible_pairs` + `client_preferred_users` from VisitExport (Personal Care, last 16 weeks, **Actual Employee Name**; default: `assets/visit_data.csv`). |
+| `client-windows [path]` | Patient_Analyzer pipeline → `client_schedule_preferences` window_start / window_end / suggested_duration / min_duration (default: `assets/client_windows_data.csv`). |
+| `carer-travel-limits [path]` | Set `user.max_distance_km` / `max_p2p_distance_km` from VisitExport routes + `travel_distances` (default: `assets/visit_data.csv`; run after `travel-distances`). |
 | `test` | Run pre-run checks and optional distance test |
 
 ---

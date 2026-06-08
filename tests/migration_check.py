@@ -1348,17 +1348,87 @@ def check_feasible_pairs(connection) -> Tuple[bool, List[str]]:
     if passed:
         msgs.append("PASS: All %d expected pairs found in feasible_pairs table" % len(expected_pairs))
 
+    cursor = connection.cursor()
+    try:
+        cursor.execute("SELECT COUNT(*) AS total FROM client_preferred_users")
+        preferred_count = cursor.fetchone()["total"] or 0
+        msgs.append("  client_preferred_users rows: %d" % preferred_count)
+        if len(db_pairs) > 0 and preferred_count == 0:
+            msgs.append("WARN: feasible_pairs populated but client_preferred_users is empty")
+    finally:
+        cursor.close()
+
     return passed, msgs
 
 
 # ---------------------------------------------------------------------------
-# 9. Client Windows Check (placeholder)
+# 9. Client Windows Check
 # ---------------------------------------------------------------------------
 
 def check_client_windows(connection) -> Tuple[bool, List[str]]:
     msgs: List[str] = []
-    msgs.append("SKIP: Client windows check — no specific scenario defined yet")
-    return True, msgs
+    cursor = connection.cursor()
+    try:
+        cursor.execute("""
+            SELECT
+                COUNT(*) AS total,
+                COUNT(csp.suggested_duration) AS with_suggested,
+                COUNT(csp.min_duration) AS with_min_duration,
+                COUNT(CASE
+                    WHEN csp.window_start IS NOT NULL AND csp.window_end IS NOT NULL
+                    THEN 1 END) AS with_windows
+            FROM client_schedule_preferences csp
+            JOIN client_schedules cs ON cs.id = csp.client_schedule_id
+            WHERE cs.deleted_at IS NULL
+              AND COALESCE(csp.is_unavailability, false) = false
+              AND COALESCE(csp.not_send_to_engine, false) = false
+        """)
+        row = cursor.fetchone()
+        total = row["total"] or 0
+        with_suggested = row["with_suggested"] or 0
+        with_min = row["with_min_duration"] or 0
+        with_windows = row["with_windows"] or 0
+        msgs.append("Client schedule preferences: %d total (non-unavailability)" % total)
+        msgs.append("  With suggested_duration: %d" % with_suggested)
+        msgs.append("  With min_duration: %d" % with_min)
+        msgs.append("  With window_start/end: %d" % with_windows)
+        if total > 0 and with_suggested == 0:
+            msgs.append("WARN: No suggested_duration values populated — run Client windows analyzer?")
+        passed = total == 0 or with_suggested > 0 or with_windows > 0
+        if not passed:
+            msgs.append("FAIL: Expected some analyzed schedule preferences")
+        else:
+            msgs.append("PASS: Client windows analytics fields present or no schedules to analyze")
+        return passed, msgs
+    finally:
+        cursor.close()
+
+
+def check_carer_travel_limits(connection) -> Tuple[bool, List[str]]:
+    msgs: List[str] = []
+    cursor = connection.cursor()
+    try:
+        cursor.execute("""
+            SELECT COUNT(*) AS total
+            FROM "user"
+            WHERE deleted_at IS NULL AND is_caregiver = true
+              AND (max_distance_km IS NOT NULL OR max_p2p_distance_km IS NOT NULL)
+        """)
+        populated = cursor.fetchone()["total"] or 0
+        cursor.execute("""
+            SELECT COUNT(*) AS total
+            FROM "user"
+            WHERE deleted_at IS NULL AND is_caregiver = true
+        """)
+        caregivers = cursor.fetchone()["total"] or 0
+        msgs.append("Caregivers with travel limits: %d / %d" % (populated, caregivers))
+        if caregivers > 0 and populated == 0:
+            msgs.append("WARN: No max_distance_km / max_p2p_distance_km set — run Carer travel limits?")
+            return True, msgs
+        msgs.append("PASS: Travel limit fields populated or no caregivers")
+        return True, msgs
+    finally:
+        cursor.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1378,6 +1448,7 @@ CHECK_MAP = {
     "geocode_caregiver_file":  ("Geocode Caregiver File",  check_geocode),
     "fvisit_history":          ("Feasible Pairs",          check_feasible_pairs),
     "client_windows":          ("Client Windows",          check_client_windows),
+    "carer_travel_limits":     ("Carer Travel Limits",     check_carer_travel_limits),
 }
 
 

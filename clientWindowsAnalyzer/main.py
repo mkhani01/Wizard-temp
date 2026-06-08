@@ -192,12 +192,16 @@ def load_client_schedules(connection) -> Tuple[List[Dict], Dict[int, str]]:
         """)
         total_count = cursor.fetchone()["total"]
 
-        # Load ALL records first to detect overlaps (now including start_date and occurs_every for matching)
+        # Load ALL records first to detect overlaps (join preferences for unavailability filter)
         cursor.execute("""
-            SELECT id, client_id, requested_start_time, requested_end_time,
-                   requested_duration, number_of_care_givers, days, start_date, occurs_every
-            FROM client_schedules
-            WHERE deleted_at IS NULL
+            SELECT cs.id, cs.client_id, cs.requested_start_time, cs.requested_end_time,
+                   cs.requested_duration, cs.number_of_care_givers, cs.days, cs.start_date,
+                   cs.occurs_every,
+                   COALESCE(csp.is_unavailability, false) AS is_unavailability,
+                   COALESCE(csp.not_send_to_engine, false) AS not_send_to_engine
+            FROM client_schedules cs
+            LEFT JOIN client_schedule_preferences csp ON csp.client_schedule_id = cs.id
+            WHERE cs.deleted_at IS NULL
         """)
         all_rows = cursor.fetchall()
 
@@ -228,11 +232,14 @@ def load_client_schedules(connection) -> Tuple[List[Dict], Dict[int, str]]:
                 "days": days_list,
                 "start_date": r.get("start_date"),
                 "occurs_every": r.get("occurs_every", 1),
+                "is_unavailability": bool(r.get("is_unavailability")),
+                "not_send_to_engine": bool(r.get("not_send_to_engine")),
             })
 
         # Detect overlaps: for each client, check if any two time slots overlap on the same day
         overlapping_ids = set()
         multiple_caregiver_ids = set()
+        unavailability_ids = set()
         skip_reasons = {}  # Track reason for each skipped record
 
         # Group by client_id
@@ -279,10 +286,11 @@ def load_client_schedules(connection) -> Tuple[List[Dict], Dict[int, str]]:
                                 f"shared_days={shared_days}"
                             )
 
-        # Filter out records with multiple caregivers or overlaps
+        # Filter out records with multiple caregivers, overlaps, or unavailability
         out = []
         skipped_multiple = 0
         skipped_overlap = 0
+        skipped_unavailability = 0
 
         for rec in all_records:
             if rec["id"] in multiple_caregiver_ids:
@@ -291,7 +299,11 @@ def load_client_schedules(connection) -> Tuple[List[Dict], Dict[int, str]]:
             if rec["id"] in overlapping_ids:
                 skipped_overlap += 1
                 continue
-            # Only include if number_of_care_givers = 1 and no overlaps
+            if rec.get("is_unavailability") or rec.get("not_send_to_engine"):
+                unavailability_ids.add(rec["id"])
+                skip_reasons[rec["id"]] = "Unavailability or not_send_to_engine preference"
+                skipped_unavailability += 1
+                continue
             if rec["number_of_care_givers"] <= 1:
                 out.append(rec)
 
@@ -300,6 +312,8 @@ def load_client_schedules(connection) -> Tuple[List[Dict], Dict[int, str]]:
             logger.info(f"  Skipped {skipped_multiple} records with multiple caregivers (number_of_care_givers >= 2)")
         if skipped_overlap > 0:
             logger.info(f"  Skipped {skipped_overlap} records with overlapping time slots on the same day")
+        if skipped_unavailability > 0:
+            logger.info(f"  Skipped {skipped_unavailability} unavailability / not_send_to_engine records")
         logger.info(f"  Total client_schedules: {total_count}")
 
         return out, skip_reasons
@@ -888,6 +902,28 @@ def stage3_5_remove_anomalies(df: pd.DataFrame) -> pd.DataFrame:
 # STAGE 3.7 — Suggested Duration Refinement
 # ============================================================================
 
+def compute_min_duration_from_suggested(
+    requested_duration: int,
+    suggested_duration: int,
+    slot_width: Optional[int] = None,
+) -> int:
+    """
+    min_duration = 65% of suggested when requested != suggested, else 85%.
+    Clamped to [1, suggested, requested, slot_width].
+    """
+    if suggested_duration <= 0:
+        return 0
+    if requested_duration != suggested_duration:
+        min_dur = round(0.65 * suggested_duration)
+    else:
+        min_dur = round(0.85 * suggested_duration)
+    caps = [suggested_duration, requested_duration]
+    if slot_width is not None and slot_width > 0:
+        caps.append(slot_width)
+    min_dur = max(1, min(min_dur, *caps))
+    return int(min_dur)
+
+
 def get_balanced_suggestion(required_dur: int, distribution_counts: Dict[int, int]) -> int:
     """
     anomalies.py Part 3: highest significant duration strictly below required_dur (10%% threshold).
@@ -912,7 +948,6 @@ def stage3_7_refine_duration(pattern_df: pd.DataFrame, stage1_df: pd.DataFrame) 
     For each pattern, use actual duration distribution from Stage 1. Build frequency map
     for durations <= Service Requirement Duration; apply 10%% significance threshold;
     set suggested_duration to highest significant duration < required, else keep required.
-    Set minDuration = suggested_duration for DB update.
     """
     logger.info("Stage 3.7: Suggested Duration Refinement")
     col_req_start = "Service Requirement Start Date And Time"
@@ -958,23 +993,10 @@ def stage3_7_refine_duration(pattern_df: pd.DataFrame, stage1_df: pd.DataFrame) 
 
     out = pattern_df.copy()
     out["suggested_duration"] = suggested
-
-    # Ensure minDuration is not bigger than duration (Service Requirement Duration)
-    def clamp_min_duration(row):
-        min_dur = row["suggested_duration"]
-        req_dur = row.get(col_req_dur)
-        if pd.isna(min_dur) or pd.isna(req_dur):
-            return min_dur
-        min_dur = int(min_dur)
-        req_dur = int(req_dur)
-        if min_dur > req_dur:
-            logger.warning(f"  Clamping minDuration for {row.get('Formatted_Name')}: {min_dur} min > required {req_dur} min, setting to {req_dur}")
-            return req_dur
-        return min_dur
-
-    out["minDuration"] = out.apply(clamp_min_duration, axis=1)
-    logger.info("  Refined minDuration for %d patterns using %.0f%% significance threshold",
-                len(out), DURATION_SIGNIFICANCE_THRESHOLD * 100)
+    logger.info(
+        "  Refined suggested_duration for %d patterns using %.0f%% significance threshold",
+        len(out), DURATION_SIGNIFICANCE_THRESHOLD * 100,
+    )
     return out
 
 
@@ -1035,7 +1057,7 @@ def run(csv_path: Optional[str] = None, connection_manager=None, state=None) -> 
     print("""
     ╔════════════════════════════════════════════════════════════════╗
     ║   CLIENT WINDOWS ANALYZER                                      ║
-    ║   Updates window_start, window_end, min_duration from visit CSV ║
+    ║   Updates window_start, window_end, suggested/min_duration from CSV ║
     ╚════════════════════════════════════════════════════════════════╝
     """)
     if state and state.is_completed("client_windows"):
@@ -1071,7 +1093,7 @@ def run(csv_path: Optional[str] = None, connection_manager=None, state=None) -> 
         updated = 0
         updated_ids = set()
         update_reasons: Dict[int, str] = {}
-        update_args: List[Tuple[str, str, int, int]] = []
+        update_args: List[Tuple[str, str, int, int, int]] = []
 
         for avail in avail_list:
             avail_id = avail["id"]
@@ -1090,37 +1112,42 @@ def run(csv_path: Optional[str] = None, connection_manager=None, state=None) -> 
 
             window_start_str = _normalize_time_to_hhmmss(pattern.get("start_time_str", ""))
             window_end_str = _normalize_time_to_hhmmss(pattern.get("end_time_str", ""))
-            min_duration_val = pattern.get("minDuration")
-            if pd.isna(min_duration_val):
-                skip_reasons[avail_id] = "Pattern has no minDuration"
+            suggested_val = pattern.get("suggested_duration")
+            if pd.isna(suggested_val):
+                skip_reasons[avail_id] = "Pattern has no suggested_duration"
                 continue
 
-            min_duration = int(min_duration_val)
+            suggested_duration = int(suggested_val)
             req_start_min = _time_str_to_minutes(rs)
             req_end_min = _time_str_to_minutes(re_)
             if req_start_min is None or req_end_min is None or req_end_min <= req_start_min:
                 skip_reasons[avail_id] = "Invalid requested start/end time on schedule record"
                 continue
 
+            slot_width = req_end_min - req_start_min
             db_duration = avail.get("requested_duration")
-            if db_duration is not None and not pd.isna(db_duration):
-                min_duration = min(min_duration, int(db_duration))
-            min_duration = min(min_duration, req_end_min - req_start_min)
+            requested_duration = int(db_duration) if db_duration is not None and not pd.isna(db_duration) else suggested_duration
+            suggested_duration = min(suggested_duration, requested_duration, slot_width)
+
+            min_duration = compute_min_duration_from_suggested(
+                requested_duration, suggested_duration, slot_width,
+            )
 
             win_start_min = _time_str_to_minutes(window_start_str)
             win_end_min = _time_str_to_minutes(window_end_str)
             if win_start_min is None or win_end_min is None or win_end_min <= win_start_min:
                 skip_reasons[avail_id] = "Invalid suggested window from analysis"
                 continue
-            if min_duration <= 0:
-                skip_reasons[avail_id] = "Suggested duration is zero; skipping update"
+            if min_duration <= 0 or suggested_duration <= 0:
+                skip_reasons[avail_id] = "Suggested or min duration is zero; skipping update"
                 continue
 
-            update_args.append((window_start_str, window_end_str, min_duration, avail_id))
+            update_args.append((window_start_str, window_end_str, suggested_duration, min_duration, avail_id))
             updated_ids.add(avail_id)
             update_reasons[avail_id] = (
                 f"Patient_Analyzer pipeline "
-                f"(window_start={window_start_str}, window_end={window_end_str}, min_duration={min_duration})"
+                f"(window_start={window_start_str}, window_end={window_end_str}, "
+                f"suggested_duration={suggested_duration}, min_duration={min_duration})"
             )
             updated += 1
 
@@ -1132,7 +1159,9 @@ def run(csv_path: Optional[str] = None, connection_manager=None, state=None) -> 
                 execute_batch(
                     cursor,
                     """UPDATE client_schedule_preferences
-                       SET window_start = %s, window_end = %s, min_duration = %s, last_modified_date = NOW()
+                       SET window_start = %s, window_end = %s,
+                           suggested_duration = %s, min_duration = %s,
+                           last_modified_date = NOW()
                        WHERE client_schedule_id = %s""",
                     update_args,
                     page_size=500,

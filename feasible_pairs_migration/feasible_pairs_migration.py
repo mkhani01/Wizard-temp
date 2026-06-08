@@ -392,6 +392,29 @@ def calculate_pair_weights(frequencies, pair_last_visit, customer_totals, datase
     return weights
 
 
+def calculate_pair_statuses(frequencies, pair_last_visit, customer_totals, dataset_end):
+    """Return carer status per (caregiver_id, client_id) pair."""
+    statuses = {}
+    if not dataset_end:
+        return statuses
+
+    for pair_key, total_pair_visits in frequencies.items():
+        _, client_id = pair_key
+        total_cust_visits = customer_totals.get(client_id, 0)
+        if total_cust_visits <= 0:
+            continue
+
+        last_visit = pair_last_visit.get(pair_key)
+        days_since_last_visit = 999
+        if last_visit:
+            days_since_last_visit = max((dataset_end - last_visit).days, 0)
+
+        overall_pct = round((total_pair_visits / total_cust_visits) * 100, 1)
+        statuses[pair_key] = identify_carer_status(overall_pct, days_since_last_visit)
+
+    return statuses
+
+
 def find_roster_cutoff_date(csv_path):
     """
     Scan CSV for the latest valid visit date, then return cutoff for the last ROSTER_WEEKS.
@@ -425,6 +448,7 @@ def extract_visit_frequencies_from_csv(csv_path, users_lookup, clients_lookup):
     Returns:
       - frequencies: (caregiver_id, client_id) -> frequency
       - weights: (caregiver_id, client_id) -> weight (0..1, rounded to 4 decimals)
+      - statuses: (caregiver_id, client_id) -> carer status string
       - stats
     """
     frequencies = defaultdict(int)
@@ -448,7 +472,7 @@ def extract_visit_frequencies_from_csv(csv_path, users_lookup, clients_lookup):
     cutoff_date = find_roster_cutoff_date(csv_path)
     if cutoff_date is None:
         logger.warning("No valid visit dates found in CSV; nothing to process.")
-        return {}, {}, stats
+        return {}, {}, {}, stats
 
     logger.info("Reading CSV: %s", csv_path)
     logger.info(
@@ -550,7 +574,9 @@ def extract_visit_frequencies_from_csv(csv_path, users_lookup, clients_lookup):
     stats['matched_pairs'] = len(frequencies)
     stats['total_visits'] = sum(frequencies.values())
     weights = calculate_pair_weights(frequencies, pair_last_visit, customer_totals, dataset_end)
+    statuses = calculate_pair_statuses(frequencies, pair_last_visit, customer_totals, dataset_end)
     stats['weighted_pairs'] = len(weights)
+    stats['current_primary_pairs'] = sum(1 for s in statuses.values() if s == "Current Primary")
     
     logger.info(f"\nProcessing complete!")
     logger.info(f"  Total rows processed: {stats['total_rows']}")
@@ -576,7 +602,7 @@ def extract_visit_frequencies_from_csv(csv_path, users_lookup, clients_lookup):
         for name in list(stats['unmatched_clients'])[:10]:
             logger.info(f"  - {name}")
     
-    return frequencies, weights, stats
+    return frequencies, weights, statuses, stats
 
 
 def truncate_feasible_pairs(connection):
@@ -630,6 +656,42 @@ def seed_feasible_pairs(connection, frequencies, weights):
     except Exception as e:
         connection.rollback()
         logger.error(f"✗ Failed to seed feasible pairs: {e}")
+        raise
+    finally:
+        cursor.close()
+
+
+def refresh_client_preferred_users(connection, pair_statuses):
+    """
+    Full refresh of client_preferred_users for Current Primary caregiver-client pairs.
+    """
+    preferred = [
+        (client_id, caregiver_id)
+        for (caregiver_id, client_id), status in pair_statuses.items()
+        if status == "Current Primary"
+    ]
+
+    cursor = connection.cursor()
+    try:
+        logger.info("Refreshing client_preferred_users (DELETE + INSERT)...")
+        cursor.execute("DELETE FROM client_preferred_users")
+        if preferred:
+            insert_query = """
+                INSERT INTO client_preferred_users (client_id, user_id)
+                VALUES %s
+            """
+            execute_values(cursor, insert_query, preferred, template="(%s, %s)")
+        connection.commit()
+        logger.info("✓ client_preferred_users: %d preferred carer link(s)", len(preferred))
+        return True
+    except (OperationalError, InterfaceError) as e:
+        connection.rollback()
+        if ConnectionLostError:
+            raise ConnectionLostError("client_preferred_users", {}) from e
+        raise
+    except Exception as e:
+        connection.rollback()
+        logger.error("✗ Failed to refresh client_preferred_users: %s", e)
         raise
     finally:
         cursor.close()
@@ -690,7 +752,9 @@ def run(csv_path=None, connection_manager=None, state=None):
         logger.info("\n" + "="*60)
         logger.info("STEP 4: EXTRACT VISIT FREQUENCIES AND WEIGHTS FROM CSV")
         logger.info("="*60)
-        frequencies, weights, stats = extract_visit_frequencies_from_csv(csv_path, users_lookup, clients_lookup)
+        frequencies, weights, statuses, stats = extract_visit_frequencies_from_csv(
+            csv_path, users_lookup, clients_lookup,
+        )
         if not frequencies:
             logger.warning("No valid visit frequencies found in CSV")
             return False
@@ -703,6 +767,10 @@ def run(csv_path=None, connection_manager=None, state=None):
         logger.info("="*60)
         success = seed_feasible_pairs(connection, frequencies, weights)
         if success:
+            logger.info("\n" + "="*60)
+            logger.info("STEP 7: REFRESH CLIENT PREFERRED USERS")
+            logger.info("="*60)
+            refresh_client_preferred_users(connection, statuses)
             if state:
                 state.update("feasible_pairs", status="completed")
                 state.clear_step("feasible_pairs")
@@ -719,6 +787,7 @@ def run(csv_path=None, connection_manager=None, state=None):
             print(f"  - Valid visit records: {stats['valid_rows']}")
             print(f"  - Unique caregiver-client pairs: {stats['matched_pairs']}")
             print(f"  - Pairs with calculated weight: {stats['weighted_pairs']}")
+            print(f"  - Current Primary preferred pairs: {stats.get('current_primary_pairs', 0)}")
             print(f"  - Total visits recorded: {stats['total_visits']}")
             print(f"  - Unmatched caregivers: {len(stats['unmatched_caregivers'])}")
             print(f"  - Unmatched clients: {len(stats['unmatched_clients'])}")

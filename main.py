@@ -43,8 +43,9 @@ def print_usage():
         clientlocations      Update client lat/lng from JSON backup
         travel-distances     Compute user<->client distances via OSRM, upsert travel_distances, then verify
         csv-distances [args] Geocode carer/customer CSVs and export OSRM walking/driving/cycling JSON
-        feasible-pairs [path]   Seed feasible_pairs (16-week VisitExport, Actual Employee Name; default: assets/visit_data.csv)
+        feasible-pairs [path]   Seed feasible_pairs + client_preferred_users (16-week VisitExport; default: assets/visit_data.csv)
         client-windows [path]   Patient_Analyzer windows from full VisitExport (default: assets/client_windows_data.csv)
+        carer-travel-limits [path]   Set max_distance_km / max_p2p_distance_km from VisitExport routes (default: assets/visit_data.csv)
         test                 Run pre-run checks and optional distance test (run before migrating)
         all                  Run all migrations (TODO)
     
@@ -153,6 +154,11 @@ def main():
         csv_path = sys.argv[2] if len(sys.argv) > 2 else None
         from clientWindowsAnalyzer.main import run as run_client_windows
         success = run_client_windows(csv_path=csv_path)
+        sys.exit(0 if success else 1)
+    elif command == 'carer-travel-limits':
+        csv_path = sys.argv[2] if len(sys.argv) > 2 else None
+        from carerTravelLimitsMigration.main import run as run_carer_travel_limits
+        success = run_carer_travel_limits(csv_path=csv_path)
         sys.exit(0 if success else 1)
     elif command == 'test':
         sys.path.insert(0, str(Path(__file__).resolve().parent))
