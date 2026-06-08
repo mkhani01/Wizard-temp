@@ -17,6 +17,11 @@ from tests.test_before_run import run_all as run_pre_run_checks
 def main():
     if not run_pre_run_checks():
         return 1
+    import unittest
+    analytics_suite = unittest.defaultTestLoader.loadTestsFromName("tests.test_analytics")
+    analytics_result = unittest.TextTestRunner(verbosity=1).run(analytics_suite)
+    if not analytics_result.wasSuccessful():
+        return 1
     print("Optional: distance test (requires caregivers.json / patient.json)")
     from tests.test_distance import test_small_example
     result = test_small_example()

@@ -118,7 +118,8 @@ python main.py <command> [options]
 | `userlocations` | Update user lat/lng from JSON backup |
 | `clientlocations` | Update client lat/lng from JSON backup |
 | `travel-distances` | Compute user↔client distances via OSRM, upsert `travel_distances`, verify |
-| `feasible-pairs [path]` | Seed feasible_pairs from visit data CSV (default: `assets/visit_data.csv`). Supports columns **Assignee** / **Customer** or **VisitExport** style: **Customer Name**, **Actual Employee Name** / **Planned Employee Name** (e.g. from sheet "All Visit Details" exported to CSV). |
+| `feasible-pairs [path]` | Seed `feasible_pairs` with weighted caregiver–client pairs from VisitExport CSV (Personal Care, last 16 weeks, **Actual Employee Name**; default: `assets/visit_data.csv`). |
+| `client-windows [path]` | Patient_Analyzer pipeline on full VisitExport history → `client_schedule_preferences` window_start / window_end / min_duration (default: `assets/client_windows_data.csv`). |
 | `test` | Run pre-run checks and optional distance test |
 
 ---
