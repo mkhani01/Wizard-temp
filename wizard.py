@@ -494,7 +494,7 @@ class MigrationWizard:
         messagebox.showinfo(
             "Calculate distances",
             "This step loads all caregivers (users) and clients that have latitude/longitude from your database, "
-            "calls the OSRM service (e.g. https://osrm.caspianbmp.ie) to get driving, cycling, and walking distances and durations, "
+            "calls the OSRM service (e.g. https://osrm.aossystem.com) to get driving, cycling, and walking distances and durations, "
             "then inserts or updates the travel_distances table. A verification run checks that all expected distances were stored. "
             "Ensure the database has user and client locations filled (e.g. via Geocode or location file steps) and that the OSRM endpoint is reachable."
         )

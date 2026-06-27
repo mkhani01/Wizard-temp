@@ -63,6 +63,13 @@ COLUMN_NOTES = 11
 
 DAYS_OF_WEEK = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
 TITLES = ['Mr', 'Mrs', 'Miss', 'Ms', 'Dr', 'Prof', 'Mr.', 'Mrs.', 'Miss.', 'Ms.', 'Dr.', 'Prof.']
+IMPORTED_USERS_ROLE_NAME = "Imported users role"
+IMPORTED_USERS_ROLE_SLUG = "imported-users-role"
+IMPORTED_SERVICE_TYPE_NAMES = (
+    "Moving and Handling Assistance",
+    "Medication Observation",
+    "Personal Care",
+)
 
 
 class MigrationError(Exception):
@@ -164,6 +171,93 @@ def get_availability_types(connection) -> Dict[str, Dict]:
         return types_map
     finally:
         cursor.close()
+
+
+def get_imported_service_type_ids(cursor) -> List[int]:
+    """Create missing imported service types and return their active IDs."""
+    service_type_rows = [
+        (name, "default")
+        for name in IMPORTED_SERVICE_TYPE_NAMES
+    ]
+    execute_values(
+        cursor,
+        """
+        INSERT INTO service_type (
+            name, icon, "isFixedTime", "fixedDuration", "canDurationExtend",
+            "hasAlarmActivation", "hasDocumentAttachment", "isRepeatable",
+            "repeatFrequency", "customFrequencyDays", "minimumRepeat",
+            "maximumRepeat", "canOverlap", "maximumNumberOfStaff",
+            "canAutoGenerate", "isPreferenceConsidered", "hasGenderPreference",
+            "hasLanguagePreference", "hasProtectedCharacteristics", status,
+            created_date, last_modified_date
+        )
+        VALUES %s
+        ON CONFLICT (name) DO UPDATE SET
+            status = 'Active',
+            last_modified_date = NOW()
+        """,
+        service_type_rows,
+        template=(
+            "(%s, %s, false, 0, true, false, false, false, "
+            "'Daily', 0, 0, 0, false, 10, false, false, true, true, true, "
+            "'Active', NOW(), NOW())"
+        ),
+    )
+    cursor.execute(
+        """
+        SELECT id, name
+        FROM service_type
+        WHERE name = ANY(%s) AND status = 'Active'
+        """,
+        (list(IMPORTED_SERVICE_TYPE_NAMES),),
+    )
+    rows = cursor.fetchall()
+    ids_by_name = {row['name']: row['id'] for row in rows}
+    missing = [name for name in IMPORTED_SERVICE_TYPE_NAMES if name not in ids_by_name]
+    if missing:
+        raise MigrationError(
+            "Missing active service types required for imported users role: %s"
+            % ", ".join(missing)
+        )
+    return [ids_by_name[name] for name in IMPORTED_SERVICE_TYPE_NAMES]
+
+
+def ensure_imported_user_role(cursor) -> int:
+    """Create or reuse the imported users role and its providing service types."""
+    service_type_ids = get_imported_service_type_ids(cursor)
+    cursor.execute(
+        """
+        INSERT INTO role (name, slug, description, status, created_date, last_modified_date)
+        VALUES (%s, %s, %s, 'Active', NOW(), NOW())
+        ON CONFLICT (name) DO UPDATE SET
+            description = EXCLUDED.description,
+            status = 'Active',
+            last_modified_date = NOW()
+        RETURNING id
+        """,
+        (
+            IMPORTED_USERS_ROLE_NAME,
+            IMPORTED_USERS_ROLE_SLUG,
+            "Role assigned to users imported by the migration tool",
+        ),
+    )
+    role_id = cursor.fetchone()['id']
+    execute_values(
+        cursor,
+        """
+        INSERT INTO role_providing_service_types (role_id, service_type_id)
+        VALUES %s
+        ON CONFLICT DO NOTHING
+        """,
+        [(role_id, service_type_id) for service_type_id in service_type_ids],
+        template="(%s, %s)",
+    )
+    logger.info(
+        "✓ Ensured role %r with %d providing service type(s)",
+        IMPORTED_USERS_ROLE_NAME,
+        len(service_type_ids),
+    )
+    return role_id
 
 
 def strip_title(full_name: str) -> str:
@@ -547,6 +641,7 @@ def clear_user_availabilities(connection) -> None:
             "user_availability_preferences_must_clients",
             "user_availability_preferences_only_clients",
             "user_availability_preferences_disliked_clients",
+            "user_availability_preference_groups",
             "user_availability_roles",
             "user_availability_exceptions",
             "user_availability_preferences",
@@ -577,6 +672,7 @@ def seed_availabilities(connection, availabilities: List[Dict]) -> int:
     
     cursor = connection.cursor()
     try:
+        imported_role_id = ensure_imported_user_role(cursor)
         cursor.execute("SELECT typname FROM pg_type WHERE typname = 'user_availabilities_days_enum'")
         enum_exists = cursor.fetchone()
         array_cast = '::text[]::user_availabilities_days_enum[]' if enum_exists else '::text[]'
@@ -649,6 +745,26 @@ def seed_availabilities(connection, availabilities: List[Dict]) -> int:
             preferences_insert,
             preferences_tuples,
             template="(%s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())",
+        )
+
+        availability_role_links = [
+            (availability_id, imported_role_id)
+            for availability_id in inserted_ids
+        ]
+        logger.info(
+            "Linking %d user availability record(s) to role %r...",
+            len(availability_role_links),
+            IMPORTED_USERS_ROLE_NAME,
+        )
+        execute_values(
+            cursor,
+            """
+            INSERT INTO user_availability_roles (user_availability_id, role_id)
+            VALUES %s
+            ON CONFLICT DO NOTHING
+            """,
+            availability_role_links,
+            template="(%s, %s)",
         )
         
         connection.commit()
