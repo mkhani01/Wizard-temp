@@ -30,7 +30,7 @@ OSRM_CONFIG = {
     }
 }
 
-OSRM_BASE_URL = 'https://osrm.caspianbmp.ie'
+OSRM_BASE_URL = 'https://osrm.aossystem.com'
 
 
 def call_osrm_table_api(

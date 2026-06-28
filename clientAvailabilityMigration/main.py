@@ -56,6 +56,12 @@ DEFAULT_NUMBER_OF_CARE_GIVERS = 1
 DEFAULT_MIN_DURATION = None
 
 AVAILABILITY_TYPE_NAME = 'Core'
+IMPORTED_CLIENT_GROUP_NAME = "Imported clients client group"
+IMPORTED_SERVICE_TYPE_NAMES = (
+    "Moving and Handling Assistance",
+    "Medication Observation",
+    "Personal Care",
+)
 
 # ============================================================================
 # END CONFIGURATION
@@ -180,6 +186,91 @@ def get_availability_type(connection, type_name: str) -> Tuple[int, bool]:
         return type_id, is_unavailability
     finally:
         cursor.close()
+
+
+def get_imported_service_type_ids(cursor) -> List[int]:
+    """Create missing imported service types and return their active IDs."""
+    service_type_rows = [
+        (name, "default")
+        for name in IMPORTED_SERVICE_TYPE_NAMES
+    ]
+    execute_values(
+        cursor,
+        """
+        INSERT INTO service_type (
+            name, icon, "isFixedTime", "fixedDuration", "canDurationExtend",
+            "hasAlarmActivation", "hasDocumentAttachment", "isRepeatable",
+            "repeatFrequency", "customFrequencyDays", "minimumRepeat",
+            "maximumRepeat", "canOverlap", "maximumNumberOfStaff",
+            "canAutoGenerate", "isPreferenceConsidered", "hasGenderPreference",
+            "hasLanguagePreference", "hasProtectedCharacteristics", status,
+            created_date, last_modified_date
+        )
+        VALUES %s
+        ON CONFLICT (name) DO UPDATE SET
+            status = 'Active',
+            last_modified_date = NOW()
+        """,
+        service_type_rows,
+        template=(
+            "(%s, %s, false, 0, true, false, false, false, "
+            "'Daily', 0, 0, 0, false, 10, false, false, true, true, true, "
+            "'Active', NOW(), NOW())"
+        ),
+    )
+    cursor.execute(
+        """
+        SELECT id, name
+        FROM service_type
+        WHERE name = ANY(%s) AND status = 'Active'
+        """,
+        (list(IMPORTED_SERVICE_TYPE_NAMES),),
+    )
+    rows = cursor.fetchall()
+    ids_by_name = {row['name']: row['id'] for row in rows}
+    missing = [name for name in IMPORTED_SERVICE_TYPE_NAMES if name not in ids_by_name]
+    if missing:
+        raise MigrationError(
+            "Missing active service types required for imported client group: %s"
+            % ", ".join(missing)
+        )
+    return [ids_by_name[name] for name in IMPORTED_SERVICE_TYPE_NAMES]
+
+
+def ensure_imported_client_group(cursor) -> int:
+    """Create or reuse the imported clients group and its receiving service types."""
+    service_type_ids = get_imported_service_type_ids(cursor)
+    cursor.execute(
+        """
+        INSERT INTO clients_group (name, description, created_date, last_modified_date)
+        VALUES (%s, %s, NOW(), NOW())
+        ON CONFLICT (name) DO UPDATE SET
+            description = EXCLUDED.description,
+            last_modified_date = NOW()
+        RETURNING id
+        """,
+        (
+            IMPORTED_CLIENT_GROUP_NAME,
+            "Client group assigned to clients imported by the migration tool",
+        ),
+    )
+    group_id = cursor.fetchone()['id']
+    execute_values(
+        cursor,
+        """
+        INSERT INTO clients_group_receiving_service_types (clients_group_id, service_type_id)
+        VALUES %s
+        ON CONFLICT DO NOTHING
+        """,
+        [(group_id, service_type_id) for service_type_id in service_type_ids],
+        template="(%s, %s)",
+    )
+    logger.info(
+        "✓ Ensured client group %r with %d receiving service type(s)",
+        IMPORTED_CLIENT_GROUP_NAME,
+        len(service_type_ids),
+    )
+    return group_id
 
 
 def parse_datetime_value(datetime_val) -> Optional[datetime]:
@@ -759,6 +850,7 @@ def clear_client_schedules(connection) -> None:
             "client_schedule_preferences_must_users",
             "client_schedule_preferences_only_users",
             "client_schedule_preferences_disliked_users",
+            "client_schedule_preference_groups",
             "client_schedule_clients_groups",
             "client_schedule_exceptions",
             "client_schedule_preferences",
@@ -789,6 +881,7 @@ def seed_availabilities(connection, availabilities: List[Dict]) -> int:
     
     cursor = connection.cursor()
     try:
+        imported_group_id = ensure_imported_client_group(cursor)
         cursor.execute("SELECT typname FROM pg_type WHERE typname = 'client_schedules_days_enum'")
         enum_exists = cursor.fetchone()
         array_cast = '::text[]::client_schedules_days_enum[]' if enum_exists else '::text[]'
@@ -868,6 +961,26 @@ def seed_availabilities(connection, availabilities: List[Dict]) -> int:
             preferences_insert,
             preferences_tuples,
             template="(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())",
+        )
+
+        schedule_group_links = [
+            (schedule_id, imported_group_id)
+            for schedule_id in inserted_ids
+        ]
+        logger.info(
+            "Linking %d client schedule record(s) to group %r...",
+            len(schedule_group_links),
+            IMPORTED_CLIENT_GROUP_NAME,
+        )
+        execute_values(
+            cursor,
+            """
+            INSERT INTO client_schedule_clients_groups (client_schedule_id, clients_group_id)
+            VALUES %s
+            ON CONFLICT DO NOTHING
+            """,
+            schedule_group_links,
+            template="(%s, %s)",
         )
         
         connection.commit()

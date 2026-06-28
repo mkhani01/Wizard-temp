@@ -23,6 +23,13 @@ except ImportError:
 
 USER_BATCH_SIZE = 500
 KEEPALIVES = dict(keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=5)
+IMPORTED_USERS_ROLE_NAME = "Imported users role"
+IMPORTED_USERS_ROLE_SLUG = "imported-users-role"
+IMPORTED_SERVICE_TYPE_NAMES = (
+    "Moving and Handling Assistance",
+    "Medication Observation",
+    "Personal Care",
+)
 
 # Configure logging
 logging.basicConfig(
@@ -109,6 +116,94 @@ def get_lookup_tables(connection):
         
     finally:
         cursor.close()
+
+
+def get_imported_service_type_ids(cursor):
+    """Create missing imported service types and return their active IDs."""
+    service_type_rows = [
+        (name, "default")
+        for name in IMPORTED_SERVICE_TYPE_NAMES
+    ]
+    execute_values(
+        cursor,
+        """
+        INSERT INTO service_type (
+            name, icon, "isFixedTime", "fixedDuration", "canDurationExtend",
+            "hasAlarmActivation", "hasDocumentAttachment", "isRepeatable",
+            "repeatFrequency", "customFrequencyDays", "minimumRepeat",
+            "maximumRepeat", "canOverlap", "maximumNumberOfStaff",
+            "canAutoGenerate", "isPreferenceConsidered", "hasGenderPreference",
+            "hasLanguagePreference", "hasProtectedCharacteristics", status,
+            created_date, last_modified_date
+        )
+        VALUES %s
+        ON CONFLICT (name) DO UPDATE SET
+            status = 'Active',
+            last_modified_date = NOW()
+        """,
+        service_type_rows,
+        template=(
+            "(%s, %s, false, 0, true, false, false, false, "
+            "'Daily', 0, 0, 0, false, 10, false, false, true, true, true, "
+            "'Active', NOW(), NOW())"
+        ),
+    )
+    cursor.execute(
+        """
+        SELECT id, name
+        FROM service_type
+        WHERE name = ANY(%s) AND status = 'Active'
+        """,
+        (list(IMPORTED_SERVICE_TYPE_NAMES),),
+    )
+    rows = cursor.fetchall()
+    ids_by_name = {row['name']: row['id'] for row in rows}
+    missing = [name for name in IMPORTED_SERVICE_TYPE_NAMES if name not in ids_by_name]
+    if missing:
+        raise ValueError(
+            "Missing active service types required for imported users role: %s"
+            % ", ".join(missing)
+        )
+    return [ids_by_name[name] for name in IMPORTED_SERVICE_TYPE_NAMES]
+
+
+def ensure_imported_user_role(cursor):
+    """Create or reuse the imported users role and its providing service types."""
+    service_type_ids = get_imported_service_type_ids(cursor)
+    cursor.execute(
+        """
+        INSERT INTO role (name, slug, description, status, created_date, last_modified_date)
+        VALUES (%s, %s, %s, 'Active', NOW(), NOW())
+        ON CONFLICT (name) DO UPDATE SET
+            description = EXCLUDED.description,
+            status = 'Active',
+            last_modified_date = NOW()
+        RETURNING id
+        """,
+        (
+            IMPORTED_USERS_ROLE_NAME,
+            IMPORTED_USERS_ROLE_SLUG,
+            "Role assigned to users imported by the migration tool",
+        ),
+    )
+    role_id = cursor.fetchone()['id']
+    role_service_links = [(role_id, service_type_id) for service_type_id in service_type_ids]
+    execute_values(
+        cursor,
+        """
+        INSERT INTO role_providing_service_types (role_id, service_type_id)
+        VALUES %s
+        ON CONFLICT DO NOTHING
+        """,
+        role_service_links,
+        template="(%s, %s)",
+    )
+    logger.info(
+        "✓ Ensured role %r with %d providing service type(s)",
+        IMPORTED_USERS_ROLE_NAME,
+        len(service_type_ids),
+    )
+    return role_id
 
 
 def parse_date(date_str):
@@ -211,7 +306,7 @@ def extract_users_from_csv(csv_path, lookups):
     """Extract user data from CSV and map to database fields"""
     users = []
     used_emails = set()
-    stats = {"skipped_no_name": 0, "skipped_terminated": 0, "warn_no_phone": 0, "placeholder_email": 0}
+    stats = {"skipped_no_name": 0, "deactivated_terminated": 0, "warn_no_phone": 0, "placeholder_email": 0}
     
     logger.info("Reading CSV: %s", csv_path)
     
@@ -248,15 +343,14 @@ def extract_users_from_csv(csv_path, lookups):
                 )
                 continue
 
-            # Seed only when Termination Date is null/empty OR >= today (equal to today is seeded)
             termination_date = parse_date(clean_excel_value(row.get('Termination Date', '')))
+            status = 'Deactive' if termination_date is not None and termination_date < date.today() else 'Active'
             if termination_date is not None and termination_date < date.today():
-                stats["skipped_terminated"] += 1
+                stats["deactivated_terminated"] += 1
                 logger.info(
-                    "Row %d: SKIPPED - Termination Date %s is before today | name=%r, lastname=%r",
+                    "Row %d: TERMINATED - migrating as Deactive | Termination Date %s | name=%r, lastname=%r",
                     row_num, termination_date, first_name, last_name
                 )
-                continue
 
             # Email: use from CSV or unique placeholder when missing (fix encoding)
             email_raw = fix_utf8_mojibake(row.get('Email', '') or '').strip().lower()
@@ -343,7 +437,7 @@ def extract_users_from_csv(csv_path, lookups):
                 'county': row.get('County', '').strip() or None,
                 'postcode': row.get('Post Code', '').strip() or None,
                 'travel_method': travel_method,
-                'status': 'Active',  # Ignore CSV Status column; all seeded users are Active per termination-date filter
+                'status': status,
                 'title_id': title_id,
                 'nationality_id': nationality_id,
                 'religion_id': religion_id,
@@ -358,8 +452,8 @@ def extract_users_from_csv(csv_path, lookups):
             )
     
     logger.info(
-        "Extracted %d users from CSV. Skipped: %d (no name), %d (termination date before today). Placeholder email used: %d. Warnings (no phone): %d.",
-        len(users), stats["skipped_no_name"], stats["skipped_terminated"], stats["placeholder_email"], stats["warn_no_phone"]
+        "Extracted %d users from CSV. Skipped: %d (no name). Migrated as Deactive from termination date: %d. Placeholder email used: %d. Warnings (no phone): %d.",
+        len(users), stats["skipped_no_name"], stats["deactivated_terminated"], stats["placeholder_email"], stats["warn_no_phone"]
     )
     return users
 
@@ -428,12 +522,14 @@ def seed_users(connection, users, state=None):
 
     cursor = connection.cursor()
     try:
+        imported_role_id = ensure_imported_user_role(cursor)
         if state is None:
             processed = execute_values(cursor, insert_query, user_tuples, template=template, fetch=True)
             if processed:
                 user_ids = [row['id'] for row in processed]
                 cursor.execute("DELETE FROM user_users_groups WHERE user_id = ANY(%s)", (user_ids,))
                 link_users_to_groups(cursor, processed, users)
+                link_users_to_imported_role(cursor, user_ids, imported_role_id)
             connection.commit()
             logger.info("Successfully processed %d users (inserted/updated)", len(processed))
             return True
@@ -452,6 +548,7 @@ def seed_users(connection, users, state=None):
                     cursor.execute("DELETE FROM user_users_groups WHERE user_id = ANY(%s)", (user_ids,))
                     batch_users = users[batch_start:batch_start + len(batch)]
                     link_users_to_groups(cursor, processed, batch_users)
+                    link_users_to_imported_role(cursor, user_ids, imported_role_id)
                 connection.commit()
                 total_committed = batch_start + len(batch)
                 state.update("users_migration", status="in_progress", batch_index=batch_index + 1, rows_committed=total_committed)
@@ -512,6 +609,24 @@ def link_users_to_groups(cursor, inserted_users, original_users):
     )
     
     logger.info(f"✓ Linked {len(user_group_links)} user-group relationships")
+
+
+def link_users_to_imported_role(cursor, user_ids, role_id):
+    """Assign the imported role directly to each migrated user."""
+    user_role_links = [(user_id, role_id) for user_id in user_ids]
+    if not user_role_links:
+        return
+    execute_values(
+        cursor,
+        """
+        INSERT INTO user_roles (user_id, role_id)
+        VALUES %s
+        ON CONFLICT DO NOTHING
+        """,
+        user_role_links,
+        template="(%s, %s)",
+    )
+    logger.info("✓ Linked %d user-role relationships to %r", len(user_role_links), IMPORTED_USERS_ROLE_NAME)
 
 
 def run(connection_manager=None, state=None):

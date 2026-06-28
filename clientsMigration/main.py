@@ -21,6 +21,12 @@ except ImportError:
     ConnectionLostError = None
 
 KEEPALIVES = dict(keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=5)
+IMPORTED_CLIENT_GROUP_NAME = "Imported clients client group"
+IMPORTED_SERVICE_TYPE_NAMES = (
+    "Moving and Handling Assistance",
+    "Medication Observation",
+    "Personal Care",
+)
 
 # Configure logging
 logging.basicConfig(
@@ -116,6 +122,92 @@ def get_lookup_tables(connection):
         
     finally:
         cursor.close()
+
+
+def get_imported_service_type_ids(cursor):
+    """Create missing imported service types and return their active IDs."""
+    service_type_rows = [
+        (name, "default")
+        for name in IMPORTED_SERVICE_TYPE_NAMES
+    ]
+    execute_values(
+        cursor,
+        """
+        INSERT INTO service_type (
+            name, icon, "isFixedTime", "fixedDuration", "canDurationExtend",
+            "hasAlarmActivation", "hasDocumentAttachment", "isRepeatable",
+            "repeatFrequency", "customFrequencyDays", "minimumRepeat",
+            "maximumRepeat", "canOverlap", "maximumNumberOfStaff",
+            "canAutoGenerate", "isPreferenceConsidered", "hasGenderPreference",
+            "hasLanguagePreference", "hasProtectedCharacteristics", status,
+            created_date, last_modified_date
+        )
+        VALUES %s
+        ON CONFLICT (name) DO UPDATE SET
+            status = 'Active',
+            last_modified_date = NOW()
+        """,
+        service_type_rows,
+        template=(
+            "(%s, %s, false, 0, true, false, false, false, "
+            "'Daily', 0, 0, 0, false, 10, false, false, true, true, true, "
+            "'Active', NOW(), NOW())"
+        ),
+    )
+    cursor.execute(
+        """
+        SELECT id, name
+        FROM service_type
+        WHERE name = ANY(%s) AND status = 'Active'
+        """,
+        (list(IMPORTED_SERVICE_TYPE_NAMES),),
+    )
+    rows = cursor.fetchall()
+    ids_by_name = {row['name']: row['id'] for row in rows}
+    missing = [name for name in IMPORTED_SERVICE_TYPE_NAMES if name not in ids_by_name]
+    if missing:
+        raise ValueError(
+            "Missing active service types required for imported client group: %s"
+            % ", ".join(missing)
+        )
+    return [ids_by_name[name] for name in IMPORTED_SERVICE_TYPE_NAMES]
+
+
+def ensure_imported_client_group(cursor):
+    """Create or reuse the imported clients group and its receiving service types."""
+    service_type_ids = get_imported_service_type_ids(cursor)
+    cursor.execute(
+        """
+        INSERT INTO clients_group (name, description, created_date, last_modified_date)
+        VALUES (%s, %s, NOW(), NOW())
+        ON CONFLICT (name) DO UPDATE SET
+            description = EXCLUDED.description,
+            last_modified_date = NOW()
+        RETURNING id
+        """,
+        (
+            IMPORTED_CLIENT_GROUP_NAME,
+            "Client group assigned to clients imported by the migration tool",
+        ),
+    )
+    group_id = cursor.fetchone()['id']
+    group_service_links = [(group_id, service_type_id) for service_type_id in service_type_ids]
+    execute_values(
+        cursor,
+        """
+        INSERT INTO clients_group_receiving_service_types (clients_group_id, service_type_id)
+        VALUES %s
+        ON CONFLICT DO NOTHING
+        """,
+        group_service_links,
+        template="(%s, %s)",
+    )
+    logger.info(
+        "✓ Ensured client group %r with %d receiving service type(s)",
+        IMPORTED_CLIENT_GROUP_NAME,
+        len(service_type_ids),
+    )
+    return group_id
 
 
 def safe_strip(value):
@@ -283,12 +375,14 @@ def seed_client_groups_from_csv(connection, csv_path):
     for group in sorted(groups):
         logger.info(f"  - {group}")
     
-    if not groups:
-        logger.warning("No client groups found in CSV")
-        return
-    
     cursor = connection.cursor()
     try:
+        ensure_imported_client_group(cursor)
+        if not groups:
+            connection.commit()
+            logger.warning("No client groups found in CSV")
+            return
+
         # Check existing groups
         cursor.execute("SELECT id, name FROM clients_group")
         existing = {row['name']: row['id'] for row in cursor.fetchall()}
@@ -297,6 +391,7 @@ def seed_client_groups_from_csv(connection, csv_path):
         new_groups = groups - set(existing.keys())
         
         if not new_groups:
+            connection.commit()
             logger.info("✓ All client groups already exist")
             return
         
@@ -406,11 +501,7 @@ def seed_areas_from_csv(connection, csv_path):
 
 
 def extract_clients_from_csv(csv_path, lookups):
-    """Extract client data from CSV and map to database fields.
-    Returns (clients_to_seed, all_keys_in_csv). all_keys_in_csv includes every row
-    that has first+last name (even if skipped for termination) so we don't deactivate
-    clients who appear in the file but were skipped.
-    """
+    """Extract client data from CSV and map to database fields."""
     clients = []
     all_keys_in_csv = set()
 
@@ -497,21 +588,19 @@ def extract_clients_from_csv(csv_path, lookups):
             start_date = parse_date(safe_get('Start Date'))
             termination_date = parse_date(safe_get('Termination Date'))
 
-            # Seed only when Termination Date is null/empty OR >= today (equal to today is seeded)
-            if termination_date is not None and termination_date < date.today():
-                logger.info(
-                    "Row %d: SKIPPED - Termination Date %s is before today | name=%r, lastname=%r",
-                    row_num, termination_date, first_name, last_name
-                )
-                continue
-
             consent_date = parse_date(safe_get('Consent Date'))
             created_date = parse_datetime(safe_get('Service Location Created Date & Time'))
             updated_date = parse_datetime(safe_get('Service Location Updated Date & Time'))
             
-            # Map enums (status ignored: all seeded clients are Active per termination-date filter)
+            if termination_date is not None and termination_date < date.today():
+                logger.info(
+                    "Row %d: TERMINATED - migrating as Deactive | Termination Date %s | name=%r, lastname=%r",
+                    row_num, termination_date, first_name, last_name
+                )
+
+            # Map enums
             gender = map_gender(safe_get('Gender'))
-            status = 'Active'
+            status = 'Deactive' if termination_date is not None and termination_date < date.today() else 'Active'
             service_priority = map_service_priority(safe_get('Service Location Service Priority'))
             consent_status = map_consent_status(safe_get('Consent Status'))
             living_circumstances = map_living_circumstances(safe_get('ServiceLocationCustom_Living_Circumstances'))
@@ -597,10 +686,7 @@ def extract_clients_from_csv(csv_path, lookups):
 
 def seed_clients(connection, clients, all_keys_in_csv=None):
     """Insert or update clients using manual upsert.
-    Only clients with no termination date (or termination >= today) are in `clients`.
-    keys_in_file = keys of those clients only → we deactivate DB clients not in that set,
-    and we set Active for DB clients that are in that set.
-    all_keys_in_csv is ignored (kept for backward compatibility).
+    Terminated clients from the CSV are migrated with Deactive status.
     """
     if not clients:
         logger.warning("No clients extracted from CSV. Aborting sync to prevent database wipe.")
@@ -611,6 +697,7 @@ def seed_clients(connection, clients, all_keys_in_csv=None):
     
     cursor = connection.cursor()
     try:
+        imported_group_id = ensure_imported_client_group(cursor)
         # Load existing clients by (name, lastname). Use client-match normalization so
         # "Hawkshaw (DS)" and "Hawkshaw" match (trailing parentheticals stripped).
         # When multiple rows normalize to the same key, keep the highest id (most recent).
@@ -627,13 +714,12 @@ def seed_clients(connection, clients, all_keys_in_csv=None):
         to_insert = []
         to_update = []
         
-        # Keys that count as "in file" = only clients we're seeding (no termination date).
-        # So: terminated in CSV + match in DB → key not in keys_in_file → deactivate.
-        #     no termination + in DB → key in keys_in_file → keep/activate.
         keys_in_file = set()
+        status_by_key = {}
         for client in clients:
             key = f"{normalize_name_for_client_match(client['name'])}|{normalize_name_for_client_match(client['lastname'])}"
             keys_in_file.add(key)
+            status_by_key[key] = client['status']
         
         for client in clients:
             key = f"{normalize_name_for_client_match(client['name'])}|{normalize_name_for_client_match(client['lastname'])}"
@@ -742,7 +828,7 @@ def seed_clients(connection, clients, all_keys_in_csv=None):
                 logger.info("  SEEDED client INSERT id=%s name=%r lastname=%r", row['id'], row['name'], row['lastname'])
             logger.info("Inserted %d new clients", len(inserted))
 
-        # UPDATE existing clients (set status = Active so previously deactivated records are reactivated)
+        # UPDATE existing clients, preserving Active/Deactive from the CSV termination date.
         for client, client_id in to_update:
             update_query = """
                 UPDATE client SET
@@ -762,7 +848,7 @@ def seed_clients(connection, clients, all_keys_in_csv=None):
                     consent_status = %s,
                     consent_date = %s,
                     consent_notes = %s,
-                    status = 'Active',
+                    status = %s,
                     gender = %s,
                     service_priority = %s,
                     start_date = %s,
@@ -806,7 +892,7 @@ def seed_clients(connection, clients, all_keys_in_csv=None):
                 client['consent_status'],
                 client['consent_date'],
                 client['consent_notes'],
-                # status set to 'Active' in SQL so deactivated records are reactivated
+                client['status'],
                 client['gender'],
                 client['service_priority'],
                 client['start_date'],
@@ -851,9 +937,13 @@ def seed_clients(connection, clients, all_keys_in_csv=None):
             )
             logger.info(f"✓ Deactivated {len(to_deactivate_ids)} clients not present in file(s)")
         
-        # Activate all clients that appear in the CSV (key in keys_in_file), so previously
-        # deactivated or mismatched records become Active when we re-run migration.
-        to_activate_ids = [existing[k] for k in keys_in_file if k in existing]
+        # Activate only non-terminated clients that appear in the CSV. Terminated rows
+        # were already set to Deactive above and must not be reactivated here.
+        to_activate_ids = [
+            existing[k]
+            for k in keys_in_file
+            if k in existing and status_by_key.get(k) == 'Active'
+        ]
         if to_activate_ids:
             cursor.execute(
                 "UPDATE client SET status = 'Active', last_modified_date = NOW() WHERE id = ANY(%s)",
@@ -864,7 +954,7 @@ def seed_clients(connection, clients, all_keys_in_csv=None):
         # Link clients to groups (many-to-many)
         if processed:
             logger.info(f"\nLinking {len(processed)} clients to groups...")
-            link_clients_to_groups(cursor, processed, clients)
+            link_clients_to_groups(cursor, processed, clients, imported_group_id)
         
         connection.commit()
         
@@ -887,7 +977,7 @@ def seed_clients(connection, clients, all_keys_in_csv=None):
         cursor.close()
 
 
-def link_clients_to_groups(cursor, processed_clients, original_clients):
+def link_clients_to_groups(cursor, processed_clients, original_clients, imported_group_id=None):
     """Link clients to their groups via many-to-many relationship"""
     
     # Create name+lastname to client mapping (normalized for encoding-safe matching)
@@ -907,6 +997,8 @@ def link_clients_to_groups(cursor, processed_clients, original_clients):
         if original_client and original_client.get('group_id'):
             group_id = original_client['group_id']
             client_group_links.append((client_id, group_id))
+        if imported_group_id:
+            client_group_links.append((client_id, imported_group_id))
     
     if not client_group_links:
         logger.warning("No client-group links to create")
@@ -923,6 +1015,7 @@ def link_clients_to_groups(cursor, processed_clients, original_clients):
     insert_groups_query = """
         INSERT INTO client_clients_groups (client_id, group_id)
         VALUES %s
+        ON CONFLICT DO NOTHING
     """
     
     execute_values(
