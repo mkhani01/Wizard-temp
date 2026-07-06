@@ -661,40 +661,23 @@ def seed_feasible_pairs(connection, frequencies, weights):
         cursor.close()
 
 
-def refresh_client_preferred_users(connection, pair_statuses):
-    """
-    Full refresh of client_preferred_users for Current Primary caregiver-client pairs.
-    """
-    preferred = [
-        (client_id, caregiver_id)
-        for (caregiver_id, client_id), status in pair_statuses.items()
-        if status == "Current Primary"
-    ]
+def refresh_profile_preferences(connection, weights, statuses):
+    """Refresh Must/Preferred/Only on user and client profile join tables (two-way sync)."""
+    from feasible_pairs_migration.profile_preferences import refresh_all_profile_preferences
 
-    cursor = connection.cursor()
+    client_durations = None
     try:
-        logger.info("Refreshing client_preferred_users (DELETE + INSERT)...")
-        cursor.execute("DELETE FROM client_preferred_users")
-        if preferred:
-            insert_query = """
-                INSERT INTO client_preferred_users (client_id, user_id)
-                VALUES %s
-            """
-            execute_values(cursor, insert_query, preferred, template="(%s, %s)")
-        connection.commit()
-        logger.info("✓ client_preferred_users: %d preferred carer link(s)", len(preferred))
-        return True
-    except (OperationalError, InterfaceError) as e:
-        connection.rollback()
-        if ConnectionLostError:
-            raise ConnectionLostError("client_preferred_users", {}) from e
-        raise
+        from feasible_pairs_migration.profile_preferences import load_client_durations
+        client_durations = load_client_durations(connection)
     except Exception as e:
-        connection.rollback()
-        logger.error("✗ Failed to refresh client_preferred_users: %s", e)
-        raise
-    finally:
-        cursor.close()
+        logger.warning("Could not load client durations: %s", e)
+
+    return refresh_all_profile_preferences(
+        connection,
+        weights=weights,
+        statuses=statuses,
+        client_durations=client_durations,
+    )
 
 
 def run(csv_path=None, connection_manager=None, state=None):
@@ -768,9 +751,12 @@ def run(csv_path=None, connection_manager=None, state=None):
         success = seed_feasible_pairs(connection, frequencies, weights)
         if success:
             logger.info("\n" + "="*60)
-            logger.info("STEP 7: REFRESH CLIENT PREFERRED USERS")
+            logger.info("STEP 7: REFRESH PROFILE PREFERENCES (Must / Preferred / Only)")
             logger.info("="*60)
-            refresh_client_preferred_users(connection, statuses)
+            profile_counts = refresh_profile_preferences(connection, weights, statuses)
+            stats['profile_preferred'] = profile_counts.get('user_preferred_clients', 0)
+            stats['profile_must'] = profile_counts.get('user_must_clients', 0)
+            stats['profile_only'] = profile_counts.get('user_only_clients', 0)
             if state:
                 state.update("feasible_pairs", status="completed")
                 state.clear_step("feasible_pairs")
@@ -788,6 +774,9 @@ def run(csv_path=None, connection_manager=None, state=None):
             print(f"  - Unique caregiver-client pairs: {stats['matched_pairs']}")
             print(f"  - Pairs with calculated weight: {stats['weighted_pairs']}")
             print(f"  - Current Primary preferred pairs: {stats.get('current_primary_pairs', 0)}")
+            print(f"  - Profile preferred: {stats.get('profile_preferred', 0)}")
+            print(f"  - Profile must: {stats.get('profile_must', 0)}")
+            print(f"  - Profile only: {stats.get('profile_only', 0)}")
             print(f"  - Total visits recorded: {stats['total_visits']}")
             print(f"  - Unmatched caregivers: {len(stats['unmatched_caregivers'])}")
             print(f"  - Unmatched clients: {len(stats['unmatched_clients'])}")

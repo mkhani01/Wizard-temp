@@ -69,6 +69,8 @@ def check_migration_imports():
         ("geocodeCalculation.main", "Geocode calculation"),
         ("areaMigration.main", "Area migration"),
         ("feasible_pairs_migration.feasible_pairs_migration", "Feasible pairs"),
+        ("feasible_pairs_migration.profile_preferences", "Profile preferences"),
+        ("distance_migration.pair_scope", "Distance pair scope"),
         ("clientWindowsAnalyzer.main", "Client windows analyzer"),
         ("carerTravelLimitsMigration.main", "Carer travel limits"),
         ("distance_migration.travel_distances_migration", "Travel distances"),

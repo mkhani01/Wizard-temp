@@ -37,6 +37,7 @@ jobs:
             --hidden-import=feasible_pairs_migration --hidden-import=geocodeCalculation `
             --hidden-import=userAvailabilityMigration --hidden-import=userLocationsMigration `
             --hidden-import=usersMigration --hidden-import=tests --hidden-import=tests.test_before_run --hidden-import=migration_support `
+            --hidden-import=msgpack `
             wizard.py
 
       - name: Create zip with exe and favicon
@@ -83,6 +84,7 @@ jobs:
             --hidden-import=feasible_pairs_migration --hidden-import=geocodeCalculation \
             --hidden-import=userAvailabilityMigration --hidden-import=userLocationsMigration \
             --hidden-import=usersMigration --hidden-import=tests --hidden-import=tests.test_before_run --hidden-import=migration_support \
+            --hidden-import=msgpack \
             wizard.py
           # PyInstaller outputs a folder; wrap as .app bundle
           if [ -d "dist/AOS-Migration-Wizard.app" ]; then
@@ -166,6 +168,7 @@ jobs:
             --hidden-import=feasible_pairs_migration --hidden-import=geocodeCalculation \
             --hidden-import=userAvailabilityMigration --hidden-import=userLocationsMigration \
             --hidden-import=usersMigration --hidden-import=tests --hidden-import=tests.test_before_run --hidden-import=migration_support \
+            --hidden-import=msgpack \
             wizard.py
 
       - name: Create zip (binary + logo when present)

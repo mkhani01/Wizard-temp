@@ -11,6 +11,9 @@ import os
 import sys
 import json
 import logging
+import io
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from datetime import datetime
 import psycopg2
@@ -21,6 +24,19 @@ try:
     from connection_manager import ConnectionLostError
 except ImportError:
     ConnectionLostError = None
+
+try:
+    from distance_migration.pair_scope import (
+        build_required_pairs,
+        build_full_matrix_pairs,
+        get_distance_mode,
+        resolve_visit_csv_path,
+    )
+except ImportError:
+    build_required_pairs = None
+    build_full_matrix_pairs = None
+    get_distance_mode = lambda: os.getenv("DISTANCE_MODE", "scoped").strip().lower()
+    resolve_visit_csv_path = lambda explicit_path=None: None
 
 # Import OSRM helper
 try:
@@ -57,7 +73,8 @@ OSRM_METHODS = list(TRAVEL_METHOD_MAP.keys())
 
 # Batch sizes
 DEFAULT_STEP_SIZE = 25
-DB_INSERT_BATCH_SIZE = 10000
+DB_INSERT_BATCH_SIZE = int(os.getenv("DB_INSERT_BATCH_SIZE", "5000"))
+PIPELINE_FLUSH_PAIRS = int(os.getenv("PIPELINE_FLUSH_PAIRS", "250"))
 
 # Cache Directory for Resume capability
 SCRIPT_DIR = Path(__file__).parent.resolve()
@@ -160,18 +177,217 @@ def get_existing_pair_counts(connection, from_type, to_type, method):
         cursor.close()
 
 
-def get_existing_pairs(connection, from_type, to_type, method):
-    """Return set of (from_id, to_id) already in DB for this segment (for smart retry insert skip)."""
+def get_existing_pairs_for_keys(connection, from_type, to_type, method, pair_keys):
+    """Return subset of pair_keys already present in DB."""
+    if not pair_keys:
+        return set()
     cursor = connection.cursor()
     try:
-        cursor.execute("""
-            SELECT from_id, to_id
-            FROM travel_distances
-            WHERE from_type = %s AND to_type = %s AND travel_method = %s
-        """, (from_type, to_type, method))
-        return {(row["from_id"], row["to_id"]) for row in cursor.fetchall()}
+        keys_list = list(pair_keys)
+        existing = set()
+        chunk = 5000
+        for i in range(0, len(keys_list), chunk):
+            sub = keys_list[i:i + chunk]
+            from_ids = [p[0] for p in sub]
+            to_ids = [p[1] for p in sub]
+            cursor.execute("""
+                SELECT from_id, to_id
+                FROM travel_distances
+                WHERE from_type = %s AND to_type = %s AND travel_method = %s
+                  AND (from_id, to_id) IN (
+                    SELECT * FROM UNNEST(%s::int[], %s::int[]) AS t(from_id, to_id)
+                  )
+            """, (from_type, to_type, method, from_ids, to_ids))
+            for row in cursor.fetchall():
+                existing.add((row["from_id"], row["to_id"]))
+        return existing
     finally:
         cursor.close()
+
+
+class PipelineInserter:
+    """Buffer rows and flush via COPY + INSERT. DB work runs on a dedicated thread."""
+
+    def __init__(
+        self,
+        connection,
+        cursor,
+        from_type,
+        to_type,
+        db_enum_method,
+        state=None,
+        segment_key=None,
+        skip_conflict_check=False,
+        async_insert=True,
+    ):
+        self.connection = connection
+        self.cursor = cursor
+        self.from_type = from_type
+        self.to_type = to_type
+        self.db_enum_method = db_enum_method
+        self.state = state
+        self.segment_key = segment_key
+        self.skip_conflict_check = skip_conflict_check
+        self.now = datetime.utcnow()
+        self.buffer = []
+        self.attempted_rows = 0
+        self.batches_committed = 0
+        self.processed_pairs = 0
+        self._lock = threading.Lock()
+        self._async = async_insert
+        self._insert_pool = (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="td-insert")
+            if async_insert else None
+        )
+        self._pending = []
+
+    def add_block(self, matrix):
+        """Queue block for insert (async) or insert immediately (sync)."""
+        if self._async and self._insert_pool is not None:
+            fut = self._insert_pool.submit(self._add_block_locked, matrix)
+            self._pending.append(fut)
+        else:
+            self._add_block_locked(matrix)
+
+    def _add_block_locked(self, matrix):
+        with self._lock:
+            for (src_id, tgt_id), dist_km in matrix.get("distance", {}).items():
+                self.processed_pairs += 1
+                if dist_km is None:
+                    continue
+                dur_min = matrix.get("duration", {}).get((src_id, tgt_id), 0)
+                self.buffer.append((
+                    self.from_type, src_id, self.to_type, tgt_id, self.db_enum_method,
+                    int(round(dist_km * 1000)), int(dur_min) if dur_min else 0,
+                    CALCULATION_STATUS_COMPLETED, None, self.now, self.now, self.now,
+                ))
+                if len(self.buffer) >= PIPELINE_FLUSH_PAIRS:
+                    self._flush_locked()
+            if self.buffer:
+                self._flush_locked()
+
+    def flush(self):
+        with self._lock:
+            self._flush_locked()
+
+    def _flush_locked(self):
+        if not self.buffer:
+            return
+        try:
+            _copy_insert_batch(
+                self.cursor,
+                self.buffer,
+                skip_conflict_check=self.skip_conflict_check,
+            )
+            self.connection.commit()
+            self.attempted_rows += len(self.buffer)
+            self.batches_committed += 1
+            logger.info(
+                "    Insert progress: attempted %d row(s), committed %d batch(es)",
+                self.attempted_rows,
+                self.batches_committed,
+            )
+            if self.state and self.segment_key:
+                self.state.update(
+                    "distance_migration",
+                    current_segment=self.segment_key,
+                    inserted_rows=self.attempted_rows,
+                )
+            self.buffer = []
+        except (OperationalError, InterfaceError) as e:
+            self.connection.rollback()
+            if ConnectionLostError:
+                completed = self.state.get_step("distance_migration").get("completed_segments") or [] if self.state else []
+                raise ConnectionLostError("distance_migration", dict(
+                    completed_segments=completed,
+                    current_segment=self.segment_key,
+                )) from e
+            raise
+
+    def finish(self):
+        if self._insert_pool is not None:
+            for fut in self._pending:
+                try:
+                    fut.result()
+                except Exception:
+                    self._insert_pool.shutdown(wait=False)
+                    raise
+            self._insert_pool.shutdown(wait=True)
+        self.flush()
+        return self.attempted_rows, self.batches_committed
+
+
+def _copy_insert_batch(cursor, rows, skip_conflict_check=False):
+    """Insert rows using COPY into a temp table, then INSERT into travel_distances."""
+    if not rows:
+        return
+    cursor.execute("""
+        CREATE TEMP TABLE IF NOT EXISTS _td_stage (
+            from_type text,
+            from_id int,
+            to_type text,
+            to_id int,
+            travel_method text,
+            distance_meters int,
+            duration_minutes int,
+            calculation_status text,
+            error_message text,
+            last_calculated_at timestamp,
+            created_at timestamp,
+            updated_at timestamp
+        ) ON COMMIT DELETE ROWS
+    """)
+    cursor.execute("TRUNCATE _td_stage")
+
+    buf = io.StringIO()
+    for row in rows:
+        parts = []
+        for val in row:
+            if val is None:
+                parts.append("\\N")
+            elif isinstance(val, datetime):
+                parts.append(val.strftime("%Y-%m-%d %H:%M:%S"))
+            else:
+                s = str(val).replace("\\", "\\\\").replace("\n", "\\n").replace("\t", "\\t")
+                parts.append(s)
+        buf.write("\t".join(parts) + "\n")
+    buf.seek(0)
+
+    cursor.copy_expert("""
+        COPY _td_stage (
+            from_type, from_id, to_type, to_id, travel_method,
+            distance_meters, duration_minutes, calculation_status, error_message,
+            last_calculated_at, created_at, updated_at
+        ) FROM STDIN WITH (FORMAT text, NULL '\\N')
+    """, buf)
+
+    if skip_conflict_check:
+        cursor.execute("""
+            INSERT INTO travel_distances (
+                from_type, from_id, from_hexagon, to_type, to_id, to_hexagon, travel_method,
+                distance_meters, duration_minutes, calculation_status, error_message,
+                last_calculated_at, created_at, updated_at
+            )
+            SELECT
+                from_type, from_id, NULL, to_type, to_id, NULL, travel_method,
+                distance_meters, duration_minutes, calculation_status, error_message,
+                last_calculated_at, created_at, updated_at
+            FROM _td_stage
+        """)
+    else:
+        cursor.execute("""
+            INSERT INTO travel_distances (
+                from_type, from_id, from_hexagon, to_type, to_id, to_hexagon, travel_method,
+                distance_meters, duration_minutes, calculation_status, error_message,
+                last_calculated_at, created_at, updated_at
+            )
+            SELECT
+                from_type, from_id, NULL, to_type, to_id, NULL, travel_method,
+                distance_meters, duration_minutes, calculation_status, error_message,
+                last_calculated_at, created_at, updated_at
+            FROM _td_stage
+            ON CONFLICT DO NOTHING
+        """)
 
 
 def find_missing_source_ids(all_source_ids, existing_counts, expected_target_count):
@@ -196,6 +412,91 @@ def insert_batch(cursor, data):
     """
     template = "(%s, %s, NULL, %s, %s, NULL, %s, %s, %s, %s, %s, %s, %s, %s)"
     execute_values(cursor, sql, data, template=template, page_size=5000)
+
+
+def insert_matrix_streaming(
+    connection,
+    cursor,
+    matrix,
+    from_type,
+    to_type,
+    db_enum_method,
+    state=None,
+    segment_key=None,
+):
+    """
+    Stream calculated matrix rows into travel_distances in DB-sized chunks.
+    This avoids loading all existing pairs and building a multi-million-row
+    in-memory insert list before the first commit.
+    """
+    total_pairs = len(matrix["distance"])
+    logger.info(
+        "    Streaming %d calculated pair(s) into DB in chunks of %d...",
+        total_pairs,
+        DB_INSERT_BATCH_SIZE,
+    )
+
+    now = datetime.utcnow()
+    chunk = []
+    processed_pairs = 0
+    attempted_rows = 0
+    skipped_null = 0
+    batches_committed = 0
+
+    def commit_chunk():
+        nonlocal chunk, attempted_rows, batches_committed
+        if not chunk:
+            return
+        try:
+            insert_batch(cursor, chunk)
+            connection.commit()
+            attempted_rows += len(chunk)
+            batches_committed += 1
+            logger.info(
+                "    Insert progress: processed %d / %d pair(s), attempted %d row(s), committed %d batch(es)",
+                processed_pairs,
+                total_pairs,
+                attempted_rows,
+                batches_committed,
+            )
+            if state and segment_key:
+                state.update("distance_migration", current_segment=segment_key)
+            chunk = []
+        except (OperationalError, InterfaceError) as e:
+            connection.rollback()
+            if ConnectionLostError:
+                completed = state.get_step("distance_migration").get("completed_segments") or [] if state else []
+                raise ConnectionLostError("distance_migration", dict(
+                    completed_segments=completed,
+                    current_segment=segment_key,
+                )) from e
+            raise
+
+    for (src_id, tgt_id), dist_km in matrix["distance"].items():
+        processed_pairs += 1
+        if dist_km is None:
+            skipped_null += 1
+            continue
+
+        dur_min = matrix["duration"].get((src_id, tgt_id), 0)
+        chunk.append((
+            from_type, src_id, to_type, tgt_id, db_enum_method,
+            int(round(dist_km * 1000)), int(dur_min) if dur_min else 0,
+            CALCULATION_STATUS_COMPLETED, None, now, now, now,
+        ))
+
+        if len(chunk) >= DB_INSERT_BATCH_SIZE:
+            commit_chunk()
+
+    commit_chunk()
+    logger.info(
+        "    Finished DB streaming: processed %d pair(s), attempted %d row(s), skipped %d null distance(s), committed %d batch(es)",
+        processed_pairs,
+        attempted_rows,
+        skipped_null,
+        batches_committed,
+    )
+    return attempted_rows, batches_committed
 
 
 # --- Cache Helpers (msgpack for speed, JSON fallback for backward compatibility) ---
@@ -344,6 +645,18 @@ def _save_entities_cache(users, clients):
     logger.info("Saved entities cache: %d users, %d clients", len(users), len(clients))
 
 
+def _get_missing_pairs(connection, from_type, to_type, method, required_pairs):
+    if not required_pairs:
+        return set()
+    return required_pairs - get_existing_pairs_for_keys(
+        connection, from_type, to_type, method, required_pairs,
+    )
+
+
+def _segment_is_complete(connection, from_type, to_type, method, required_pairs):
+    return len(_get_missing_pairs(connection, from_type, to_type, method, required_pairs)) == 0
+
+
 def process_missing_segment(
     connection,
     cursor,
@@ -356,101 +669,214 @@ def process_missing_segment(
     db_enum_method,
     state=None,
     segment_key=None,
+    required_pairs=None,
 ):
+    """Legacy full-matrix segment processor (DISTANCE_MODE=full). Uses pipeline when no cache."""
+    if required_pairs is not None:
+        return process_scoped_segment(
+            connection, cursor, source_entities, target_entities,
+            required_pairs, from_type, to_type, osrm_method, db_enum_method,
+            state=state, segment_key=segment_key,
+        )
+
     if not missing_source_ids:
         logger.info(f"  {from_type}->{to_type} ({db_enum_method}): No missing pairs.")
         return
     logger.info(f"  {from_type}->{to_type} ({db_enum_method}): Found {len(missing_source_ids)} sources with missing data.")
     matrix = load_cache(osrm_method, from_type, to_type)
+    had_partial_errors = False
     if not matrix:
         sources_to_calc = {sid: source_entities[sid] for sid in missing_source_ids if sid in source_entities}
         if not sources_to_calc:
             logger.warning("    No coordinate data found for missing source IDs.")
             return
         logger.info(f"    >>> CALLING OSRM API: {len(sources_to_calc)} x {len(target_entities)}")
-        matrix = get_distance_matrix(
+        inserter = PipelineInserter(
+            connection, cursor, from_type, to_type, db_enum_method,
+            state=state, segment_key=segment_key, skip_conflict_check=False,
+            async_insert=True,
+        )
+
+        def on_block(block_matrix):
+            inserter.add_block(block_matrix)
+
+        result = get_distance_matrix(
             entities_info1=sources_to_calc,
             entities_info2=target_entities,
             travel_method=osrm_method,
             step_size=DEFAULT_STEP_SIZE,
+            on_block_complete=on_block,
         )
-        save_cache(osrm_method, from_type, to_type, matrix["distance"], matrix["duration"])
+        had_partial_errors = bool(result.get("errors"))
+        attempted_rows, batches_committed = inserter.finish()
+        if had_partial_errors:
+            logger.warning(
+                "    OSRM returned partial results: %d failed block(s). "
+                "Will insert successful pairs, then stop so retry fills remaining pairs.",
+                len(result.get("errors") or []),
+            )
+        else:
+            pass  # pipeline mode: no segment cache (pairs committed per block)
+        matrix = None
     else:
         logger.info("    Using cached data (Skipping OSRM API call).")
-    # Smart retry: only insert pairs that are not already in DB (avoids millions of conflict checks)
-    try:
-        existing_pairs = get_existing_pairs(connection, from_type, to_type, db_enum_method)
-    except (OperationalError, InterfaceError) as e:
-        if ConnectionLostError:
-            completed = state.get_step("distance_migration").get("completed_segments") or [] if state else []
-            raise ConnectionLostError("distance_migration", dict(completed_segments=completed, current_segment=segment_key)) from e
-        raise
-    total_cached = len(matrix["distance"])
-    now = datetime.utcnow()
-    batch_data = []
-    for (src_id, tgt_id), dist_km in matrix["distance"].items():
-        if dist_km is None:
-            continue
-        if (src_id, tgt_id) in existing_pairs:
-            continue
-        dur_min = matrix["duration"].get((src_id, tgt_id), 0)
-        batch_data.append((
-            from_type, src_id, to_type, tgt_id, db_enum_method,
-            int(round(dist_km * 1000)), int(dur_min) if dur_min else 0,
-            CALCULATION_STATUS_COMPLETED, None, now, now, now,
-        ))
-    skipped = total_cached - len(batch_data)
-    if skipped:
-        logger.info("    Skipping %d pairs already in DB (inserting only %d missing).", skipped, len(batch_data))
-    if not batch_data:
-        logger.info("    No missing pairs to insert.")
+        attempted_rows, batches_committed = insert_matrix_streaming(
+            connection, cursor, matrix, from_type, to_type, db_enum_method,
+            state=state, segment_key=segment_key,
+        )
+
+    if matrix is None:
+        if attempted_rows == 0:
+            logger.info("    No missing pairs to insert.")
+            if had_partial_errors:
+                raise RuntimeError(
+                    "OSRM segment had failed block(s). No new successful pairs to insert; retry to calculate remaining missing pairs."
+                )
+            clear_cache(osrm_method, from_type, to_type)
+            return
+        logger.info("    Inserted/updated records (batches committed: %d).", batches_committed)
+        if had_partial_errors:
+            raise RuntimeError(
+                "OSRM segment had failed block(s). Inserted successful pairs; retry to calculate remaining missing pairs."
+            )
         clear_cache(osrm_method, from_type, to_type)
         return
-    total_batches = (len(batch_data) + DB_INSERT_BATCH_SIZE - 1) // DB_INSERT_BATCH_SIZE
-    logger.info("    Inserting %d rows in %d batches (batch size %d)...", len(batch_data), total_batches, DB_INSERT_BATCH_SIZE)
-    batches_committed = 0
-    for i in range(0, len(batch_data), DB_INSERT_BATCH_SIZE):
-        chunk = batch_data[i:i + DB_INSERT_BATCH_SIZE]
-        try:
-            insert_batch(cursor, chunk)
-            connection.commit()
-            batches_committed += 1
-            if batches_committed % 10 == 0 or batches_committed == total_batches:
-                logger.info("    Insert progress: %d / %d batches", batches_committed, total_batches)
-            if state and segment_key:
-                state.update("distance_migration", current_segment=segment_key)
-        except (OperationalError, InterfaceError) as e:
-            if ConnectionLostError:
-                completed = state.get_step("distance_migration").get("completed_segments") or [] if state else []
-                raise ConnectionLostError("distance_migration", dict(
-                    completed_segments=completed,
-                    current_segment=segment_key,
-                )) from e
-            raise
-    logger.info("    Inserted/Updated records (batches committed: %d).", batches_committed)
+
+    if attempted_rows == 0:
+        logger.info("    No missing pairs to insert.")
+        if had_partial_errors:
+            raise RuntimeError(
+                "OSRM segment had failed block(s). No new successful pairs to insert; retry to calculate remaining missing pairs."
+            )
+        clear_cache(osrm_method, from_type, to_type)
+        return
+    logger.info("    Inserted/updated records (batches committed: %d).", batches_committed)
+    if had_partial_errors:
+        raise RuntimeError(
+            "OSRM segment had failed block(s). Inserted successful pairs; retry to calculate remaining missing pairs."
+        )
     clear_cache(osrm_method, from_type, to_type)
 
 
-def _build_segments_list():
+def _build_segments_list(scoped_pair_map=None):
     """List of (segment_key, from_type, to_type, osrm_method, db_enum_method) in execution order."""
     out = []
     for osrm_method in OSRM_METHODS:
         db_enum = TRAVEL_METHOD_MAP[osrm_method]
-        out.append((_segment_key(osrm_method, ENTITY_TYPE_USER, ENTITY_TYPE_USER), ENTITY_TYPE_USER, ENTITY_TYPE_USER, osrm_method, db_enum))
-        out.append((_segment_key(osrm_method, ENTITY_TYPE_CLIENT, ENTITY_TYPE_CLIENT), ENTITY_TYPE_CLIENT, ENTITY_TYPE_CLIENT, osrm_method, db_enum))
-        out.append((_segment_key(osrm_method, ENTITY_TYPE_USER, ENTITY_TYPE_CLIENT), ENTITY_TYPE_USER, ENTITY_TYPE_CLIENT, osrm_method, db_enum))
-        out.append((_segment_key(osrm_method, ENTITY_TYPE_CLIENT, ENTITY_TYPE_USER), ENTITY_TYPE_CLIENT, ENTITY_TYPE_USER, osrm_method, db_enum))
+        segment_defs = [
+            (ENTITY_TYPE_USER, ENTITY_TYPE_USER),
+            (ENTITY_TYPE_CLIENT, ENTITY_TYPE_CLIENT),
+            (ENTITY_TYPE_USER, ENTITY_TYPE_CLIENT),
+            (ENTITY_TYPE_CLIENT, ENTITY_TYPE_USER),
+        ]
+        if scoped_pair_map is not None:
+            segment_defs = [
+                (ft, tt) for ft, tt in segment_defs
+                if scoped_pair_map.get((ft, tt))
+            ]
+        for from_type, to_type in segment_defs:
+            out.append((
+                _segment_key(osrm_method, from_type, to_type),
+                from_type, to_type, osrm_method, db_enum,
+            ))
     return out
 
 
-def run(connection_manager=None, state=None):
+def process_scoped_segment(
+    connection,
+    cursor,
+    source_entities,
+    target_entities,
+    required_pairs,
+    from_type,
+    to_type,
+    osrm_method,
+    db_enum_method,
+    state=None,
+    segment_key=None,
+):
+    """Compute and insert only missing pairs; OSRM and DB insert run in parallel."""
+    if not required_pairs:
+        logger.info(f"  {from_type}->{to_type} ({db_enum_method}): No required pairs.")
+        return True
+
+    missing = _get_missing_pairs(connection, from_type, to_type, db_enum_method, required_pairs)
+    if not missing:
+        logger.info(
+            f"  {from_type}->{to_type} ({db_enum_method}): All {len(required_pairs)} pair(s) already in DB."
+        )
+        return True
+
+    source_ids = {s for s, _t in missing}
+    target_ids = {t for _s, t in missing}
+    sources_to_calc = {sid: source_entities[sid] for sid in source_ids if sid in source_entities}
+    targets = {tid: target_entities[tid] for tid in target_ids if tid in target_entities}
+    if not sources_to_calc or not targets:
+        logger.warning("    No coordinate data for missing pair endpoints.")
+        return False
+
+    logger.info(
+        "  %s->%s (%s): %d missing pair(s), %d sources x %d targets (retry skips %d already in DB)",
+        from_type, to_type, db_enum_method, len(missing), len(sources_to_calc), len(targets),
+        len(required_pairs) - len(missing),
+    )
+
+    inserter = PipelineInserter(
+        connection, cursor, from_type, to_type, db_enum_method,
+        state=state, segment_key=segment_key, skip_conflict_check=True,
+        async_insert=True,
+    )
+
+    def on_block(block_matrix):
+        inserter.add_block(block_matrix)
+
+    result = get_distance_matrix(
+        entities_info1=sources_to_calc,
+        entities_info2=targets,
+        travel_method=osrm_method,
+        step_size=DEFAULT_STEP_SIZE,
+        on_block_complete=on_block,
+        required_pairs=missing,
+    )
+
+    attempted_rows, batches_committed = inserter.finish()
+    had_partial_errors = bool(result.get("errors"))
+    still_missing = _get_missing_pairs(connection, from_type, to_type, db_enum_method, required_pairs)
+
+    if had_partial_errors:
+        logger.warning(
+            "    OSRM partial: %d failed block(s). Inserted %d row(s); %d pair(s) still missing (retry continues from here).",
+            len(result.get("errors") or []),
+            attempted_rows,
+            len(still_missing),
+        )
+
+    if still_missing:
+        if state and segment_key:
+            state.update(
+                "distance_migration",
+                current_segment=segment_key,
+                segment_missing_pairs=len(still_missing),
+            )
+        raise RuntimeError(
+            f"Segment incomplete: {len(still_missing)} pair(s) still missing. "
+            "Successful pairs are already in DB; retry will skip them."
+        )
+
+    logger.info("    Inserted %d row(s) in %d batch(es). Segment complete.", attempted_rows, batches_committed)
+    return True
+
+
+def run(connection_manager=None, state=None, visit_csv_path=None):
+    distance_mode = get_distance_mode()
     print("""
     ╔══════════════════════════════════════════════════════════╗
     ║     Travel Distances Migration (RESUME ENABLED)          ║
-    ║     Find Missing -> Cache -> Insert                      ║
+    ║     Scoped pairs -> OSRM pipeline -> COPY insert         ║
     ╚══════════════════════════════════════════════════════════╝
     """)
     logger.info("Cache directory: %s", CACHE_DIR)
+    logger.info("Distance mode: %s", distance_mode)
     if state and state.is_completed("distance_migration"):
         logger.info("Distance migration already completed (resume).")
         return True
@@ -465,6 +891,11 @@ def run(connection_manager=None, state=None):
         else:
             connection = connect_to_database(config)
         cursor = connection.cursor()
+        try:
+            cursor.execute("SET synchronous_commit = off")
+        except Exception:
+            pass
+
         completed_segments = list(state.get_step("distance_migration").get("completed_segments") or []) if state else []
         users = None
         clients = None
@@ -483,25 +914,58 @@ def run(connection_manager=None, state=None):
                 state.update("distance_migration", entities_loaded=True)
         user_ids = set(users.keys())
         client_ids = set(clients.keys())
-        segments = _build_segments_list()
+
+        scoped_pair_map = None
+        if distance_mode == "scoped" and build_required_pairs:
+            visit_path = resolve_visit_csv_path(visit_csv_path)
+            if visit_path:
+                logger.info("VisitExport for route pairs: %s", visit_path)
+            else:
+                logger.warning("VisitExport not found; client↔client route pairs will be omitted.")
+            scoped_pair_map = build_required_pairs(connection, visit_csv_path=visit_path)
+        elif distance_mode == "full" and build_full_matrix_pairs:
+            scoped_pair_map = build_full_matrix_pairs(user_ids, client_ids)
+            logger.info("Full matrix mode: user=%d, client=%d", len(user_ids), len(client_ids))
+
+        segments = _build_segments_list(scoped_pair_map)
         for segment_key, from_type, to_type, osrm_method, db_enum_method in segments:
+            required_pairs = None
+            if scoped_pair_map is not None:
+                required_pairs = scoped_pair_map.get((from_type, to_type), set())
+
             if segment_key in completed_segments:
-                logger.info("Skipping completed segment: %s", segment_key)
-                continue
+                if required_pairs and not _segment_is_complete(
+                    connection, from_type, to_type, db_enum_method, required_pairs,
+                ):
+                    remaining = len(_get_missing_pairs(
+                        connection, from_type, to_type, db_enum_method, required_pairs,
+                    ))
+                    logger.info(
+                        "Segment %s marked complete but %d pair(s) missing; resuming.",
+                        segment_key, remaining,
+                    )
+                else:
+                    logger.info("Skipping completed segment: %s", segment_key)
+                    continue
+
             source_entities = users if from_type == ENTITY_TYPE_USER else clients
             target_entities = users if to_type == ENTITY_TYPE_USER else clients
             if not source_entities or not target_entities:
                 continue
-            expected_count = len(target_entities)
-            try:
-                counts = get_existing_pair_counts(connection, from_type, to_type, db_enum_method)
-            except (OperationalError, InterfaceError) as e:
-                if ConnectionLostError:
-                    raise ConnectionLostError("distance_migration", dict(completed_segments=completed_segments, current_segment=segment_key)) from e
-                raise
-            missing_src = find_missing_source_ids(
-                user_ids if from_type == ENTITY_TYPE_USER else client_ids, counts, expected_count
-            )
+
+            missing_src = set()
+            if scoped_pair_map is None:
+                expected_count = len(target_entities)
+                try:
+                    counts = get_existing_pair_counts(connection, from_type, to_type, db_enum_method)
+                except (OperationalError, InterfaceError) as e:
+                    if ConnectionLostError:
+                        raise ConnectionLostError("distance_migration", dict(completed_segments=completed_segments, current_segment=segment_key)) from e
+                    raise
+                missing_src = find_missing_source_ids(
+                    user_ids if from_type == ENTITY_TYPE_USER else client_ids, counts, expected_count
+                )
+
             process_missing_segment(
                 connection, cursor,
                 source_entities=source_entities,
@@ -513,9 +977,30 @@ def run(connection_manager=None, state=None):
                 db_enum_method=db_enum_method,
                 state=state,
                 segment_key=segment_key,
+                required_pairs=required_pairs,
             )
+
+            if required_pairs is not None and not _segment_is_complete(
+                connection, from_type, to_type, db_enum_method, required_pairs,
+            ):
+                remaining = len(_get_missing_pairs(
+                    connection, from_type, to_type, db_enum_method, required_pairs,
+                ))
+                logger.warning(
+                    "Segment %s incomplete (%d pair(s) remain). Retry will continue from here.",
+                    segment_key, remaining,
+                )
+                if state:
+                    state.update(
+                        "distance_migration",
+                        current_segment=segment_key,
+                        segment_missing_pairs=remaining,
+                    )
+                continue
+
             if state:
-                completed_segments = list(completed_segments) + [segment_key]
+                if segment_key not in completed_segments:
+                    completed_segments = list(completed_segments) + [segment_key]
                 state.update("distance_migration", completed_segments=completed_segments, current_segment=segment_key)
         logger.info("")
         logger.info("Migration completed successfully.")
@@ -548,8 +1033,12 @@ def run(connection_manager=None, state=None):
                 connection.rollback()
             except Exception:
                 pass
+        if state:
+            state.update("distance_migration", completed_segments=completed_segments)
         logger.exception("Migration failed: %s", e)
-        logger.error("IMPORTANT: You can retry the script. Cached API results will be reused.")
+        logger.error(
+            "Retry will resume from the last incomplete segment; pairs already inserted are skipped."
+        )
         return False
     finally:
         if connection and not connection_manager and connection.closed == 0:
