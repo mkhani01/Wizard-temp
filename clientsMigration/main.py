@@ -629,7 +629,7 @@ def extract_clients_from_csv(csv_path, lookups):
             race_sensitivity = False
             language_sensitivity = False
             continuity_required = False
-            
+
             # Build client data
             client_data = {
                 'name': first_name,
@@ -674,6 +674,7 @@ def extract_clients_from_csv(csv_path, lookups):
                 'origin_id': origin_id,
                 'area_id': area_id,
                 'group_id': group_id,
+                'group_name': group_name or None,
                 'created_date': created_date or datetime.now(),
                 'updated_date': updated_date or datetime.now(),
             }
@@ -682,6 +683,41 @@ def extract_clients_from_csv(csv_path, lookups):
 
     logger.info("Extracted %d clients from CSV (%d keys in file for deactivation check)", len(clients), len(all_keys_in_csv))
     return clients, all_keys_in_csv
+
+
+def _client_match_key(name, lastname):
+    return f"{normalize_name_for_client_match(name)}|{normalize_name_for_client_match(lastname)}"
+
+
+def _dedupe_clients_by_key(clients):
+    """Last CSV row wins when multiple rows share the same normalized name key."""
+    by_key = {}
+    for client in clients:
+        by_key[_client_match_key(client['name'], client['lastname'])] = client
+    return by_key
+
+
+def _build_clients_for_group_link(existing_ids_by_key, clients):
+    """Resolve every CSV client to a DB id for group/role linking."""
+    clients_by_key = _dedupe_clients_by_key(clients)
+    out = []
+    missing = 0
+    for key, client in clients_by_key.items():
+        client_id = existing_ids_by_key.get(key)
+        if not client_id:
+            missing += 1
+            continue
+        out.append({
+            'id': client_id,
+            'name': client['name'],
+            'lastname': client['lastname'],
+        })
+    if missing:
+        logger.warning(
+            "%d CSV client(s) could not be resolved to a DB id for group linking",
+            missing,
+        )
+    return out
 
 
 def seed_clients(connection, clients, all_keys_in_csv=None):
@@ -823,6 +859,10 @@ def seed_clients(connection, clients, all_keys_in_csv=None):
             )
             
             inserted = cursor.fetchall()
+            for row in inserted:
+                key = _client_match_key(row['name'], row['lastname'])
+                if key:
+                    existing[key] = row['id']
             processed.extend(inserted)
             for row in inserted:
                 logger.info("  SEEDED client INSERT id=%s name=%r lastname=%r", row['id'], row['name'], row['lastname'])
@@ -917,14 +957,16 @@ def seed_clients(connection, clients, all_keys_in_csv=None):
                 client['area_id'],
                 client_id,
             ))
-            
+
+            processed.append({
+                'id': client_id,
+                'name': client['name'],
+                'lastname': client['lastname'],
+            })
             if cursor.rowcount:
-                processed.append({
-                    'id': client_id,
-                    'name': client['name'],
-                    'lastname': client['lastname'],
-                })
                 logger.info("  SEEDED client UPDATE id=%s name=%r lastname=%r", client_id, client['name'], client['lastname'])
+            else:
+                logger.debug("  client UPDATE unchanged id=%s name=%r lastname=%r", client_id, client['name'], client['lastname'])
 
         if to_update:
             logger.info("Updated %d existing clients", len(to_update))
@@ -951,10 +993,13 @@ def seed_clients(connection, clients, all_keys_in_csv=None):
             )
             logger.info(f"✓ Set status = Active for {len(to_activate_ids)} clients present in CSV")
         
-        # Link clients to groups (many-to-many)
-        if processed:
-            logger.info(f"\nLinking {len(processed)} clients to groups...")
-            link_clients_to_groups(cursor, processed, clients, imported_group_id)
+        # Link every CSV client to groups (imported group + Area group), not only changed rows.
+        clients_for_link = _build_clients_for_group_link(existing, clients)
+        if clients_for_link:
+            logger.info(f"\nLinking {len(clients_for_link)} CSV client(s) to groups...")
+            link_clients_to_groups(cursor, clients_for_link, clients, imported_group_id)
+        else:
+            logger.warning("No CSV clients resolved for group linking")
         
         connection.commit()
         
@@ -978,27 +1023,29 @@ def seed_clients(connection, clients, all_keys_in_csv=None):
 
 
 def link_clients_to_groups(cursor, processed_clients, original_clients, imported_group_id=None):
-    """Link clients to their groups via many-to-many relationship"""
-    
-    # Create name+lastname to client mapping (normalized for encoding-safe matching)
-    name_to_client = {
-        f"{normalize_name_for_match(client['name'])}|{normalize_name_for_match(client['lastname'])}": client
-        for client in original_clients
-    }
-    
-    # Prepare client-group links
+    """Link clients to their groups via many-to-many relationship."""
+
+    clients_by_key = _dedupe_clients_by_key(original_clients)
+
     client_group_links = []
+    missing_area_group = 0
     for client_row in processed_clients:
-        key = f"{normalize_name_for_match(client_row['name'])}|{normalize_name_for_match(client_row['lastname'])}"
+        key = _client_match_key(client_row['name'], client_row['lastname'])
         client_id = client_row['id']
-        
-        # Get group_id from original client data
-        original_client = name_to_client.get(key)
+
+        original_client = clients_by_key.get(key)
         if original_client and original_client.get('group_id'):
-            group_id = original_client['group_id']
-            client_group_links.append((client_id, group_id))
+            client_group_links.append((client_id, original_client['group_id']))
+        elif original_client and original_client.get('group_name'):
+            missing_area_group += 1
         if imported_group_id:
             client_group_links.append((client_id, imported_group_id))
+
+    if missing_area_group:
+        logger.warning(
+            "%d client(s) have an Area in CSV that did not match any clients_group name",
+            missing_area_group,
+        )
     
     if not client_group_links:
         logger.warning("No client-group links to create")
