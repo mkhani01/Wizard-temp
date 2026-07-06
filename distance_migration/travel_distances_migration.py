@@ -81,6 +81,76 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 CACHE_DIR = SCRIPT_DIR / ".cache" / "travel_migration"
 ENTITIES_CACHE_FILE = CACHE_DIR / "entities.json"
 
+# Cached enum ::cast suffixes for travel_distances text → enum inserts.
+_TD_ENUM_CASTS_CACHE = None
+
+
+def _resolve_travel_distances_enum_casts(cursor):
+    """Map travel_distances enum columns to ::type casts for text staging inserts."""
+    global _TD_ENUM_CASTS_CACHE
+    if _TD_ENUM_CASTS_CACHE is not None:
+        return _TD_ENUM_CASTS_CACHE
+
+    enum_columns = (
+        "from_type",
+        "to_type",
+        "travel_method",
+        "calculation_status",
+    )
+    casts = {col: "" for col in enum_columns}
+    used_fallback = False
+    try:
+        cursor.execute("""
+            SELECT a.attname, t.typname
+            FROM pg_catalog.pg_attribute a
+            JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+            JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
+            WHERE c.relname = 'travel_distances'
+              AND n.nspname = current_schema()
+              AND a.attnum > 0
+              AND NOT a.attisdropped
+              AND t.typcategory = 'E'
+              AND a.attname = ANY(%s)
+        """, (list(enum_columns),))
+        rows = cursor.fetchall()
+        if not rows:
+            used_fallback = True
+        else:
+            for row in rows:
+                casts[row["attname"]] = f"::{row['typname']}"
+    except Exception as e:
+        logger.debug("Could not resolve travel_distances enum casts from catalog: %s", e)
+        used_fallback = True
+
+    if used_fallback:
+        casts = {
+            "from_type": "::travel_distances_from_type_enum",
+            "to_type": "::travel_distances_to_type_enum",
+            "travel_method": "::travel_distances_travel_method_enum",
+            "calculation_status": "::travel_distances_calculation_status_enum",
+        }
+
+    _TD_ENUM_CASTS_CACHE = casts
+    return casts
+
+
+def _stage_insert_select_sql(casts):
+    return (
+        f"from_type{casts['from_type']}, from_id, NULL, "
+        f"to_type{casts['to_type']}, to_id, NULL, travel_method{casts['travel_method']}, "
+        f"distance_meters, duration_minutes, calculation_status{casts['calculation_status']}, "
+        f"error_message, last_calculated_at, created_at, updated_at"
+    )
+
+
+def _insert_values_template(casts):
+    return (
+        f"(%s{casts['from_type']}, %s, NULL, %s{casts['to_type']}, %s, NULL, "
+        f"%s{casts['travel_method']}, %s, %s, %s{casts['calculation_status']}, "
+        f"%s, %s, %s, %s)"
+    )
+
 
 def get_db_config():
     """Get database configuration from environment variables."""
@@ -321,6 +391,8 @@ def _copy_insert_batch(cursor, rows, skip_conflict_check=False):
     """Insert rows using COPY into a temp table, then INSERT into travel_distances."""
     if not rows:
         return
+    casts = _resolve_travel_distances_enum_casts(cursor)
+    select_cols = _stage_insert_select_sql(casts)
     cursor.execute("""
         CREATE TEMP TABLE IF NOT EXISTS _td_stage (
             from_type text,
@@ -362,29 +434,25 @@ def _copy_insert_batch(cursor, rows, skip_conflict_check=False):
     """, buf)
 
     if skip_conflict_check:
-        cursor.execute("""
+        cursor.execute(f"""
             INSERT INTO travel_distances (
                 from_type, from_id, from_hexagon, to_type, to_id, to_hexagon, travel_method,
                 distance_meters, duration_minutes, calculation_status, error_message,
                 last_calculated_at, created_at, updated_at
             )
             SELECT
-                from_type, from_id, NULL, to_type, to_id, NULL, travel_method,
-                distance_meters, duration_minutes, calculation_status, error_message,
-                last_calculated_at, created_at, updated_at
+                {select_cols}
             FROM _td_stage
         """)
     else:
-        cursor.execute("""
+        cursor.execute(f"""
             INSERT INTO travel_distances (
                 from_type, from_id, from_hexagon, to_type, to_id, to_hexagon, travel_method,
                 distance_meters, duration_minutes, calculation_status, error_message,
                 last_calculated_at, created_at, updated_at
             )
             SELECT
-                from_type, from_id, NULL, to_type, to_id, NULL, travel_method,
-                distance_meters, duration_minutes, calculation_status, error_message,
-                last_calculated_at, created_at, updated_at
+                {select_cols}
             FROM _td_stage
             ON CONFLICT DO NOTHING
         """)
@@ -402,6 +470,7 @@ def find_missing_source_ids(all_source_ids, existing_counts, expected_target_cou
 def insert_batch(cursor, data):
     if not data:
         return
+    casts = _resolve_travel_distances_enum_casts(cursor)
     sql = """
         INSERT INTO travel_distances
         (from_type, from_id, from_hexagon, to_type, to_id, to_hexagon, travel_method,
@@ -410,7 +479,7 @@ def insert_batch(cursor, data):
         VALUES %s
         ON CONFLICT DO NOTHING
     """
-    template = "(%s, %s, NULL, %s, %s, NULL, %s, %s, %s, %s, %s, %s, %s, %s)"
+    template = _insert_values_template(casts)
     execute_values(cursor, sql, data, template=template, page_size=5000)
 
 
