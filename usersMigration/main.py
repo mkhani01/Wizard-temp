@@ -167,6 +167,54 @@ def get_imported_service_type_ids(cursor):
     return [ids_by_name[name] for name in IMPORTED_SERVICE_TYPE_NAMES]
 
 
+def seed_user_groups_from_csv(connection, csv_path):
+    """Extract and seed unique user groups from CSV Area column."""
+    groups = set()
+
+    logger.info("Reading CSV for user groups: %s", csv_path)
+    with open(csv_path, 'r', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            area = fix_utf8_mojibake(row.get('Area', '') or '').strip()
+            if area:
+                groups.add(area)
+
+    logger.info("Found %d unique user groups in CSV", len(groups))
+    cursor = connection.cursor()
+    try:
+        if not groups:
+            logger.warning("No user groups found in CSV Area column")
+            return
+
+        cursor.execute("SELECT id, name FROM users_group")
+        existing = {row['name']: row['id'] for row in cursor.fetchall()}
+        new_groups = groups - set(existing.keys())
+        if not new_groups:
+            logger.info("✓ All user groups from CSV already exist")
+            return
+
+        logger.info("Inserting %d new user group(s)...", len(new_groups))
+        execute_values(
+            cursor,
+            """
+            INSERT INTO users_group (name, description, created_date, last_modified_date)
+            VALUES %s
+            RETURNING id, name
+            """,
+            [(group, f"User group {group}") for group in sorted(new_groups)],
+            template="(%s, %s, NOW(), NOW())",
+        )
+        inserted = cursor.fetchall()
+        connection.commit()
+        logger.info("✓ Inserted %d user group(s)", len(inserted))
+    except Exception as e:
+        connection.rollback()
+        logger.error("✗ Failed to insert user groups: %s", e)
+        raise
+    finally:
+        cursor.close()
+
+
 def ensure_imported_user_role(cursor):
     """Create or reuse the imported users role and its providing service types."""
     service_type_ids = get_imported_service_type_ids(cursor)
@@ -401,7 +449,6 @@ def extract_users_from_csv(csv_path, lookups):
             if origin_name and origin_name in lookups['origins']:
                 origin_id = lookups['origins'][origin_name]
 
-            # Get group_id for many-to-many relationship (not area_id)
             group_id = None
             group_name = fix_utf8_mojibake(row.get('Area', '') or '').strip()
             if group_name and group_name in lookups['groups']:
@@ -442,7 +489,8 @@ def extract_users_from_csv(csv_path, lookups):
                 'nationality_id': nationality_id,
                 'religion_id': religion_id,
                 'origin_id': origin_id,
-                'group_id': group_id,  # For many-to-many linking
+                'group_id': group_id,
+                'group_name': group_name or None,
             }
             
             users.append(user_data)
@@ -530,6 +578,7 @@ def seed_users(connection, users, state=None):
                 cursor.execute("DELETE FROM user_users_groups WHERE user_id = ANY(%s)", (user_ids,))
                 link_users_to_groups(cursor, processed, users)
                 link_users_to_imported_role(cursor, user_ids, imported_role_id)
+            ensure_all_csv_users_linked(cursor, users, imported_role_id)
             connection.commit()
             logger.info("Successfully processed %d users (inserted/updated)", len(processed))
             return True
@@ -560,6 +609,8 @@ def seed_users(connection, users, state=None):
 
         state.update("users_migration", status="completed", rows_committed=total_committed)
         state.clear_step("users_migration")
+        ensure_all_csv_users_linked(cursor, users, imported_role_id)
+        connection.commit()
         logger.info("Successfully processed %d users (inserted/updated)", len(all_processed))
         return True
     except (OperationalError, InterfaceError):
@@ -573,25 +624,29 @@ def seed_users(connection, users, state=None):
         cursor.close()
 
 def link_users_to_groups(cursor, inserted_users, original_users):
-    """Link users to their groups via many-to-many relationship"""
-    
-    # Create email to user mapping
+    """Link users to their groups via many-to-many relationship."""
+
     email_to_user = {user['email']: user for user in original_users}
-    
-    # Prepare user-group links
+
     user_group_links = []
+    missing_area_group = 0
     for user_row in inserted_users:
         email = user_row['email']
         user_id = user_row['id']
-        
-        # Get group_id from original user data
+
         original_user = email_to_user.get(email)
         if original_user and original_user.get('group_id'):
-            group_id = original_user['group_id']
-            user_group_links.append((user_id, group_id))
-    
+            user_group_links.append((user_id, original_user['group_id']))
+        elif original_user and original_user.get('group_name'):
+            missing_area_group += 1
+
+    if missing_area_group:
+        logger.warning(
+            "%d user(s) have an Area in CSV that did not match any users_group name",
+            missing_area_group,
+        )
+
     if not user_group_links:
-        logger.warning("No user-group links to create")
         return
     
     # Insert into user_users_groups junction table
@@ -629,6 +684,48 @@ def link_users_to_imported_role(cursor, user_ids, role_id):
     logger.info("✓ Linked %d user-role relationships to %r", len(user_role_links), IMPORTED_USERS_ROLE_NAME)
 
 
+def ensure_all_csv_users_linked(cursor, users, imported_role_id):
+    """Ensure every CSV user has imported role and Area group (idempotent backfill)."""
+    if not users:
+        return
+
+    emails = [user['email'] for user in users]
+    cursor.execute('SELECT id, email FROM "user" WHERE email = ANY(%s)', (emails,))
+    db_users = {row['email']: row['id'] for row in cursor.fetchall()}
+    email_to_user = {user['email']: user for user in users}
+
+    user_ids = []
+    user_group_links = []
+    missing_in_db = 0
+    for email in emails:
+        user_id = db_users.get(email)
+        if not user_id:
+            missing_in_db += 1
+            continue
+        user_ids.append(user_id)
+        original = email_to_user.get(email)
+        if original and original.get('group_id'):
+            user_group_links.append((user_id, original['group_id']))
+
+    if missing_in_db:
+        logger.warning("%d CSV user(s) not found in DB for role/group backfill", missing_in_db)
+
+    if user_group_links:
+        execute_values(
+            cursor,
+            """
+            INSERT INTO user_users_groups (user_id, group_id)
+            VALUES %s
+            ON CONFLICT DO NOTHING
+            """,
+            user_group_links,
+            template="(%s, %s)",
+        )
+        logger.info("✓ Ensured %d user-group relationship(s) from CSV", len(user_group_links))
+
+    link_users_to_imported_role(cursor, user_ids, imported_role_id)
+
+
 def run(connection_manager=None, state=None):
     """Main execution function. When run from wizard, connection_manager and state are provided for resume support."""
     print("""
@@ -659,18 +756,22 @@ def run(connection_manager=None, state=None):
         else:
             connection = connect_to_database(config)
         logger.info("\n" + "="*60)
-        logger.info("STEP 2: LOAD LOOKUP TABLES")
+        logger.info("STEP 2: SEED USER GROUPS FROM CSV")
+        logger.info("="*60)
+        seed_user_groups_from_csv(connection, csv_path)
+        logger.info("\n" + "="*60)
+        logger.info("STEP 3: LOAD LOOKUP TABLES")
         logger.info("="*60)
         lookups = get_lookup_tables(connection)
         logger.info("\n" + "="*60)
-        logger.info("STEP 3: EXTRACT USERS FROM CSV")
+        logger.info("STEP 4: EXTRACT USERS FROM CSV")
         logger.info("="*60)
         users = extract_users_from_csv(csv_path, lookups)
         if not users:
             logger.warning("No users found in CSV")
             return False
         logger.info("\n" + "="*60)
-        logger.info("STEP 4: SEED USERS TO DATABASE")
+        logger.info("STEP 5: SEED USERS TO DATABASE")
         logger.info("="*60)
         success = seed_users(connection, users, state=state)
         if success:
