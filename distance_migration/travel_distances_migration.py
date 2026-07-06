@@ -195,7 +195,7 @@ def get_existing_pairs_for_keys(connection, from_type, to_type, method, pair_key
                 FROM travel_distances
                 WHERE from_type = %s AND to_type = %s AND travel_method = %s
                   AND (from_id, to_id) IN (
-                    SELECT * FROM UNNEST(%s::int[], %s::int[]) AS t(from_id, to_id)
+                    SELECT * FROM UNNEST(%s::bigint[], %s::bigint[]) AS t(from_id, to_id)
                   )
             """, (from_type, to_type, method, from_ids, to_ids))
             for row in cursor.fetchall():
@@ -324,9 +324,9 @@ def _copy_insert_batch(cursor, rows, skip_conflict_check=False):
     cursor.execute("""
         CREATE TEMP TABLE IF NOT EXISTS _td_stage (
             from_type text,
-            from_id int,
+            from_id bigint,
             to_type text,
-            to_id int,
+            to_id bigint,
             travel_method text,
             distance_meters int,
             duration_minutes int,
