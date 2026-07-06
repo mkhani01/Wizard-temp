@@ -886,6 +886,63 @@ def check_caregiver_availability(connection) -> Tuple[bool, List[str]]:
 # 5. Distances Migration Check
 # ---------------------------------------------------------------------------
 
+def _check_distances_scoped(connection, user_ids, client_ids) -> Tuple[bool, List[str]]:
+    """Verify travel_distances for scoped pair sets (feasible_pairs + profile + routes)."""
+    msgs: List[str] = ["Distance Validation (scoped mode):"]
+    methods = ["car", "bike", "walk"]
+    all_ok = True
+
+    try:
+        from distance_migration.pair_scope import build_required_pairs, resolve_visit_csv_path
+    except ImportError:
+        msgs.append("SKIP: pair_scope module not available")
+        return True, msgs
+
+    scoped = build_required_pairs(connection, visit_csv_path=resolve_visit_csv_path())
+    categories = [
+        ("user", "client", scoped.get(("user", "client"), set()), "User → Client"),
+        ("client", "user", scoped.get(("client", "user"), set()), "Client → User"),
+        ("client", "client", scoped.get(("client", "client"), set()), "Client → Client (routes)"),
+    ]
+
+    cursor = connection.cursor()
+    try:
+        cursor.execute("""
+            SELECT from_type, to_type, from_id, to_id, travel_method
+            FROM travel_distances
+        """)
+        db_pairs = {}
+        for row in cursor.fetchall():
+            key = (row["from_type"], row["to_type"], row["travel_method"])
+            db_pairs.setdefault(key, set()).add((row["from_id"], row["to_id"]))
+    finally:
+        cursor.close()
+
+    for from_type, to_type, expected_pairs, label in categories:
+        if not expected_pairs:
+            msgs.append("%s: no pairs required (skip)" % label)
+            continue
+        msgs.append("%s (expected: %d pairs):" % (label, len(expected_pairs)))
+        for method in methods:
+            key = (from_type, to_type, method)
+            actual = db_pairs.get(key, set())
+            missing = expected_pairs - actual
+            if missing:
+                all_ok = False
+                msgs.append("  FAIL: %s - %d/%d pairs" % (method, len(actual), len(expected_pairs)))
+                for from_id, to_id in list(missing)[:5]:
+                    msgs.append("    missing: %s %d → %s %d" % (from_type, from_id, to_type, to_id))
+            else:
+                msgs.append("  PASS: %s has all %d pairs" % (method, len(expected_pairs)))
+        msgs.append("")
+
+    if all_ok:
+        msgs.append("PASS: All scoped distance pairs verified")
+    else:
+        msgs.append("FAIL: Some scoped distance pairs are missing")
+    return all_ok, msgs
+
+
 def check_distances(connection) -> Tuple[bool, List[str]]:
     """
     Verify that ALL distance pairs exist in travel_distances for all travel methods:
@@ -894,7 +951,11 @@ def check_distances(connection) -> Tuple[bool, List[str]]:
     3. All user to client pairs (both directions: user→client and client→user)
 
     This test verifies ACTUAL pairs, not just counts, to ensure no missing or duplicate pairs.
+    When DISTANCE_MODE=scoped (default), only feasible/profile/route pairs are checked.
     """
+    import os
+    distance_mode = os.getenv("DISTANCE_MODE", "scoped").strip().lower()
+
     msgs: List[str] = []
 
     cursor = connection.cursor()
@@ -917,31 +978,37 @@ def check_distances(connection) -> Tuple[bool, List[str]]:
         """)
         client_ids = [row["id"] for row in cursor.fetchall()]
 
-        if not user_ids:
-            msgs.append("SKIP: No users with coordinates")
-            return True, msgs
+    finally:
+        cursor.close()
 
-        if not client_ids:
-            msgs.append("SKIP: No clients with coordinates")
-            return True, msgs
+    if not user_ids:
+        msgs.append("SKIP: No users with coordinates")
+        return True, msgs
 
-        msgs.append("Distance Validation:")
+    if not client_ids:
+        msgs.append("SKIP: No clients with coordinates")
+        return True, msgs
+
+    if distance_mode == "scoped":
+        return _check_distances_scoped(connection, user_ids, client_ids)
+
+    cursor = connection.cursor()
+    try:
+        msgs.append("Distance Validation (full matrix mode):")
         msgs.append("  Users with coordinates: %d" % len(user_ids))
         msgs.append("  Clients with coordinates: %d" % len(client_ids))
         msgs.append("")
 
-        # Load ALL actual pairs from database grouped by (from_type, to_type, travel_method)
         cursor.execute("""
             SELECT from_type, to_type, from_id, to_id, travel_method
             FROM travel_distances
         """)
-        db_pairs = {}  # key: (from_type, to_type, travel_method) -> set of (from_id, to_id)
+        db_pairs = {}
         for row in cursor.fetchall():
             key = (row["from_type"], row["to_type"], row["travel_method"])
             if key not in db_pairs:
                 db_pairs[key] = set()
             db_pairs[key].add((row["from_id"], row["to_id"]))
-
     finally:
         cursor.close()
 
@@ -1353,8 +1420,14 @@ def check_feasible_pairs(connection) -> Tuple[bool, List[str]]:
         cursor.execute("SELECT COUNT(*) AS total FROM client_preferred_users")
         preferred_count = cursor.fetchone()["total"] or 0
         msgs.append("  client_preferred_users rows: %d" % preferred_count)
-        if len(db_pairs) > 0 and preferred_count == 0:
-            msgs.append("WARN: feasible_pairs populated but client_preferred_users is empty")
+        cursor.execute("SELECT COUNT(*) AS total FROM user_must_clients")
+        must_count = cursor.fetchone()["total"] or 0
+        cursor.execute("SELECT COUNT(*) AS total FROM user_only_clients")
+        only_count = cursor.fetchone()["total"] or 0
+        msgs.append("  user_must_clients rows: %d" % must_count)
+        msgs.append("  user_only_clients rows: %d" % only_count)
+        if len(db_pairs) > 0 and preferred_count == 0 and must_count == 0 and only_count == 0:
+            msgs.append("WARN: feasible_pairs populated but profile preference tables are empty")
     finally:
         cursor.close()
 

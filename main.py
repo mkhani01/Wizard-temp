@@ -41,10 +41,10 @@ def print_usage():
         geocode-calculation  Run geocode calculation
         userlocations        Update user lat/lng from JSON backup
         clientlocations      Update client lat/lng from JSON backup
-        travel-distances     Compute user<->client distances via OSRM, upsert travel_distances, then verify
+        travel-distances     Compute scoped travel distances via OSRM (DISTANCE_MODE=scoped default)
         csv-distances [args] Geocode carer/customer CSVs and export OSRM walking/driving/cycling JSON
         json-distances [args] Geocode users/clients JSONs and export walking/driving/cycling JSON
-        feasible-pairs [path]   Seed feasible_pairs + client_preferred_users (16-week VisitExport; default: assets/visit_data.csv)
+        feasible-pairs [path]   Seed feasible_pairs + profile Must/Preferred/Only (16-week VisitExport)
         client-windows [path]   Patient_Analyzer windows from full VisitExport (default: assets/client_windows_data.csv)
         carer-travel-limits [path]   Set max_distance_km / max_p2p_distance_km from VisitExport routes (default: assets/visit_data.csv)
         test                 Run pre-run checks and optional distance test (run before migrating)
@@ -56,10 +56,14 @@ def print_usage():
         python3 main.py clientlocations
     """)
 
-def run_travel_distances_migration():
+def run_travel_distances_migration(visit_csv_path=None):
     """Run travel distances migration"""
     from distance_migration.travel_distances_migration import run as run_travel_distances_migration
-    run_travel_distances_migration()
+    from migration_support import get_assets_dir
+    if visit_csv_path is None:
+        default = get_assets_dir() / "visit_data.csv"
+        visit_csv_path = str(default) if default.exists() else None
+    run_travel_distances_migration(visit_csv_path=visit_csv_path)
 
 def run_areas_migration():
     """Run area migration"""

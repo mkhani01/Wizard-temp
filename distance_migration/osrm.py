@@ -4,11 +4,12 @@ OSRM table API client: distance and duration matrices for driving, cycling, walk
 
 import os
 import sys
-from typing import List, Dict, Literal, Tuple
+from typing import List, Dict, Literal, Tuple, Optional, Callable, Set
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import argparse
 import json
+import time
 import requests
 
 from geopy.distance import geodesic
@@ -31,6 +32,10 @@ OSRM_CONFIG = {
 }
 
 OSRM_BASE_URL = 'https://osrm.aossystem.com'
+OSRM_REQUEST_TIMEOUT_SECONDS = 120
+OSRM_MAX_RETRIES = 5
+OSRM_BACKOFF_SECONDS = 2
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 
 def call_osrm_table_api(
@@ -60,20 +65,37 @@ def call_osrm_table_api(
     if destinations is not None:
         params['destinations'] = ';'.join(map(str, destinations))
 
-    try:
-        response = requests.get(url, params=params, timeout=300)
-        response.raise_for_status()
-        data = response.json()
+    last_error = None
+    for attempt in range(1, OSRM_MAX_RETRIES + 1):
+        try:
+            response = requests.get(url, params=params, timeout=OSRM_REQUEST_TIMEOUT_SECONDS)
+            if response.status_code in RETRYABLE_STATUS_CODES:
+                raise requests.exceptions.HTTPError(
+                    f"Retryable OSRM status {response.status_code}",
+                    response=response,
+                )
+            response.raise_for_status()
+            data = response.json()
 
-        if data.get('code') != 'Ok':
-            raise ValueError(f"OSRM API error: {data.get('message', 'Unknown error')}")
+            if data.get('code') != 'Ok':
+                raise ValueError(f"OSRM API error: {data.get('message', 'Unknown error')}")
 
-        return {
-            'distances': data.get('distances', []),
-            'durations': data.get('durations', [])
-        }
-    except requests.exceptions.RequestException as e:
-        raise RuntimeError(f"Failed to call OSRM API: {str(e)}")
+            return {
+                'distances': data.get('distances', []),
+                'durations': data.get('durations', [])
+            }
+        except requests.exceptions.RequestException as e:
+            last_error = e
+            if attempt == OSRM_MAX_RETRIES:
+                break
+            delay = OSRM_BACKOFF_SECONDS * (2 ** (attempt - 1))
+            print(
+                f"OSRM request failed on attempt {attempt}/{OSRM_MAX_RETRIES}: {e}. "
+                f"Retrying in {delay}s..."
+            )
+            time.sleep(delay)
+
+    raise RuntimeError(f"Failed to call OSRM API after {OSRM_MAX_RETRIES} attempts: {str(last_error)}")
 
 
 def get_cross_distance_matrix(
@@ -156,18 +178,45 @@ def get_cross_distance_matrix(
 
 
 # Max concurrent OSRM block requests (avoid overwhelming server)
-OSRM_MAX_WORKERS = 6
+OSRM_MAX_WORKERS = 4
+
+
+def _block_covers_required_pairs(
+    blk1: Tuple[int, int],
+    blk2: Tuple[int, int],
+    entity_ids1: List,
+    entity_ids2: List,
+    num_entity1: int,
+    num_entity2: int,
+    required_pairs: Optional[Set[Tuple[int, int]]],
+) -> bool:
+    """True if this source×dest block could contain any required pair."""
+    if not required_pairs:
+        return True
+    src_ids = entity_ids1[blk1[0]: min(blk1[1], num_entity1)]
+    dst_ids = entity_ids2[blk2[0]: min(blk2[1], num_entity2)]
+    for s in src_ids:
+        for t in dst_ids:
+            if (s, t) in required_pairs:
+                return True
+    return False
 
 
 def get_distance_matrix(
     entities_info1: Dict,
     entities_info2: Dict,
     travel_method: Literal['driving-car', 'cycling-regular', 'foot-walking'],
-    step_size: int = 50
+    step_size: int = 50,
+    on_block_complete: Optional[Callable[[Dict], None]] = None,
+    required_pairs: Optional[Set[Tuple[int, int]]] = None,
 ) -> Dict:
     """
     Computes distance matrix between two sets of entities with batching.
     Block pairs are requested in parallel via ThreadPoolExecutor.
+
+    If on_block_complete is provided, each successful block is passed to the callback
+    immediately and is not accumulated in the returned matrix (pipeline mode).
+    required_pairs optionally filters block results to (src_id, dst_id) in the set.
     """
     entity_ids1 = list(entities_info1.keys())
     num_entity1 = len(entities_info1)
@@ -177,12 +226,36 @@ def get_distance_matrix(
     blocks1 = [(i, i + step_size) for i in range(0, num_entity1, step_size)]
     blocks2 = [(i, i + step_size) for i in range(0, num_entity2, step_size)]
 
-    distance_info = {'distance': {}, 'duration': {}}
+    block_pairs = [
+        (blk1, blk2)
+        for blk1 in blocks1
+        for blk2 in blocks2
+        if _block_covers_required_pairs(
+            blk1, blk2, entity_ids1, entity_ids2,
+            num_entity1, num_entity2, required_pairs,
+        )
+    ]
+
+    accumulate = on_block_complete is None
+    distance_info = {'distance': {}, 'duration': {}} if accumulate else {}
 
     is_self_matrix = (entities_info1 is entities_info2)
 
-    total_blocks = len(blocks1) * len(blocks2)
+    total_blocks = len(block_pairs)
+    skipped_blocks = (len(blocks1) * len(blocks2)) - total_blocks
+    if skipped_blocks:
+        print(f"Skipping {skipped_blocks} block(s) with no missing required pairs.")
     print(f"Processing {num_entity1} x {num_entity2} matrix with {travel_method} ({total_blocks} blocks, {OSRM_MAX_WORKERS} workers)...")
+
+    def _filter_block(blk_distance: Dict) -> Dict:
+        if not required_pairs:
+            return blk_distance
+        filtered = {"distance": {}, "duration": {}}
+        for key, dist_km in blk_distance.get("distance", {}).items():
+            if key in required_pairs:
+                filtered["distance"][key] = dist_km
+                filtered["duration"][key] = blk_distance.get("duration", {}).get(key, 0)
+        return filtered
 
     def run_block(blk1, blk2):
         src_entities = {
@@ -201,19 +274,42 @@ def get_distance_matrix(
         )
 
     completed = 0
+    errors = []
+    if not block_pairs:
+        return distance_info
+
     with ThreadPoolExecutor(max_workers=OSRM_MAX_WORKERS) as executor:
         futures = {
             executor.submit(run_block, blk1, blk2): (blk1, blk2)
-            for blk1 in blocks1
-            for blk2 in blocks2
+            for blk1, blk2 in block_pairs
         }
         for future in as_completed(futures):
-            blk_distance = future.result()
-            distance_info['distance'].update(blk_distance['distance'])
-            distance_info['duration'].update(blk_distance['duration'])
+            blk1, blk2 = futures[future]
+            try:
+                blk_distance = future.result()
+            except Exception as e:
+                errors.append((blk1, blk2, str(e)))
+                print(
+                    f"  Block {blk1[0]}:{blk1[1]} x {blk2[0]}:{blk2[1]} failed after retries: {e}"
+                )
+                continue
+            blk_distance = _filter_block(blk_distance)
+            if on_block_complete:
+                if blk_distance.get("distance"):
+                    on_block_complete(blk_distance)
+            elif accumulate:
+                distance_info['distance'].update(blk_distance['distance'])
+                distance_info['duration'].update(blk_distance['duration'])
             completed += 1
             if completed % 20 == 0 or completed == total_blocks:
                 print(f"  Processing block {completed}/{total_blocks}...")
+
+    if errors:
+        distance_info['errors'] = errors
+        print(
+            f"Completed {completed}/{total_blocks} blocks with {len(errors)} failed block(s). "
+            "Successful blocks will be inserted before retry."
+        )
 
     return distance_info
 

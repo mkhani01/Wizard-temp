@@ -66,8 +66,36 @@ def test_small_example():
     return True
 
 
+def test_pipeline_callback_does_not_accumulate():
+    """Verify on_block_complete pipeline mode returns empty matrix."""
+    from unittest.mock import patch
+
+    locs_a = {1: {"longitude": -6.2, "latitude": 53.3}, 2: {"longitude": -6.3, "latitude": 53.4}}
+    locs_b = {10: {"longitude": -6.25, "latitude": 53.35}}
+    blocks = []
+
+    def on_block(m):
+        blocks.append(m)
+
+    fake_block = {"distance": {(1, 10): 1.5}, "duration": {(1, 10): 5}}
+    with patch("distance_migration.osrm.get_cross_distance_matrix", return_value=fake_block):
+        result = get_distance_matrix(
+            entities_info1=locs_a,
+            entities_info2=locs_b,
+            travel_method="driving-car",
+            step_size=10,
+            on_block_complete=on_block,
+        )
+    assert result.get("distance", {}) == {} or not result.get("distance")
+    assert len(blocks) >= 1
+    print("  ✓ Pipeline callback test passed")
+    return True
+
+
 if __name__ == "__main__":
+    if not test_pipeline_callback_does_not_accumulate():
+        sys.exit(1)
     result = test_small_example()
-    if result is None:
-        sys.exit(0)  # skip
-    sys.exit(0 if result else 1)
+    if result is False:
+        sys.exit(1)
+    sys.exit(0)

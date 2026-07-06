@@ -30,6 +30,22 @@ def main():
     result = test_small_example()
     if result is False:
         return 1
+    print("Profile preference classification tests...")
+    from tests.test_profile_preferences import (
+        test_classify_only_for_long_duration_high_weight,
+        test_classify_must_for_normal_duration_high_weight,
+        test_classify_preferred_for_current_primary,
+        test_must_only_take_precedence_over_preferred,
+        test_exclusivity_in_build_profile_rows,
+        test_two_way_sync_row_counts,
+    )
+    test_classify_only_for_long_duration_high_weight()
+    test_classify_must_for_normal_duration_high_weight()
+    test_classify_preferred_for_current_primary()
+    test_must_only_take_precedence_over_preferred()
+    test_exclusivity_in_build_profile_rows()
+    test_two_way_sync_row_counts()
+    print("  ✓ Profile preference tests passed")
     print("\n✓ All tests OK. You can run the wizard or CLI.")
     return 0
 
