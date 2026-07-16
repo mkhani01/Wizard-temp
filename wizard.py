@@ -70,7 +70,7 @@ STEP_RUN = 5
 TOTAL_STEPS = 6
 
 # Wizard release version (shown in UI and window title on all platforms / frozen builds)
-WIZARD_VERSION = "0.0.2"
+WIZARD_VERSION = "0.0.4"
 
 # Migration option keys (must match checkbox keys and file keys)
 OPT_CAREGIVERS = "caregivers"
@@ -210,8 +210,8 @@ class MigrationWizard:
     def __init__(self):
         self.root = Tk()
         self.root.title("AOS System – Migration Wizard ({})".format(WIZARD_VERSION))
-        self.root.minsize(640, 520)
-        self.root.geometry("720x580")
+        self.root.minsize(700, 560)
+        self.root.geometry("780x640")
 
         # Window icon (favicon) – keep reference so it persists, especially on Mac
         # When frozen, logo is bundled via PyInstaller --add-data (in BUNDLE_ROOT); else next to exe/script
@@ -410,10 +410,38 @@ class MigrationWizard:
         intro = (
             "Tick each type of data you want to import. In the next step you will choose the file (or folder) for each option.\n\n"
             "Hint: If you want to migrate Caregivers Availability or Clients Availability, you must tick \"Availability types\" as well, "
-            "and run that step first (the wizard runs steps in the correct order)."
+            "and run that step first (the wizard runs steps in the correct order).\n\n"
+            "Scroll down in the list below (mouse wheel, scrollbar, or arrow/Page keys) to see more options "
+            "(Caregivers, Clients, Geocode, Calculate distances, Feasible pairs, etc.)."
         )
-        ttk.Label(parent, text=intro, wraplength=560, padding=(0, 6)).grid(row=row, column=0, sticky=W, pady=(0, 10))
+        ttk.Label(parent, text=intro, wraplength=560, padding=(0, 6)).grid(row=row, column=0, sticky=W, pady=(0, 8))
         row += 1
+
+        # Pin "Update today visits" above the scroll list so it is always visible on Windows
+        # (scroll + mousewheel often fail to reach options buried inside a Canvas).
+        pinned = ttk.Frame(parent, padding=(0, 4, 0, 10))
+        pinned.grid(row=row, column=0, sticky=(E, W), pady=(0, 4))
+        pinned.columnconfigure(0, weight=1)
+        ttk.Checkbutton(
+            pinned,
+            text="Update today visits",
+            variable=self.check_vars[OPT_UPDATE_TODAY_VISITS],
+            command=self._sync_checkbox_dependencies,
+        ).grid(row=0, column=0, sticky=W)
+        ttk.Label(
+            pinned,
+            text=(
+                "Cancel roster visits for a selected date using Client Hours with Service Type. "
+                "Rows with Cancellation Description cancel matching ALLOCATED/UNALLOCATED visits; "
+                "terminated clients' visits that day are cancelled with type Terminated. "
+                "Missing visits are skipped and logged. You will pick the file and date in the next step."
+            ),
+            wraplength=560,
+            padding=(28, 4, 8, 4),
+        ).grid(row=1, column=0, sticky=W)
+        ttk.Separator(pinned, orient="horizontal").grid(row=2, column=0, sticky=(E, W), pady=(8, 0))
+        row += 1
+
         row_for_scroll = row
 
         # Scrollable area: canvas + scrollbar + inner frame
@@ -458,13 +486,24 @@ class MigrationWizard:
         scroll_frame.bind("<Button-4>", _on_mousewheel_linux)
         scroll_frame.bind("<Button-5>", _on_mousewheel_linux)
         scroll_frame.bind("<Enter>", _focus_canvas)
+        # Keyboard scrolling as a fallback when wheel/touchpad events don't reach the canvas
+        canvas.bind("<Up>", lambda e: canvas.yview_scroll(-1, "units"))
+        canvas.bind("<Down>", lambda e: canvas.yview_scroll(1, "units"))
+        canvas.bind("<Prior>", lambda e: canvas.yview_scroll(-1, "pages"))  # Page Up
+        canvas.bind("<Next>", lambda e: canvas.yview_scroll(1, "pages"))  # Page Down
+        canvas.bind("<Home>", lambda e: canvas.yview_moveto(0))
+        canvas.bind("<End>", lambda e: canvas.yview_moveto(1))
+        # Used by _show_step to bind_all while this step is visible (Windows)
+        self._checkbox_canvas = canvas
+        self._checkbox_on_mousewheel = _on_mousewheel
+        self._checkbox_on_mousewheel_linux = _on_mousewheel_linux
 
         canvas.grid(row=row_for_scroll, column=0, sticky=(N, S, E, W))
         scrollbar.grid(row=row_for_scroll, column=1, sticky=(N, S))
         parent.columnconfigure(0, weight=1)
         parent.rowconfigure(row_for_scroll, weight=1)
 
-        # Content inside scroll_frame
+        # Content inside scroll_frame (Update today visits is pinned above, not listed again)
         inner = scroll_frame
         inner.columnconfigure(0, weight=1)
         wrap = 540
@@ -475,7 +514,6 @@ class MigrationWizard:
             (OPT_CAREGIVERS_AVAILABILITY, "Caregivers Availability", "Import each caregiver’s availability from an Excel workbook. Hint: Requires Availability types. File is usually userAvailabilities.xlsx. You will select it in the next step."),
             (OPT_CLIENTS, "Clients", "Import clients from a CSV export. Hint: Use a file like CustomerExport.csv. You will choose the file in the next step."),
             (OPT_CLIENTS_AVAILABILITY, "Clients Availability", "Import client availability from Excel. Hint: Requires Availability types. You can select one file or a folder of workbooks (e.g. Client Hours with Service Type)."),
-            (OPT_UPDATE_TODAY_VISITS, "Update today visits", "Cancel roster visits for a selected date using Client Hours with Service Type. Rows with Cancellation Description cancel matching ALLOCATED/UNALLOCATED visits; terminated clients' visits that day are cancelled with type Terminated. Missing visits are skipped and logged."),
             (OPT_GEOCODE_CLIENT_FILE, "Get clients location from file", "Update client latitude/longitude from a JSON backup file (e.g. clientbackup.json). File must contain \"latitude\", \"longitude\", \"name\", \"lastname\" for each record. This is useful for manually seeding known coordinates before using the Google API."),
             (OPT_GEOCODE_CAREGIVER_FILE, "Get users location from file", "Update user (caregiver) latitude/longitude from a JSON backup file (e.g. usersBackup.json). File must contain \"latitude\", \"longitude\", \"name\", \"lastname\" for each record. This is useful for manually seeding known coordinates before using the Google API."),
             (OPT_GEOCODE_API, "Calculated Geocode (Google API)", "Use Google Maps API to fill in latitude/longitude from postcodes for users and clients that have NULL coordinates. This runs AFTER file-based location imports (if selected), only geocoding records with postcodes but missing lat/long. You need a Google Maps API key and the Irish cities file (IE.txt). Can be combined with file-based options."),
@@ -620,6 +658,13 @@ class MigrationWizard:
         scroll_frame.bind("<MouseWheel>", _on_mousewheel)
         scroll_frame.bind("<Button-4>", _on_mousewheel_linux)
         scroll_frame.bind("<Button-5>", _on_mousewheel_linux)
+        # Keyboard scrolling as a fallback when wheel/touchpad events don't reach the canvas
+        canvas.bind("<Up>", lambda e: canvas.yview_scroll(-1, "units"))
+        canvas.bind("<Down>", lambda e: canvas.yview_scroll(1, "units"))
+        canvas.bind("<Prior>", lambda e: canvas.yview_scroll(-1, "pages"))  # Page Up
+        canvas.bind("<Next>", lambda e: canvas.yview_scroll(1, "pages"))  # Page Down
+        canvas.bind("<Home>", lambda e: canvas.yview_moveto(0))
+        canvas.bind("<End>", lambda e: canvas.yview_moveto(1))
         # Keep refs so _refresh_file_step can re-bind wheel on new children (Windows)
         self._files_on_mousewheel = _on_mousewheel
         self._files_on_mousewheel_linux = _on_mousewheel_linux
@@ -821,6 +866,33 @@ class MigrationWizard:
         ]
         self.step_label.config(text=titles[step])
         self.btn_back.config(state="normal" if step > 0 else "disabled")
+
+        # Global mousewheel only while on scrollable checkbox/files steps (Windows needs bind_all)
+        self.root.unbind_all("<MouseWheel>")
+        self.root.unbind_all("<Button-4>")
+        self.root.unbind_all("<Button-5>")
+        if step == STEP_CHECKBOXES:
+            on_wheel = getattr(self, "_checkbox_on_mousewheel", None)
+            on_linux = getattr(self, "_checkbox_on_mousewheel_linux", None)
+            if on_wheel:
+                self.root.bind_all("<MouseWheel>", on_wheel)
+            if on_linux:
+                self.root.bind_all("<Button-4>", on_linux)
+                self.root.bind_all("<Button-5>", on_linux)
+            checkbox_canvas = getattr(self, "_checkbox_canvas", None)
+            if checkbox_canvas is not None:
+                checkbox_canvas.focus_set()
+        elif step == STEP_FILES:
+            on_wheel = getattr(self, "_files_on_mousewheel", None)
+            on_linux = getattr(self, "_files_on_mousewheel_linux", None)
+            if on_wheel:
+                self.root.bind_all("<MouseWheel>", on_wheel)
+            if on_linux:
+                self.root.bind_all("<Button-4>", on_linux)
+                self.root.bind_all("<Button-5>", on_linux)
+            files_canvas = getattr(self, "_files_canvas", None)
+            if files_canvas is not None:
+                files_canvas.focus_set()
 
         # Show/hide Check Migration button for file selection step
         if step == STEP_FILES:
