@@ -32,7 +32,7 @@ jobs:
           $addData = if (Test-Path favicon.png) { @('--add-data', 'favicon.png;.') } else { @() }
           pyinstaller --onefile --noconfirm --clean --name AOS-Migration-Wizard @addData `
             --hidden-import=areaMigration --hidden-import=availabilityTypeMigration `
-            --hidden-import=clientAvailabilityMigration --hidden-import=clientLocationsMigration `
+            --hidden-import=clientAvailabilityMigration --hidden-import=clientLocationsMigration --hidden-import=updateTodayVisitsMigration `
             --hidden-import=clientsMigration --hidden-import=distance_migration `
             --hidden-import=feasible_pairs_migration --hidden-import=geocodeCalculation `
             --hidden-import=userAvailabilityMigration --hidden-import=userLocationsMigration `
@@ -79,7 +79,7 @@ jobs:
           if [ -f favicon.png ]; then ADD_DATA=' --add-data favicon.png:.'; fi
           pyinstaller --noconfirm --clean --onedir --windowed --name AOS-Migration-Wizard $ADD_DATA \
             --hidden-import=areaMigration --hidden-import=availabilityTypeMigration \
-            --hidden-import=clientAvailabilityMigration --hidden-import=clientLocationsMigration \
+            --hidden-import=clientAvailabilityMigration --hidden-import=clientLocationsMigration --hidden-import=updateTodayVisitsMigration \
             --hidden-import=clientsMigration --hidden-import=distance_migration \
             --hidden-import=feasible_pairs_migration --hidden-import=geocodeCalculation \
             --hidden-import=userAvailabilityMigration --hidden-import=userLocationsMigration \
@@ -163,7 +163,7 @@ jobs:
           [ -f favicon.png ] && ADD_DATA=' --add-data favicon.png:.'
           pyinstaller --onefile --noconfirm --clean --name AOS-Migration-Wizard $ADD_DATA \
             --hidden-import=areaMigration --hidden-import=availabilityTypeMigration \
-            --hidden-import=clientAvailabilityMigration --hidden-import=clientLocationsMigration \
+            --hidden-import=clientAvailabilityMigration --hidden-import=clientLocationsMigration --hidden-import=updateTodayVisitsMigration \
             --hidden-import=clientsMigration --hidden-import=distance_migration \
             --hidden-import=feasible_pairs_migration --hidden-import=geocodeCalculation \
             --hidden-import=userAvailabilityMigration --hidden-import=userLocationsMigration \

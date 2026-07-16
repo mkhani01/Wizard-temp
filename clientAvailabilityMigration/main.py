@@ -13,6 +13,8 @@ Rules:
   AND "Planned Service Requirement Type Description" = "Personal Care" are considered.
 - Client matching: "Service Location Name" column (format: "lastname, name")
 - Time: "Service Requirement Start Date And Time" and "Service Requirement End Date And Time"
+  (if either is empty, fall back to "Actual Start Date And Time" / "Actual End Date And Time";
+   if still empty after fallback, skip and log)
 - Start Date: First service date - 14 days (2 weeks before)
 - Recurrence: Based on WEEK_ROTATION or auto-detected from comparing both weeks
   - If both weeks have SAME schedule → occurs_every=1 (weekly)
@@ -396,6 +398,8 @@ def process_xlsx_file(filepath: Path, clients_map: Dict[str, int]) -> Tuple[Dict
     col_planned_req_type = find_excel_column_index(header_row, ['Planned Service Requirement Type Description'])
     col_start_datetime = find_excel_column_index(header_row, ['Service Requirement Start Date And Time'])
     col_end_datetime = find_excel_column_index(header_row, ['Service Requirement End Date And Time'])
+    col_actual_start = find_excel_column_index(header_row, ['Actual Start Date And Time'])
+    col_actual_end = find_excel_column_index(header_row, ['Actual End Date And Time'])
     col_duration = find_excel_column_index(header_row, ['Service Requirement Duration'])
 
     logger.info(f"Column mappings:")
@@ -404,6 +408,8 @@ def process_xlsx_file(filepath: Path, clients_map: Dict[str, int]) -> Tuple[Dict
     logger.info(f"  - Planned Service Requirement Type Description: column {col_planned_req_type}")
     logger.info(f"  - Service Requirement Start Date And Time: column {col_start_datetime}")
     logger.info(f"  - Service Requirement End Date And Time: column {col_end_datetime}")
+    logger.info(f"  - Actual Start Date And Time: column {col_actual_start}")
+    logger.info(f"  - Actual End Date And Time: column {col_actual_end}")
     logger.info(f"  - Service Requirement Duration: column {col_duration}")
     
     if col_service_location_name == -1:
@@ -434,6 +440,8 @@ def process_xlsx_file(filepath: Path, clients_map: Dict[str, int]) -> Tuple[Dict
         planned_req_type_val = row[col_planned_req_type] if col_planned_req_type < len(row) else None
         start_datetime_val = row[col_start_datetime] if col_start_datetime < len(row) else None
         end_datetime_val = row[col_end_datetime] if col_end_datetime < len(row) else None
+        actual_start_val = row[col_actual_start] if col_actual_start != -1 and col_actual_start < len(row) else None
+        actual_end_val = row[col_actual_end] if col_actual_end != -1 and col_actual_end < len(row) else None
         duration_val = row[col_duration] if col_duration != -1 and col_duration < len(row) else None
         
         # Before everything: only rows with BOTH "Planned Service Type Description" = "Personal Care"
@@ -476,15 +484,30 @@ def process_xlsx_file(filepath: Path, clients_map: Dict[str, int]) -> Tuple[Dict
 
         start_datetime = parse_datetime_value(start_datetime_val)
         end_datetime = parse_datetime_value(end_datetime_val)
+        used_actual_fallback = False
+        if not start_datetime:
+            start_datetime = parse_datetime_value(actual_start_val)
+            if start_datetime:
+                used_actual_fallback = True
+        if not end_datetime:
+            end_datetime = parse_datetime_value(actual_end_val)
+            if end_datetime:
+                used_actual_fallback = True
 
         # Extra safety check for None/NaT values
         if not start_datetime or not end_datetime:
             skipped_missing_data += 1
             logger.warning(
-                "Row %d: SKIPPED - missing datetime | Location=%r, Start=%r, End=%r",
-                row_num, service_location_name, start_datetime_val, end_datetime_val
+                "Row %d: SKIPPED - missing datetime (Requirement and Actual empty) | Location=%r, ReqStart=%r, ReqEnd=%r, ActStart=%r, ActEnd=%r",
+                row_num, service_location_name, start_datetime_val, end_datetime_val, actual_start_val, actual_end_val
             )
             continue
+
+        if used_actual_fallback:
+            logger.info(
+                "Row %d: using Actual Start/End (Requirement empty) | Location=%r, start=%s, end=%s",
+                row_num, service_location_name, start_datetime, end_datetime
+            )
 
         # Ensure we have actual datetime objects
         try:

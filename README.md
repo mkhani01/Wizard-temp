@@ -25,6 +25,7 @@ Migration/
 ├── clientAvailabilityMigration/
 ├── clientLocationsMigration/
 ├── clientsMigration/
+├── updateTodayVisitsMigration/  # Cancel today's visits from Client Hours + terminated clients
 ├── feasible_pairs_migration/
 ├── geocodeCalculation/
 ├── userAvailabilityMigration/
@@ -62,7 +63,7 @@ Migration/
    - `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` for PostgreSQL.
 
    Optional: `GOOGLE_MAPS_API_KEY` for geocode step; OSRM base URL is in `distance_migration/osrm.py`.
-   `DISTANCE_MODE=scoped` (default) or `full`; `VISIT_EXPORT_CSV` for route-based client↔client pairs in scoped mode.
+   `DISTANCE_MODE=full` (default) or `scoped`; `VISIT_EXPORT_CSV` for route-based client↔client pairs in scoped mode.
 
 ---
 
@@ -92,7 +93,7 @@ Steps:
 
 1. **Welcome** – Intro and link to AOS.
 2. **Database** – PostgreSQL connection (Host, Port, Database, User, Password).
-3. **Select data** – Choose what to migrate (Caregivers, Clients, Availability types, etc.). Select **Availability types** if you use Caregivers/Clients Availability.
+3. **Select data** – Choose what to migrate (Caregivers, Clients, Availability types, Update today visits, etc.). Select **Availability types** if you use Caregivers/Clients Availability. **Update today visits** needs a Client Hours with Service Type file and a visit date (YYYY-MM-DD).
 4. **Files** – For each option, choose the input file or folder. Not needed for “Calculated Geocode” or “Calculate distances” (except IE.txt for API geocode).
 5. **Review** – Summary; accept the privacy policy to continue.
 6. **Run** – Pre-run checks run first; then migrations run in order. A log file is saved in the project root.
@@ -114,15 +115,16 @@ python main.py <command> [options]
 | `clients` | Migrate clients |
 | `availability-types [path]` | Migrate availability types from CSV (default: `assets/availabilitytypes`) |
 | `user-availabilities` | Migrate user availability |
-| `availabilities [xlsx] [out_dir]` | Migrate client availabilities (Client Hours with Service Type) |
+| `availabilities [xlsx] [out_dir]` | Migrate client availabilities (Client Hours with Service Type). If Requirement start/end is empty, uses Actual Start/End; otherwise skips the row. |
 | `geocode-calculation` | Run geocode calculation (Google API) |
 | `userlocations` | Update user lat/lng from JSON backup |
 | `clientlocations` | Update client lat/lng from JSON backup |
-| `travel-distances` | Compute scoped user↔client distances via OSRM (feasible pairs + profile prefs); pipeline COPY insert. `DISTANCE_MODE=full` for legacy full matrix |
+| `travel-distances` | Compute full travel distance matrix via OSRM (all pairs with coordinates); pipeline COPY insert. `DISTANCE_MODE=scoped` for feasible/profile/route pairs only |
 | `json-distances [args]` | Geocode `users.json` and `clients.json`, then write enriched JSON files plus `walking_data.json`, `driving_data.json`, and `cycling_data.json` |
 | `feasible-pairs [path]` | Seed `feasible_pairs` + profile Must/Preferred/Only (two-way sync) from VisitExport (default: `assets/visit_data.csv`) |
 | `client-windows [path]` | Patient_Analyzer pipeline → `client_schedule_preferences` window_start / window_end / suggested_duration / min_duration (default: `assets/client_windows_data.csv`). |
 | `carer-travel-limits [path]` | Set `user.max_distance_km` / `max_p2p_distance_km` from VisitExport routes + `travel_distances` (default: `assets/visit_data.csv`; run after `travel-distances`). |
+| `update-today-visits [xlsx] [YYYY-MM-DD]` | Cancel roster visits for a date from Client Hours with Service Type: rows with Cancellation Description cancel matching ALLOCATED/UNALLOCATED visits; terminated clients' visits that day cancel with type `Terminated`. Missing visits are skipped and logged. |
 | `test` | Run pre-run checks and optional distance test |
 
 ---

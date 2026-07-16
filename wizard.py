@@ -87,6 +87,7 @@ OPT_CALCULATE_DISTANCES = "calculate_distances"
 OPT_FVISIT_HISTORY = "fvisit_history"
 OPT_CLIENT_WINDOWS = "client_windows"
 OPT_CARER_TRAVEL_LIMITS = "carer_travel_limits"
+OPT_UPDATE_TODAY_VISITS = "update_today_visits"
 
 # Options that require a file in step 4 (excluding geocode_api and calculate_distances)
 FILE_OPTIONS = [
@@ -100,6 +101,7 @@ FILE_OPTIONS = [
     OPT_FVISIT_HISTORY,
     OPT_CLIENT_WINDOWS,
     OPT_CARER_TRAVEL_LIMITS,
+    OPT_UPDATE_TODAY_VISITS,
 ]
 # Geocode API needs IE.txt (and optional API key in env)
 GEOCODE_API_FILES = ["geocode_ie_txt", "geocode_api_key"]
@@ -116,6 +118,7 @@ OPT_FILE_TYPE = {
     OPT_FVISIT_HISTORY: "file",
     OPT_CLIENT_WINDOWS: "file",
     OPT_CARER_TRAVEL_LIMITS: "file",
+    OPT_UPDATE_TODAY_VISITS: "file",
 }
 
 # Where to copy each option's file(s) (relative to ASSETS)
@@ -130,6 +133,7 @@ OPT_ASSET_PATH = {
     OPT_FVISIT_HISTORY: "visit_data.csv",
     OPT_CLIENT_WINDOWS: "client_windows_data.csv",
     OPT_CARER_TRAVEL_LIMITS: "carer_travel_limits_data.csv",
+    OPT_UPDATE_TODAY_VISITS: "updateTodayVisits/ClientHoursWithServiceType.xlsx",
 }
 
 AOS_URL = "https://aossystem.com/"
@@ -228,11 +232,12 @@ class MigrationWizard:
             OPT_GEOCODE_CLIENT_FILE, OPT_GEOCODE_CAREGIVER_FILE,
             OPT_GEOCODE_ALL_CLIENTS, OPT_GEOCODE_ALL_USERS,
             OPT_CALCULATE_DISTANCES, OPT_FVISIT_HISTORY, OPT_CLIENT_WINDOWS,
-            OPT_CARER_TRAVEL_LIMITS,
+            OPT_CARER_TRAVEL_LIMITS, OPT_UPDATE_TODAY_VISITS,
         ]}
         self.file_paths = {}  # option -> path string (file or folder)
         self.geocode_api_key = StringVar(value=os.getenv("GOOGLE_MAPS_API_KEY", ""))
         self.geocode_ie_txt_path = StringVar(value="")
+        self.update_today_visits_date = StringVar(value=datetime.now().strftime("%Y-%m-%d"))
         self.privacy_accepted = BooleanVar(value=False)
 
         self._setup_styles()
@@ -461,10 +466,11 @@ class MigrationWizard:
             (OPT_GEOCODE_API, "Calculated Geocode (Google API)", "Use Google Maps API to fill in latitude/longitude from postcodes for users and clients that have NULL coordinates. This runs AFTER file-based location imports (if selected), only geocoding records with postcodes but missing lat/long. You need a Google Maps API key and the Irish cities file (IE.txt). Can be combined with file-based options."),
             (OPT_GEOCODE_ALL_CLIENTS, "Geocode all Clients", "Re-geocode ALL clients with a postcode, including records that already have latitude/longitude. Use this to refresh all client coordinates from postcode before distance migration."),
             (OPT_GEOCODE_ALL_USERS, "Geocode all Users", "Re-geocode ALL users with a postcode, including records that already have latitude/longitude. Use this to refresh all user coordinates from postcode before distance migration."),
-            (OPT_CALCULATE_DISTANCES, "Calculate distances", "Compute travel distances for feasible pairs and profile preferences (scoped mode by default). Reads coordinates from DB, calls OSRM, inserts via pipeline COPY. Run Feasible pairs first for best coverage. Set DISTANCE_MODE=full for legacy full matrix."),
+            (OPT_CALCULATE_DISTANCES, "Calculate distances", "Compute full travel distance matrix for all users and clients with coordinates (default). Reads coordinates from DB, calls OSRM, inserts via pipeline COPY. Set DISTANCE_MODE=scoped to limit pairs to feasible/profile/route sets only."),
             (OPT_FVISIT_HISTORY, "Feasible pairs (visit history)", "Seed feasible_pairs and profile Must/Preferred/Only (two-way sync on user and client profiles) from VisitExport CSV (Personal Care, last 16 weeks, Actual Employee Name). Run before Calculate distances."),
             (OPT_CLIENT_WINDOWS, "Client windows analyzer", "Update client_schedule_preferences (window_start, window_end, suggested_duration, min_duration) from full VisitExport history using the Patient_Analyzer pipeline. Requires Clients Availability. Same VisitExport file as Feasible pairs is fine."),
             (OPT_CARER_TRAVEL_LIMITS, "Carer travel limits (max distance)", "Set user.max_distance_km and max_p2p_distance_km from VisitExport daily routes and the travel_distances table. Requires Calculate distances first. Same VisitExport file as Feasible pairs is fine."),
+            (OPT_UPDATE_TODAY_VISITS, "Update today visits", "Cancel roster visits for a selected date using Client Hours with Service Type. Rows with Cancellation Description cancel matching ALLOCATED/UNALLOCATED visits; terminated clients' visits that day are cancelled with type Terminated. Missing visits are skipped and logged."),
         ]
         row = 0
         for key, title, hint in opts:
@@ -493,9 +499,9 @@ class MigrationWizard:
     def _show_distance_info(self):
         messagebox.showinfo(
             "Calculate distances",
-            "This step loads caregivers and clients with coordinates, computes distances only for "
-            "feasible pairs and profile Must/Preferred/Only (scoped mode), using OSRM with pipeline "
-            "insert. Run Feasible pairs first. Set DISTANCE_MODE=full for a complete matrix."
+            "This step loads caregivers and clients with coordinates, then computes the full "
+            "distance matrix (all user↔user, client↔client, user↔client pairs) using OSRM "
+            "with pipeline insert. Set DISTANCE_MODE=scoped to limit pairs to feasible/profile/route sets only."
         )
 
     def _sync_checkbox_dependencies(self):
@@ -649,6 +655,7 @@ class MigrationWizard:
                 OPT_FVISIT_HISTORY: "Feasible pairs (visit data) CSV:",
                 OPT_CLIENT_WINDOWS: "Client windows analyzer CSV:",
                 OPT_CARER_TRAVEL_LIMITS: "Carer travel limits (VisitExport) CSV:",
+                OPT_UPDATE_TODAY_VISITS: "Client Hours with Service Type XLSX (today visits):",
             }.get(key, key)
             existing = self.file_paths.get(key)
             if hasattr(existing, "get"):
@@ -667,6 +674,14 @@ class MigrationWizard:
             self.file_rows.extend([e, b])
             self.file_widgets.append((key, var, row))
             row += 1
+            if key == OPT_UPDATE_TODAY_VISITS:
+                ttk.Label(parent, text="Visit date (YYYY-MM-DD):").grid(
+                    row=row, column=0, sticky=W, padx=(0, 8), pady=4
+                )
+                date_entry = Entry(parent, textvariable=self.update_today_visits_date, width=40)
+                date_entry.grid(row=row, column=1, sticky=(E, W), pady=4)
+                self.file_rows.append(date_entry)
+                row += 1
         # Ensure scroll region updates after content is built
         if getattr(self, "_files_canvas", None):
             self._files_canvas.update_idletasks()
@@ -724,6 +739,10 @@ class MigrationWizard:
                 path = self.file_paths[key].get()
                 if path:
                     lines.append("  File: " + path)
+            if key == OPT_UPDATE_TODAY_VISITS:
+                visit_date = self.update_today_visits_date.get().strip()
+                if visit_date:
+                    lines.append("  Date: " + visit_date)
             if key in (OPT_GEOCODE_API, OPT_GEOCODE_ALL_CLIENTS, OPT_GEOCODE_ALL_USERS):
                 ie = self.geocode_ie_txt_path.get()
                 if ie:
@@ -1009,6 +1028,19 @@ class MigrationWizard:
                 if not ok:
                     messagebox.showwarning("Files", err)
                     return False
+        if OPT_UPDATE_TODAY_VISITS in selected:
+            date_str = self.update_today_visits_date.get().strip()
+            if not date_str:
+                messagebox.showwarning("Files", "Please enter a visit date (YYYY-MM-DD) for Update today visits.")
+                return False
+            try:
+                datetime.strptime(date_str, "%Y-%m-%d")
+            except ValueError:
+                messagebox.showwarning(
+                    "Files",
+                    "Visit date must be YYYY-MM-DD (e.g. %s)." % datetime.now().strftime("%Y-%m-%d"),
+                )
+                return False
         return True
 
     def _run_migrations(self, start_from=0):
@@ -1515,6 +1547,8 @@ class MigrationWizard:
             order.append(("Calculate distances", self._run_travel_distances))
         if self.check_vars[OPT_CARER_TRAVEL_LIMITS].get():
             order.append(("Carer travel limits", self._run_carer_travel_limits))
+        if self.check_vars[OPT_UPDATE_TODAY_VISITS].get():
+            order.append(("Update today visits", self._run_update_today_visits))
         return order
 
     def _run_users(self, connection_manager=None, state=None):
@@ -1586,6 +1620,18 @@ class MigrationWizard:
         from clientWindowsAnalyzer.main import run as run_client_windows
         csv_path = ASSETS / OPT_ASSET_PATH[OPT_CLIENT_WINDOWS]
         return run_client_windows(csv_path=str(csv_path), connection_manager=connection_manager, state=state)
+
+    def _run_update_today_visits(self, connection_manager=None, state=None):
+        sys.path.insert(0, str(BUNDLE_ROOT))
+        from updateTodayVisitsMigration.main import run as run_update_today_visits
+        xlsx_path = ASSETS / OPT_ASSET_PATH[OPT_UPDATE_TODAY_VISITS]
+        target_date = self.update_today_visits_date.get().strip() or datetime.now().strftime("%Y-%m-%d")
+        return run_update_today_visits(
+            excel_path=str(xlsx_path),
+            target_date=target_date,
+            connection_manager=connection_manager,
+            state=state,
+        )
 
     def run(self):
         self.root.mainloop()

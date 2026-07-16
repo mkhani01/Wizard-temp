@@ -483,6 +483,8 @@ def check_client_availability(connection) -> Tuple[bool, List[str]]:
         col_req = _col_idx(["Planned Service Requirement Type Description"])
         col_start = _col_idx(["Service Requirement Start Date And Time"])
         col_end = _col_idx(["Service Requirement End Date And Time"])
+        col_act_start = _col_idx(["Actual Start Date And Time"])
+        col_act_end = _col_idx(["Actual End Date And Time"])
         col_duration = _col_idx(["Service Requirement Duration"])
 
         if any(c == -1 for c in [col_loc, col_type, col_req, col_start, col_end]):
@@ -509,12 +511,14 @@ def check_client_availability(connection) -> Tuple[bool, List[str]]:
 
             client_key = normalize_name_for_match(loc)
 
-            # Parse date/time
+            # Parse date/time — Requirement first, fall back to Actual when empty
             start_dt_val = row[col_start] if col_start < len(row) else None
             end_dt_val = row[col_end] if col_end < len(row) else None
+            act_start_val = row[col_act_start] if col_act_start != -1 and col_act_start < len(row) else None
+            act_end_val = row[col_act_end] if col_act_end != -1 and col_act_end < len(row) else None
 
-            start_dt = _parse_datetime_value(start_dt_val)
-            end_dt = _parse_datetime_value(end_dt_val)
+            start_dt = _parse_datetime_value(start_dt_val) or _parse_datetime_value(act_start_val)
+            end_dt = _parse_datetime_value(end_dt_val) or _parse_datetime_value(act_end_val)
 
             if not start_dt or not end_dt:
                 skipped_parse_errors += 1
@@ -951,10 +955,11 @@ def check_distances(connection) -> Tuple[bool, List[str]]:
     3. All user to client pairs (both directions: user→client and client→user)
 
     This test verifies ACTUAL pairs, not just counts, to ensure no missing or duplicate pairs.
-    When DISTANCE_MODE=scoped (default), only feasible/profile/route pairs are checked.
+    When DISTANCE_MODE=scoped, only feasible/profile/route pairs are checked.
+    Full matrix mode is the default.
     """
     import os
-    distance_mode = os.getenv("DISTANCE_MODE", "scoped").strip().lower()
+    distance_mode = os.getenv("DISTANCE_MODE", "full").strip().lower()
 
     msgs: List[str] = []
 
