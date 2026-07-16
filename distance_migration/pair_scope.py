@@ -121,17 +121,25 @@ def build_full_matrix_pairs(
     client_client = {(c1, c2) for c1 in client_ids for c2 in client_ids}
     user_client = {(u, c) for u in user_ids for c in client_ids}
     client_user = {(c, u) for c in client_ids for u in user_ids}
-    return {
+    result = {
         ("user", "user"): user_user,
         ("client", "client"): client_client,
         ("user", "client"): user_client,
         ("client", "user"): client_user,
     }
+    logger.info(
+        "Full matrix pair counts: user→user=%d, client→client=%d, user→client=%d, client→user=%d",
+        len(user_user),
+        len(client_client),
+        len(user_client),
+        len(client_user),
+    )
+    return result
 
 
 def get_distance_mode() -> str:
     import os
-    return os.getenv("DISTANCE_MODE", "scoped").strip().lower()
+    return os.getenv("DISTANCE_MODE", "full").strip().lower()
 
 
 def resolve_visit_csv_path(explicit_path=None) -> Optional[Path]:

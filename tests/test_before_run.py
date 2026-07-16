@@ -64,6 +64,7 @@ def check_migration_imports():
         ("availabilityTypeMigration.main", "Availability types"),
         ("userAvailabilityMigration.main", "User availability"),
         ("clientAvailabilityMigration.main", "Client availability"),
+        ("updateTodayVisitsMigration.main", "Update today visits"),
         ("clientLocationsMigration.main", "Client locations"),
         ("userLocationsMigration.main", "User locations"),
         ("geocodeCalculation.main", "Geocode calculation"),

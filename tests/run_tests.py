@@ -46,6 +46,11 @@ def main():
     test_exclusivity_in_build_profile_rows()
     test_two_way_sync_row_counts()
     print("  ✓ Profile preference tests passed")
+    print("Update today visits / Actual fallback tests...")
+    update_suite = loader.loadTestsFromName("tests.test_update_today_visits")
+    update_result = unittest.TextTestRunner(verbosity=1).run(update_suite)
+    if not update_result.wasSuccessful():
+        return 1
     print("\n✓ All tests OK. You can run the wizard or CLI.")
     return 0
 

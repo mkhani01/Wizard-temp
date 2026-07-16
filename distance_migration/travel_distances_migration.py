@@ -35,7 +35,7 @@ try:
 except ImportError:
     build_required_pairs = None
     build_full_matrix_pairs = None
-    get_distance_mode = lambda: os.getenv("DISTANCE_MODE", "scoped").strip().lower()
+    get_distance_mode = lambda: os.getenv("DISTANCE_MODE", "full").strip().lower()
     resolve_visit_csv_path = lambda explicit_path=None: None
 
 # Import OSRM helper
@@ -247,10 +247,61 @@ def get_existing_pair_counts(connection, from_type, to_type, method):
         cursor.close()
 
 
+BULK_PAIR_LOOKUP_THRESHOLD = int(os.getenv("BULK_PAIR_LOOKUP_THRESHOLD", "10000"))
+EXISTING_PAIRS_FETCH_BATCH = int(os.getenv("EXISTING_PAIRS_FETCH_BATCH", "100000"))
+
+
+def get_segment_row_count(connection, from_type, to_type, method):
+    """Fast COUNT(*) for a travel_distances segment."""
+    cursor = connection.cursor()
+    try:
+        cursor.execute("""
+            SELECT COUNT(*) AS cnt
+            FROM travel_distances
+            WHERE from_type = %s AND to_type = %s AND travel_method = %s
+        """, (from_type, to_type, method))
+        return int(cursor.fetchone()["cnt"])
+    finally:
+        cursor.close()
+
+
+def load_existing_pairs_for_segment(connection, from_type, to_type, method):
+    """Load all (from_id, to_id) pairs for a segment in one indexed scan."""
+    cursor = connection.cursor()
+    try:
+        logger.info(
+            "    Loading existing %s->%s (%s) pairs from DB...",
+            from_type, to_type, method,
+        )
+        cursor.execute("""
+            SELECT from_id, to_id
+            FROM travel_distances
+            WHERE from_type = %s AND to_type = %s AND travel_method = %s
+        """, (from_type, to_type, method))
+        existing = set()
+        fetched = 0
+        while True:
+            rows = cursor.fetchmany(EXISTING_PAIRS_FETCH_BATCH)
+            if not rows:
+                break
+            existing.update((row["from_id"], row["to_id"]) for row in rows)
+            fetched += len(rows)
+            if fetched % EXISTING_PAIRS_FETCH_BATCH == 0:
+                logger.info("    ... loaded %d existing pair(s) so far", fetched)
+        logger.info("    Loaded %d existing pair(s) from DB", len(existing))
+        return existing
+    finally:
+        cursor.close()
+
+
 def get_existing_pairs_for_keys(connection, from_type, to_type, method, pair_keys):
     """Return subset of pair_keys already present in DB."""
     if not pair_keys:
         return set()
+    if len(pair_keys) >= BULK_PAIR_LOOKUP_THRESHOLD:
+        return pair_keys & load_existing_pairs_for_segment(
+            connection, from_type, to_type, method,
+        )
     cursor = connection.cursor()
     try:
         keys_list = list(pair_keys)
@@ -717,13 +768,91 @@ def _save_entities_cache(users, clients):
 def _get_missing_pairs(connection, from_type, to_type, method, required_pairs):
     if not required_pairs:
         return set()
+    db_count = get_segment_row_count(connection, from_type, to_type, method)
+    if db_count == 0:
+        return set(required_pairs)
+    if db_count < len(required_pairs):
+        logger.info(
+            "    Segment has %d/%d required row(s); computing missing pairs...",
+            db_count,
+            len(required_pairs),
+        )
     return required_pairs - get_existing_pairs_for_keys(
         connection, from_type, to_type, method, required_pairs,
     )
 
 
 def _segment_is_complete(connection, from_type, to_type, method, required_pairs):
+    if not required_pairs:
+        return True
+    required_count = len(required_pairs)
+    db_count = get_segment_row_count(connection, from_type, to_type, method)
+    if db_count < required_count:
+        return False
     return len(_get_missing_pairs(connection, from_type, to_type, method, required_pairs)) == 0
+
+
+def _build_expected_pair_map(distance_mode, connection, users, clients, visit_csv_path):
+    user_ids = set(users.keys())
+    client_ids = set(clients.keys())
+    if distance_mode == "full":
+        if not build_full_matrix_pairs:
+            raise RuntimeError("Full distance mode requested but build_full_matrix_pairs is unavailable.")
+        return build_full_matrix_pairs(user_ids, client_ids)
+    if not build_required_pairs:
+        raise RuntimeError("Scoped distance mode requested but build_required_pairs is unavailable.")
+    visit_path = resolve_visit_csv_path(visit_csv_path) if resolve_visit_csv_path else None
+    return build_required_pairs(connection, visit_csv_path=visit_path)
+
+
+def _audit_incomplete_segments(connection, scoped_pair_map, segments):
+    """Return segments that still have required pairs missing from travel_distances."""
+    incomplete = []
+    for segment_key, from_type, to_type, _osrm_method, db_method in segments:
+        required_pairs = scoped_pair_map.get((from_type, to_type), set()) if scoped_pair_map else set()
+        if not required_pairs:
+            continue
+        required_count = len(required_pairs)
+        db_count = get_segment_row_count(connection, from_type, to_type, db_method)
+        if db_count < required_count:
+            incomplete.append({
+                "segment_key": segment_key,
+                "from_type": from_type,
+                "to_type": to_type,
+                "method": db_method,
+                "required": required_count,
+                "missing": required_count - db_count,
+            })
+            continue
+        missing_count = len(_get_missing_pairs(
+            connection, from_type, to_type, db_method, required_pairs,
+        ))
+        if missing_count:
+            incomplete.append({
+                "segment_key": segment_key,
+                "from_type": from_type,
+                "to_type": to_type,
+                "method": db_method,
+                "required": required_count,
+                "missing": missing_count,
+            })
+    return incomplete
+
+
+def _log_expected_row_counts(scoped_pair_map, segments):
+    if not scoped_pair_map:
+        return
+    total_rows = 0
+    for segment_key, from_type, to_type, _osrm_method, _db_method in segments:
+        pair_count = len(scoped_pair_map.get((from_type, to_type), set()))
+        total_rows += pair_count
+        if pair_count:
+            logger.info(
+                "  Segment %s: %d row(s) required",
+                segment_key,
+                pair_count,
+            )
+    logger.info("Expected travel_distances rows when complete: %d", total_rows)
 
 
 def process_missing_segment(
@@ -881,8 +1010,13 @@ def process_scoped_segment(
     sources_to_calc = {sid: source_entities[sid] for sid in source_ids if sid in source_entities}
     targets = {tid: target_entities[tid] for tid in target_ids if tid in target_entities}
     if not sources_to_calc or not targets:
-        logger.warning("    No coordinate data for missing pair endpoints.")
-        return False
+        unmapped_sources = sum(1 for s, _t in missing if s not in source_entities)
+        unmapped_targets = sum(1 for _s, t in missing if t not in target_entities)
+        raise RuntimeError(
+            f"Cannot compute {len(missing)} missing pair(s) for "
+            f"{from_type}->{to_type} ({db_enum_method}): "
+            f"{unmapped_sources} source(s) and {unmapped_targets} target(s) lack coordinates."
+        )
 
     logger.info(
         "  %s->%s (%s): %d missing pair(s), %d sources x %d targets (retry skips %d already in DB)",
@@ -941,7 +1075,7 @@ def run(connection_manager=None, state=None, visit_csv_path=None):
     print("""
     ╔══════════════════════════════════════════════════════════╗
     ║     Travel Distances Migration (RESUME ENABLED)          ║
-    ║     Scoped pairs -> OSRM pipeline -> COPY insert         ║
+    ║     Full matrix by default -> OSRM pipeline -> COPY      ║
     ╚══════════════════════════════════════════════════════════╝
     """)
     logger.info("Cache directory: %s", CACHE_DIR)
@@ -983,20 +1117,36 @@ def run(connection_manager=None, state=None, visit_csv_path=None):
                 state.update("distance_migration", entities_loaded=True)
         user_ids = set(users.keys())
         client_ids = set(clients.keys())
+        logger.info(
+            "Entities with coordinates: %d users, %d clients",
+            len(user_ids),
+            len(client_ids),
+        )
 
         scoped_pair_map = None
-        if distance_mode == "scoped" and build_required_pairs:
-            visit_path = resolve_visit_csv_path(visit_csv_path)
-            if visit_path:
-                logger.info("VisitExport for route pairs: %s", visit_path)
+        if distance_mode in ("scoped", "full"):
+            scoped_pair_map = _build_expected_pair_map(
+                distance_mode, connection, users, clients, visit_csv_path,
+            )
+            if distance_mode == "scoped":
+                visit_path = resolve_visit_csv_path(visit_csv_path) if resolve_visit_csv_path else None
+                if visit_path:
+                    logger.info("VisitExport for route pairs: %s", visit_path)
+                else:
+                    logger.warning("VisitExport not found; client↔client route pairs will be omitted.")
             else:
-                logger.warning("VisitExport not found; client↔client route pairs will be omitted.")
-            scoped_pair_map = build_required_pairs(connection, visit_csv_path=visit_path)
-        elif distance_mode == "full" and build_full_matrix_pairs:
-            scoped_pair_map = build_full_matrix_pairs(user_ids, client_ids)
-            logger.info("Full matrix mode: user=%d, client=%d", len(user_ids), len(client_ids))
+                logger.info(
+                    "Full matrix mode: %d users x %d clients (+ user↔user, client↔client)",
+                    len(user_ids),
+                    len(client_ids),
+                )
+        else:
+            raise ValueError(
+                f"Unknown DISTANCE_MODE={distance_mode!r}. Use 'full' (default) or 'scoped'."
+            )
 
         segments = _build_segments_list(scoped_pair_map)
+        _log_expected_row_counts(scoped_pair_map, segments)
         for segment_key, from_type, to_type, osrm_method, db_enum_method in segments:
             required_pairs = None
             if scoped_pair_map is not None:
@@ -1021,6 +1171,13 @@ def run(connection_manager=None, state=None, visit_csv_path=None):
             target_entities = users if to_type == ENTITY_TYPE_USER else clients
             if not source_entities or not target_entities:
                 continue
+
+            if required_pairs is not None:
+                logger.info(
+                    "Checking segment %s (%d required pair(s))...",
+                    segment_key,
+                    len(required_pairs),
+                )
 
             missing_src = set()
             if scoped_pair_map is None:
@@ -1049,28 +1206,29 @@ def run(connection_manager=None, state=None, visit_csv_path=None):
                 required_pairs=required_pairs,
             )
 
-            if required_pairs is not None and not _segment_is_complete(
-                connection, from_type, to_type, db_enum_method, required_pairs,
-            ):
-                remaining = len(_get_missing_pairs(
-                    connection, from_type, to_type, db_enum_method, required_pairs,
-                ))
-                logger.warning(
-                    "Segment %s incomplete (%d pair(s) remain). Retry will continue from here.",
-                    segment_key, remaining,
-                )
-                if state:
-                    state.update(
-                        "distance_migration",
-                        current_segment=segment_key,
-                        segment_missing_pairs=remaining,
-                    )
-                continue
-
             if state:
                 if segment_key not in completed_segments:
                     completed_segments = list(completed_segments) + [segment_key]
                 state.update("distance_migration", completed_segments=completed_segments, current_segment=segment_key)
+
+        incomplete = _audit_incomplete_segments(connection, scoped_pair_map, segments)
+        if incomplete:
+            for seg in incomplete:
+                logger.error(
+                    "INCOMPLETE: %s (%s->%s %s): %d/%d pair(s) missing",
+                    seg["segment_key"],
+                    seg["from_type"],
+                    seg["to_type"],
+                    seg["method"],
+                    seg["missing"],
+                    seg["required"],
+                )
+            total_missing = sum(seg["missing"] for seg in incomplete)
+            raise RuntimeError(
+                f"Distance migration incomplete: {total_missing} required pair(s) still missing "
+                f"across {len(incomplete)} segment(s). Re-run to resume; pairs already inserted are skipped."
+            )
+
         logger.info("")
         logger.info("Migration completed successfully.")
         try:

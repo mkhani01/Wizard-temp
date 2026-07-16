@@ -41,12 +41,13 @@ def print_usage():
         geocode-calculation  Run geocode calculation
         userlocations        Update user lat/lng from JSON backup
         clientlocations      Update client lat/lng from JSON backup
-        travel-distances     Compute scoped travel distances via OSRM (DISTANCE_MODE=scoped default)
+        travel-distances     Compute full travel distance matrix via OSRM (DISTANCE_MODE=full default)
         csv-distances [args] Geocode carer/customer CSVs and export OSRM walking/driving/cycling JSON
         json-distances [args] Geocode users/clients JSONs and export walking/driving/cycling JSON
         feasible-pairs [path]   Seed feasible_pairs + profile Must/Preferred/Only (16-week VisitExport)
         client-windows [path]   Patient_Analyzer windows from full VisitExport (default: assets/client_windows_data.csv)
         carer-travel-limits [path]   Set max_distance_km / max_p2p_distance_km from VisitExport routes (default: assets/visit_data.csv)
+        update-today-visits [xlsx] [YYYY-MM-DD]   Cancel roster visits for a date from Client Hours (Cancellation Description + terminated clients)
         test                 Run pre-run checks and optional distance test (run before migrating)
         all                  Run all migrations (TODO)
     
@@ -168,6 +169,12 @@ def main():
         csv_path = sys.argv[2] if len(sys.argv) > 2 else None
         from carerTravelLimitsMigration.main import run as run_carer_travel_limits
         success = run_carer_travel_limits(csv_path=csv_path)
+        sys.exit(0 if success else 1)
+    elif command == 'update-today-visits':
+        excel_path = sys.argv[2] if len(sys.argv) > 2 else None
+        target_date = sys.argv[3] if len(sys.argv) > 3 else None
+        from updateTodayVisitsMigration.main import run as run_update_today_visits
+        success = run_update_today_visits(excel_path=excel_path, target_date=target_date)
         sys.exit(0 if success else 1)
     elif command == 'test':
         sys.path.insert(0, str(Path(__file__).resolve().parent))
