@@ -70,7 +70,7 @@ STEP_RUN = 5
 TOTAL_STEPS = 6
 
 # Wizard release version (shown in UI and window title on all platforms / frozen builds)
-WIZARD_VERSION = "0.0.1"
+WIZARD_VERSION = "0.0.2"
 
 # Migration option keys (must match checkbox keys and file keys)
 OPT_CAREGIVERS = "caregivers"
@@ -96,12 +96,12 @@ FILE_OPTIONS = [
     OPT_CAREGIVERS_AVAILABILITY,
     OPT_CLIENTS,
     OPT_CLIENTS_AVAILABILITY,
+    OPT_UPDATE_TODAY_VISITS,
     OPT_GEOCODE_CLIENT_FILE,
     OPT_GEOCODE_CAREGIVER_FILE,
     OPT_FVISIT_HISTORY,
     OPT_CLIENT_WINDOWS,
     OPT_CARER_TRAVEL_LIMITS,
-    OPT_UPDATE_TODAY_VISITS,
 ]
 # Geocode API needs IE.txt (and optional API key in env)
 GEOCODE_API_FILES = ["geocode_ie_txt", "geocode_api_key"]
@@ -151,6 +151,20 @@ except ImportError:
 
 # Required keys in client/user location JSON backup files
 LOCATION_JSON_REQUIRED_KEYS = ("latitude", "longitude", "name", "lastname")
+
+
+def _bind_mousewheel_recursive(widget, on_mousewheel, on_linux=None):
+    """
+    Bind mousewheel on widget and all descendants.
+    On Windows, wheel events go to the widget under the cursor (e.g. Checkbutton),
+    not the Canvas — without recursive binds the bottom options are unreachable.
+    """
+    widget.bind("<MouseWheel>", on_mousewheel)
+    if on_linux:
+        widget.bind("<Button-4>", on_linux)
+        widget.bind("<Button-5>", on_linux)
+    for child in widget.winfo_children():
+        _bind_mousewheel_recursive(child, on_mousewheel, on_linux)
 
 
 def validate_location_json_file(file_path, root_key, label="File"):
@@ -461,6 +475,7 @@ class MigrationWizard:
             (OPT_CAREGIVERS_AVAILABILITY, "Caregivers Availability", "Import each caregiver’s availability from an Excel workbook. Hint: Requires Availability types. File is usually userAvailabilities.xlsx. You will select it in the next step."),
             (OPT_CLIENTS, "Clients", "Import clients from a CSV export. Hint: Use a file like CustomerExport.csv. You will choose the file in the next step."),
             (OPT_CLIENTS_AVAILABILITY, "Clients Availability", "Import client availability from Excel. Hint: Requires Availability types. You can select one file or a folder of workbooks (e.g. Client Hours with Service Type)."),
+            (OPT_UPDATE_TODAY_VISITS, "Update today visits", "Cancel roster visits for a selected date using Client Hours with Service Type. Rows with Cancellation Description cancel matching ALLOCATED/UNALLOCATED visits; terminated clients' visits that day are cancelled with type Terminated. Missing visits are skipped and logged."),
             (OPT_GEOCODE_CLIENT_FILE, "Get clients location from file", "Update client latitude/longitude from a JSON backup file (e.g. clientbackup.json). File must contain \"latitude\", \"longitude\", \"name\", \"lastname\" for each record. This is useful for manually seeding known coordinates before using the Google API."),
             (OPT_GEOCODE_CAREGIVER_FILE, "Get users location from file", "Update user (caregiver) latitude/longitude from a JSON backup file (e.g. usersBackup.json). File must contain \"latitude\", \"longitude\", \"name\", \"lastname\" for each record. This is useful for manually seeding known coordinates before using the Google API."),
             (OPT_GEOCODE_API, "Calculated Geocode (Google API)", "Use Google Maps API to fill in latitude/longitude from postcodes for users and clients that have NULL coordinates. This runs AFTER file-based location imports (if selected), only geocoding records with postcodes but missing lat/long. You need a Google Maps API key and the Irish cities file (IE.txt). Can be combined with file-based options."),
@@ -470,7 +485,6 @@ class MigrationWizard:
             (OPT_FVISIT_HISTORY, "Feasible pairs (visit history)", "Seed feasible_pairs and profile Must/Preferred/Only (two-way sync on user and client profiles) from VisitExport CSV (Personal Care, last 16 weeks, Actual Employee Name). Run before Calculate distances."),
             (OPT_CLIENT_WINDOWS, "Client windows analyzer", "Update client_schedule_preferences (window_start, window_end, suggested_duration, min_duration) from full VisitExport history using the Patient_Analyzer pipeline. Requires Clients Availability. Same VisitExport file as Feasible pairs is fine."),
             (OPT_CARER_TRAVEL_LIMITS, "Carer travel limits (max distance)", "Set user.max_distance_km and max_p2p_distance_km from VisitExport daily routes and the travel_distances table. Requires Calculate distances first. Same VisitExport file as Feasible pairs is fine."),
-            (OPT_UPDATE_TODAY_VISITS, "Update today visits", "Cancel roster visits for a selected date using Client Hours with Service Type. Rows with Cancellation Description cancel matching ALLOCATED/UNALLOCATED visits; terminated clients' visits that day are cancelled with type Terminated. Missing visits are skipped and logged."),
         ]
         row = 0
         for key, title, hint in opts:
@@ -494,6 +508,10 @@ class MigrationWizard:
         dist_frame = ttk.Frame(inner)
         dist_frame.grid(row=row, column=0, sticky=W, pady=(12, 8))
         ttk.Button(dist_frame, text="More info (Extra Cost) – Calculate distances", command=self._show_distance_info).pack(side="left", padx=(0, 8))
+        # Windows: wheel events hit child widgets; bind recursively so the full list is scrollable
+        _bind_mousewheel_recursive(scroll_frame, _on_mousewheel, _on_mousewheel_linux)
+        canvas.update_idletasks()
+        canvas.configure(scrollregion=canvas.bbox(ALL))
         self._sync_checkbox_dependencies()
 
     def _show_distance_info(self):
@@ -602,6 +620,9 @@ class MigrationWizard:
         scroll_frame.bind("<MouseWheel>", _on_mousewheel)
         scroll_frame.bind("<Button-4>", _on_mousewheel_linux)
         scroll_frame.bind("<Button-5>", _on_mousewheel_linux)
+        # Keep refs so _refresh_file_step can re-bind wheel on new children (Windows)
+        self._files_on_mousewheel = _on_mousewheel
+        self._files_on_mousewheel_linux = _on_mousewheel_linux
 
         canvas.grid(row=row_for_scroll, column=0, columnspan=3, sticky=(N, S, E, W))
         scrollbar.grid(row=row_for_scroll, column=3, sticky=(N, S))
@@ -682,8 +703,12 @@ class MigrationWizard:
                 date_entry.grid(row=row, column=1, sticky=(E, W), pady=4)
                 self.file_rows.append(date_entry)
                 row += 1
-        # Ensure scroll region updates after content is built
+        # Ensure scroll region updates after content is built; re-bind wheel for new rows (Windows)
         if getattr(self, "_files_canvas", None):
+            on_wheel = getattr(self, "_files_on_mousewheel", None)
+            on_linux = getattr(self, "_files_on_mousewheel_linux", None)
+            if on_wheel and getattr(self, "_files_scroll_frame", None):
+                _bind_mousewheel_recursive(self._files_scroll_frame, on_wheel, on_linux)
             self._files_canvas.update_idletasks()
             self._files_canvas.configure(scrollregion=self._files_canvas.bbox(ALL))
 
