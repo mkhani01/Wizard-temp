@@ -39,6 +39,10 @@ except ImportError:
     ConnectionLostError = None
 
 from encoding_utils import fix_utf8_mojibake, normalize_name_for_match
+from person_match_utils import (
+    add_person_to_name_map,
+    flatten_candidate_ids,
+)
 
 # ============================================================================
 # CONFIGURATION
@@ -115,21 +119,30 @@ def connect_to_database(config: Dict[str, Any]):
 
 def get_all_clients(connection) -> Dict[str, int]:
     """
-    Build lookup: key -> client id.
+    Build lookup: key -> client id (Active-first on duplicate names).
     Key format: "lastname, name" (lowercase, single space after comma).
     So DB row (name='Harry', lastname='Hawkshaw (DS)') -> key 'hawkshaw (ds), harry'.
     CSV "Service Location Name" must match this exactly (e.g. "Hawkshaw (DS), Harry").
     """
     cursor = connection.cursor()
     try:
-        cursor.execute("SELECT id, name, lastname FROM client WHERE deleted_at IS NULL")
-        clients = {}
+        cursor.execute(
+            "SELECT id, name, lastname, status, postcode FROM client WHERE deleted_at IS NULL"
+        )
+        candidates: Dict[str, List[Dict[str, Any]]] = {}
         for row in cursor.fetchall():
             name = (row["name"] or "").strip()
             lastname = (row["lastname"] or "").strip()
+            person = {
+                "id": row["id"],
+                "name": name,
+                "lastname": lastname,
+                "status": row["status"],
+                "postcode": row["postcode"],
+            }
             key = normalize_name_for_match(f"{lastname}, {name}")
-            if key:
-                clients[key] = row["id"]
+            add_person_to_name_map(candidates, key, person)
+        clients = flatten_candidate_ids(candidates)
         logger.info(f"✓ Loaded {len(clients)} clients from database")
         return clients
     finally:

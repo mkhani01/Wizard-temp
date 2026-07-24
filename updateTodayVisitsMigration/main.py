@@ -35,6 +35,11 @@ except ImportError:
     ConnectionLostError = None
 
 from encoding_utils import fix_utf8_mojibake, normalize_name_for_match
+from person_match_utils import (
+    add_person_to_name_map,
+    extract_eircode_from_address,
+    resolve_person_id,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -166,23 +171,28 @@ def resolve_start_end(
     return start, end, source
 
 
-def get_all_clients(connection) -> Dict[str, int]:
+def get_all_clients(connection) -> Dict[str, List[Dict[str, Any]]]:
+    """Name key -> list of candidate client dicts (Active/postcode ranking at resolve time)."""
     cursor = connection.cursor()
     try:
-        cursor.execute("SELECT id, name, lastname FROM client WHERE deleted_at IS NULL")
-        clients: Dict[str, int] = {}
+        cursor.execute(
+            "SELECT id, name, lastname, status, postcode FROM client WHERE deleted_at IS NULL"
+        )
+        clients: Dict[str, List[Dict[str, Any]]] = {}
         for row in cursor.fetchall():
             name = (row["name"] or "").strip()
             lastname = (row["lastname"] or "").strip()
-            client_id = row["id"]
+            person = {
+                "id": row["id"],
+                "name": name,
+                "lastname": lastname,
+                "status": row["status"],
+                "postcode": row["postcode"],
+            }
             key_comma = normalize_name_for_match(f"{lastname}, {name}")
             key_space = normalize_name_for_match(f"{name} {lastname}")
-            if key_comma:
-                if key_comma not in clients or client_id > clients[key_comma]:
-                    clients[key_comma] = client_id
-            if key_space:
-                if key_space not in clients or client_id > clients[key_space]:
-                    clients[key_space] = client_id
+            add_person_to_name_map(clients, key_comma, person)
+            add_person_to_name_map(clients, key_space, person)
         return clients
     finally:
         cursor.close()
@@ -286,7 +296,7 @@ def _col_idx(headers: Sequence[str], names: Sequence[str]) -> int:
 def extract_cancellation_rows(
     filepath: Path,
     target_date: date,
-    clients_map: Dict[str, int],
+    clients_map: Dict[str, List[Dict[str, Any]]],
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     """
     Parse Client Hours XLSX Data sheet; return cancellation rows for target_date
@@ -311,6 +321,7 @@ def extract_cancellation_rows(
             raise MigrationError("Workbook has no header row")
 
         col_loc = _col_idx(header, ["Service Location Name"])
+        col_addr = _col_idx(header, ["Service Location Address"])
         col_req_start = _col_idx(header, ["Service Requirement Start Date And Time"])
         col_req_end = _col_idx(header, ["Service Requirement End Date And Time"])
         col_act_start = _col_idx(header, ["Actual Start Date And Time"])
@@ -348,14 +359,19 @@ def extract_cancellation_rows(
                 logger.warning("Row %d: SKIPPED - empty Service Location Name", row_num)
                 continue
 
+            raw_addr = row[col_addr] if col_addr != -1 and col_addr < len(row) else None
+            addr = fix_utf8_mojibake(raw_addr) if raw_addr is not None else None
+            source_eircode = extract_eircode_from_address(addr)
+
             client_key = normalize_name_for_match(loc_str)
-            client_id = clients_map.get(client_key)
+            client_id = resolve_person_id(clients_map.get(client_key) or [], source_eircode)
             if not client_id:
                 stats["skipped_unknown_client"] += 1
                 logger.warning(
-                    "Row %d: SKIPPED - client not found | Location=%r Cancellation=%r",
+                    "Row %d: SKIPPED - client not found | Location=%r eircode=%r Cancellation=%r",
                     row_num,
                     loc_str,
+                    source_eircode or None,
                     cancel_name,
                 )
                 continue
@@ -460,7 +476,7 @@ def match_and_cancel_from_file(
                         cancellation_type_id = %s,
                         updated_at = NOW()
                     WHERE id = %s
-                      AND status = ANY(%s)
+                      AND status::text = ANY(%s)
                     """,
                     (type_id, visit["id"], list(ACTIVE_VISIT_STATUSES)),
                 )
@@ -505,7 +521,7 @@ def cancel_terminated_client_visits(
                     cancellation_type_id = %s,
                     updated_at = NOW()
                 WHERE id = %s
-                  AND status = ANY(%s)
+                  AND status::text = ANY(%s)
                 """,
                 (terminated_type_id, visit["id"], list(ACTIVE_VISIT_STATUSES)),
             )
