@@ -8,8 +8,15 @@ Update roster visits for a selected calendar date using Client Hours with Servic
 2. All ALLOCATED/UNALLOCATED visits for terminated clients on that date → cancel with
    type "Terminated" (insert if missing).
 3. Personal Care rows where Service Requirement start AND end are empty, but Actual
-   start/end are present → create a one-day temporary client_schedule (is_temporary,
-   effective for the target date only) and an UNALLOCATED roster_visit linked to it.
+   start/end are present → create a one-day-occurrence temporary client_schedule
+   (is_temporary, not_send_to_engine=false so engine gets a PRID) and an UNALLOCATED
+   roster_visit linked to it. effective_date_from is the target date;
+   effective_date_to is target_date + end_time_date_offset_days so overnight/multi-day
+   visits (Actual end on the next calendar day) aren't capped away by the server on
+   the continuation day (see
+   server/src/panel/common/end-time-date.helpers.ts capAbsoluteWindowAtDate and
+   server/src/panel/clients/schedule/application/schedule.helpers.ts
+   resolveClientScheduleVisitWindowForDate).
 
 Missing visits for cancel path → skip and log. Missing roster → created when temps needed.
 """
@@ -842,9 +849,19 @@ def _find_existing_temp_schedule_id(
     cursor,
     client_id: int,
     target_date: date,
+    end_date: date,
     requested_start: str,
     requested_end: str,
+    end_time_date_offset_days: int,
 ) -> Optional[int]:
+    """
+    Look up a reusable one-day temp schedule for this (client, occurrence start,
+    times, multi-day offset). ``effective_date_to`` must match the *end* of the
+    occurrence window (target_date + end_time_date_offset_days), matching how
+    the server caps multi-day temporary windows via
+    resolveClientScheduleVisitWindowForDate/capAbsoluteWindowAtDate — otherwise
+    the continuation-day portion of an overnight visit would be capped away.
+    """
     cursor.execute(
         """
         SELECT cs.id
@@ -857,10 +874,18 @@ def _find_existing_temp_schedule_id(
           AND csp.effective_date_to = %s
           AND cs.requested_start_time = %s::time
           AND cs.requested_end_time = %s::time
+          AND cs.end_time_date_offset_days = %s
         ORDER BY cs.id
         LIMIT 1
         """,
-        (client_id, target_date, target_date, requested_start, requested_end),
+        (
+            client_id,
+            target_date,
+            end_date,
+            requested_start,
+            requested_end,
+            end_time_date_offset_days,
+        ),
     )
     row = cursor.fetchone()
     return int(row["id"]) if row else None
@@ -955,14 +980,27 @@ def create_temp_schedules_and_visits(
                 )
                 continue
 
+            # Multi-day/overnight visits (offset > 0) end on a later calendar
+            # date than the occurrence start. end_date/effective_date_to must
+            # reflect that end date — the server caps a temporary schedule's
+            # absolute window at effective_date_to (capAbsoluteWindowAtDate /
+            # resolveClientScheduleVisitWindowForDate), so leaving it pinned to
+            # target_date would truncate the visit back to midnight and drop
+            # the continuation-day portion entirely.
+            offset_days = int(row.get("end_time_date_offset_days") or 0)
+            end_date_obj = target_date + timedelta(days=offset_days)
+            end_date_str = format_date_str(end_date_obj)
+
             cursor.execute("SAVEPOINT temp_visit_row")
             try:
                 existing_schedule_id = _find_existing_temp_schedule_id(
                     cursor,
                     client_id,
                     target_date,
+                    end_date_obj,
                     row["requested_start_time"],
                     row["requested_end_time"],
+                    offset_days,
                 )
                 schedule_id = existing_schedule_id
                 if schedule_id is None:
@@ -988,10 +1026,10 @@ def create_temp_schedules_and_visits(
                             row["requested_end_time"],
                             row["requested_duration"],
                             date_str,
-                            date_str,
+                            end_date_str,
                             1,
                             1,
-                            row["end_time_date_offset_days"],
+                            offset_days,
                         ),
                     )
                     schedule_id = int(cursor.fetchone()["id"])
@@ -1007,7 +1045,7 @@ def create_temp_schedules_and_visits(
                             %s, %s, %s, %s,
                             %s,
                             true, %s, %s,
-                            %s, true, false, NULL,
+                            %s, false, false, NULL,
                             NOW(), NOW()
                         )
                         """,
@@ -1018,19 +1056,22 @@ def create_temp_schedules_and_visits(
                             row["requested_duration"],
                             None,
                             date_str,
-                            date_str,
+                            end_date_str,
                             TEMP_SCHEDULE_NOTE,
                         ),
                     )
                     counts["created_schedules"] += 1
                     logger.info(
-                        "Row %d: created temp schedule id=%s client_id=%s %s-%s date=%s",
+                        "Row %d: created temp schedule id=%s client_id=%s %s-%s "
+                        "start=%s end=%s offset_days=%s",
                         row["row_num"],
                         schedule_id,
                         client_id,
                         row["requested_start_time"],
                         row["requested_end_time"],
                         date_str,
+                        end_date_str,
+                        offset_days,
                     )
                 else:
                     logger.info(

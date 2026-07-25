@@ -19,6 +19,7 @@ from updateTodayVisitsMigration.main import (
     match_and_cancel_from_file,
     cancel_terminated_client_visits,
     extract_temp_visit_rows,
+    create_temp_schedules_and_visits,
     _is_empty_datetime_val,
     offset_days_between,
     requested_duration_minutes,
@@ -447,6 +448,105 @@ class TestExtractTempVisitRows(unittest.TestCase):
             self.assertEqual(stats["skipped_missing_actual"], 1)
         finally:
             tmp.unlink(missing_ok=True)
+
+
+class TestCreateTempSchedulesAndVisits(unittest.TestCase):
+    """
+    Regression coverage for server/src client-schedule.helpers.ts behaviour:
+    a temporary client_schedule's absolute window is capped at
+    preferences.effective_date_to (capAbsoluteWindowAtDate /
+    resolveClientScheduleVisitWindowForDate — see
+    schedule.helpers.spec.ts "caps temporary schedules at effectiveDateTo").
+    For overnight/multi-day visits (end_time_date_offset_days > 0), end_date
+    and effective_date_to must therefore be target_date + offset_days, not
+    target_date, or the continuation-day portion of the visit is dropped by
+    the server.
+    """
+
+    def _run(self, candidate, target_date=date(2026, 7, 16)):
+        connection = MagicMock()
+        cursor = MagicMock()
+        connection.cursor.return_value = cursor
+        cursor.fetchone.side_effect = [
+            None,  # enum type lookup -> no client_schedules_days_enum
+            None,  # _find_existing_temp_schedule_id -> no existing schedule
+            {"id": 501},  # INSERT client_schedules ... RETURNING id
+            None,  # _active_visit_exists (client_schedule_id branch)
+            None,  # _active_visit_exists (fallback branch)
+        ]
+
+        counts = create_temp_schedules_and_visits(
+            connection,
+            roster_id="roster-1",
+            target_date=target_date,
+            candidates=[candidate],
+            terminated_ids=set(),
+            personal_care_service_type_id=None,
+        )
+
+        schedule_call = next(
+            c
+            for c in cursor.execute.call_args_list
+            if "INSERT INTO client_schedules (" in c.args[0]
+        )
+        prefs_call = next(
+            c
+            for c in cursor.execute.call_args_list
+            if "INSERT INTO client_schedule_preferences (" in c.args[0]
+        )
+        return counts, schedule_call.args[1], prefs_call.args[1]
+
+    def test_overnight_visit_extends_end_date_and_effective_date_to(self):
+        candidate = {
+            "row_num": 5,
+            "client_id": 42,
+            "client_name": "Smith, Jane",
+            "start_minute": 22 * 60,
+            "end_minute": 6 * 60,
+            "requested_start_time": "22:00:00",
+            "requested_end_time": "06:00:00",
+            "requested_duration": 8 * 60,
+            "end_time_date_offset_days": 1,
+            "day_of_week": "Thursday",
+        }
+        counts, schedule_params, prefs_params = self._run(candidate)
+
+        self.assertEqual(counts["created_schedules"], 1)
+        self.assertEqual(counts["created_visits"], 1)
+
+        # client_schedules: (..., requested_duration, start_date, end_date,
+        # occurs_every, number_of_care_givers, end_time_date_offset_days)
+        self.assertEqual(schedule_params[5], "2026-07-16")  # start_date
+        self.assertEqual(schedule_params[6], "2026-07-17")  # end_date = start + offset
+        self.assertEqual(schedule_params[9], 1)  # end_time_date_offset_days
+
+        # client_schedule_preferences: (..., effective_date_from,
+        # effective_date_to, note)
+        self.assertEqual(prefs_params[5], "2026-07-16")  # effective_date_from
+        self.assertEqual(
+            prefs_params[6], "2026-07-17"
+        )  # effective_date_to must match end_date, not start_date
+
+    def test_same_day_visit_keeps_effective_date_to_on_target_date(self):
+        candidate = {
+            "row_num": 6,
+            "client_id": 43,
+            "client_name": "Doe, Jane",
+            "start_minute": 9 * 60,
+            "end_minute": 9 * 60 + 45,
+            "requested_start_time": "09:00:00",
+            "requested_end_time": "09:45:00",
+            "requested_duration": 45,
+            "end_time_date_offset_days": 0,
+            "day_of_week": "Thursday",
+        }
+        counts, schedule_params, prefs_params = self._run(candidate)
+
+        self.assertEqual(counts["created_schedules"], 1)
+        self.assertEqual(schedule_params[5], "2026-07-16")
+        self.assertEqual(schedule_params[6], "2026-07-16")
+        self.assertEqual(prefs_params[5], "2026-07-16")
+        self.assertEqual(prefs_params[6], "2026-07-16")
 
 
 if __name__ == "__main__":
