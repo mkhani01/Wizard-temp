@@ -18,7 +18,12 @@ from updateTodayVisitsMigration.main import (
     resolve_start_end,
     match_and_cancel_from_file,
     cancel_terminated_client_visits,
+    extract_temp_visit_rows,
+    _is_empty_datetime_val,
+    offset_days_between,
+    requested_duration_minutes,
     TERMINATED_CANCELLATION_TYPE,
+    PERSONAL_CARE,
 )
 from clientAvailabilityMigration.main import parse_datetime_value as schedule_parse_datetime
 
@@ -239,7 +244,17 @@ class TestScheduleActualFallback(unittest.TestCase):
         wb.save(tmp)
         wb.close()
         try:
-            clients_map = {normalize_name_for_match("Smith, Jane"): 42}
+            clients_map = {
+                normalize_name_for_match("Smith, Jane"): [
+                    {
+                        "id": 42,
+                        "name": "Jane",
+                        "lastname": "Smith",
+                        "status": "Active",
+                        "postcode": None,
+                    }
+                ]
+            }
             records, unmatched = process_xlsx_file(tmp, clients_map)
             self.assertEqual(unmatched, [])
             self.assertEqual(len(records[42]), 1)
@@ -247,6 +262,189 @@ class TestScheduleActualFallback(unittest.TestCase):
             self.assertEqual(rec["start_date"], date(2026, 7, 16))
             self.assertEqual(rec["start_time"].strftime("%H:%M"), "09:00")
             self.assertEqual(rec["end_time"].strftime("%H:%M"), "09:45")
+        finally:
+            tmp.unlink(missing_ok=True)
+
+
+class TestTempVisitHelpers(unittest.TestCase):
+    def test_is_empty_datetime_val(self):
+        self.assertTrue(_is_empty_datetime_val(None))
+        self.assertTrue(_is_empty_datetime_val(""))
+        self.assertTrue(_is_empty_datetime_val("   "))
+        self.assertFalse(_is_empty_datetime_val("16-07-2026 09:00:00"))
+        self.assertFalse(_is_empty_datetime_val(datetime(2026, 7, 16, 9, 0)))
+
+    def test_offset_and_duration_same_day(self):
+        start = datetime(2026, 7, 16, 9, 0)
+        end = datetime(2026, 7, 16, 9, 45)
+        self.assertEqual(offset_days_between(start, end), 0)
+        self.assertEqual(requested_duration_minutes(start, end, 0), 45)
+
+    def test_offset_overnight(self):
+        start = datetime(2026, 7, 16, 22, 0)
+        end = datetime(2026, 7, 17, 6, 0)
+        self.assertEqual(offset_days_between(start, end), 1)
+        self.assertEqual(requested_duration_minutes(start, end, 1), 8 * 60)
+
+
+class TestExtractTempVisitRows(unittest.TestCase):
+    def _write_workbook(self, rows):
+        import tempfile
+        import openpyxl
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Data"
+        ws.append(
+            [
+                "Service Location Name",
+                "Service Location Address",
+                "Planned Service Type Description",
+                "Planned Service Requirement Type Description",
+                "Service Requirement Start Date And Time",
+                "Service Requirement End Date And Time",
+                "Actual Start Date And Time",
+                "Actual End Date And Time",
+                "Cancellation Description",
+            ]
+        )
+        for row in rows:
+            ws.append(row)
+        tmp = Path(tempfile.mkdtemp()) / "temp_visits.xlsx"
+        wb.save(tmp)
+        wb.close()
+        return tmp
+
+    def test_extracts_personal_care_with_empty_requirement(self):
+        from encoding_utils import normalize_name_for_match
+
+        tmp = self._write_workbook(
+            [
+                [
+                    "Smith, Jane",
+                    "1 Main St D01ABCD",
+                    "Personal Care",
+                    "Personal Care",
+                    None,
+                    None,
+                    datetime(2026, 7, 16, 9, 0),
+                    datetime(2026, 7, 16, 9, 45),
+                    None,
+                ],
+                # Requirement filled → skip
+                [
+                    "Smith, Jane",
+                    "1 Main St D01ABCD",
+                    "Personal Care",
+                    "Personal Care",
+                    datetime(2026, 7, 16, 10, 0),
+                    datetime(2026, 7, 16, 10, 30),
+                    datetime(2026, 7, 16, 10, 0),
+                    datetime(2026, 7, 16, 10, 30),
+                    None,
+                ],
+                # Not Personal Care → skip
+                [
+                    "Smith, Jane",
+                    "1 Main St D01ABCD",
+                    "Nursing",
+                    "Nursing",
+                    None,
+                    None,
+                    datetime(2026, 7, 16, 11, 0),
+                    datetime(2026, 7, 16, 11, 30),
+                    None,
+                ],
+                # Has cancellation → skip
+                [
+                    "Smith, Jane",
+                    "1 Main St D01ABCD",
+                    "Personal Care",
+                    "Personal Care",
+                    None,
+                    None,
+                    datetime(2026, 7, 16, 12, 0),
+                    datetime(2026, 7, 16, 12, 30),
+                    "Hospital",
+                ],
+                # Wrong date → skip
+                [
+                    "Smith, Jane",
+                    "1 Main St D01ABCD",
+                    "Personal Care",
+                    "Personal Care",
+                    None,
+                    None,
+                    datetime(2026, 7, 17, 9, 0),
+                    datetime(2026, 7, 17, 9, 45),
+                    None,
+                ],
+            ]
+        )
+        try:
+            clients_map = {
+                normalize_name_for_match("Smith, Jane"): [
+                    {
+                        "id": 42,
+                        "name": "Jane",
+                        "lastname": "Smith",
+                        "status": "Active",
+                        "postcode": "D01ABCD",
+                    }
+                ]
+            }
+            rows, stats = extract_temp_visit_rows(tmp, date(2026, 7, 16), clients_map)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(stats["candidates"], 1)
+            self.assertEqual(stats["skipped_req_not_both_empty"], 1)
+            self.assertEqual(stats["skipped_not_personal_care"], 1)
+            self.assertEqual(stats["skipped_has_cancellation"], 1)
+            self.assertEqual(stats["skipped_wrong_date"], 1)
+            rec = rows[0]
+            self.assertEqual(rec["client_id"], 42)
+            self.assertEqual(rec["start_minute"], 540)
+            self.assertEqual(rec["end_minute"], 585)
+            self.assertEqual(rec["requested_start_time"], "09:00:00")
+            self.assertEqual(rec["requested_end_time"], "09:45:00")
+            self.assertEqual(rec["requested_duration"], 45)
+            self.assertEqual(rec["day_of_week"], "Thursday")
+            self.assertEqual(PERSONAL_CARE, "Personal Care")
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    def test_skips_missing_actual(self):
+        from encoding_utils import normalize_name_for_match
+
+        tmp = self._write_workbook(
+            [
+                [
+                    "Smith, Jane",
+                    None,
+                    "Personal Care",
+                    "Personal Care",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ]
+            ]
+        )
+        try:
+            clients_map = {
+                normalize_name_for_match("Smith, Jane"): [
+                    {
+                        "id": 42,
+                        "name": "Jane",
+                        "lastname": "Smith",
+                        "status": "Active",
+                        "postcode": None,
+                    }
+                ]
+            }
+            rows, stats = extract_temp_visit_rows(tmp, date(2026, 7, 16), clients_map)
+            self.assertEqual(rows, [])
+            self.assertEqual(stats["skipped_missing_actual"], 1)
         finally:
             tmp.unlink(missing_ok=True)
 

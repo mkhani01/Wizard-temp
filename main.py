@@ -47,7 +47,7 @@ def print_usage():
         feasible-pairs [path]   Seed feasible_pairs + profile Must/Preferred/Only (16-week VisitExport)
         client-windows [path]   Patient_Analyzer windows from full VisitExport (default: assets/client_windows_data.csv)
         carer-travel-limits [path]   Set max_distance_km / max_p2p_distance_km from VisitExport routes (default: assets/visit_data.csv)
-        update-today-visits [xlsx] [YYYY-MM-DD]   Cancel roster visits for a date from Client Hours (Cancellation Description + terminated clients)
+        update-today-visits [xlsx] [YYYY-MM-DD]   Update roster visits for a date from Client Hours (cancel + temp schedules/visits from Actual)
         test                 Run pre-run checks and optional distance test (run before migrating)
         all                  Run all migrations (TODO)
     

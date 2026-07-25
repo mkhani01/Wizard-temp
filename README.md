@@ -124,7 +124,7 @@ python main.py <command> [options]
 | `feasible-pairs [path]` | Seed `feasible_pairs` + profile Must/Preferred/Only (two-way sync) from VisitExport (default: `assets/visit_data.csv`) |
 | `client-windows [path]` | Patient_Analyzer pipeline → `client_schedule_preferences` window_start / window_end / suggested_duration / min_duration (default: `assets/client_windows_data.csv`). |
 | `carer-travel-limits [path]` | Set `user.max_distance_km` / `max_p2p_distance_km` from VisitExport routes + `travel_distances` (default: `assets/visit_data.csv`; run after `travel-distances`). |
-| `update-today-visits [xlsx] [YYYY-MM-DD]` | Cancel roster visits for a date from Client Hours with Service Type: rows with Cancellation Description cancel matching ALLOCATED/UNALLOCATED visits; terminated clients' visits that day cancel with type `Terminated`. Missing visits are skipped and logged. |
+| `update-today-visits [xlsx] [YYYY-MM-DD]` | Update roster visits for a date from Client Hours with Service Type: cancel matching visits from Cancellation Description; cancel terminated clients' visits with type `Terminated`; for Personal Care rows where Requirement start/end are empty, create a one-day temporary client schedule + UNALLOCATED visit from Actual Start/End. Missing cancel matches are skipped and logged. |
 | `test` | Run pre-run checks and optional distance test |
 
 ---

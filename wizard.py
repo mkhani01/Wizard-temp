@@ -70,7 +70,7 @@ STEP_RUN = 5
 TOTAL_STEPS = 6
 
 # Wizard release version (shown in UI and window title on all platforms / frozen builds)
-WIZARD_VERSION = "0.0.6"
+WIZARD_VERSION = "0.0.7"
 
 # Migration option keys (must match checkbox keys and file keys)
 OPT_CAREGIVERS = "caregivers"
@@ -431,10 +431,12 @@ class MigrationWizard:
         ttk.Label(
             pinned,
             text=(
-                "Cancel roster visits for a selected date using Client Hours with Service Type. "
+                "Update roster visits for a selected date using Client Hours with Service Type. "
                 "Rows with Cancellation Description cancel matching ALLOCATED/UNALLOCATED visits; "
                 "terminated clients' visits that day are cancelled with type Terminated. "
-                "Missing visits are skipped and logged. You will pick the file and date in the next step."
+                "Personal Care rows with empty Requirement start/end create a one-day temporary "
+                "client schedule and UNALLOCATED visit from Actual Start/End. "
+                "Missing cancel matches are skipped and logged. You will pick the file and date in the next step."
             ),
             wraplength=560,
             padding=(28, 4, 8, 4),
