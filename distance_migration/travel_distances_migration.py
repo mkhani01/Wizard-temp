@@ -13,6 +13,7 @@ import json
 import logging
 import io
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from datetime import datetime
@@ -71,10 +72,17 @@ TRAVEL_METHOD_MAP = {
 }
 OSRM_METHODS = list(TRAVEL_METHOD_MAP.keys())
 
+# Skip OSRM for walk/bike when car distance already exceeds these thresholds.
+# Fixed values are written instead (duration 1440 min = 24h sentinel).
+CAR_DISTANCE_SHORTCUTS = {
+    "walk": {"car_threshold_km": 15, "fixed_km": 15, "fixed_duration_min": 1440},
+    "bike": {"car_threshold_km": 30, "fixed_km": 30, "fixed_duration_min": 1440},
+}
+
 # Batch sizes
 DEFAULT_STEP_SIZE = 25
 DB_INSERT_BATCH_SIZE = int(os.getenv("DB_INSERT_BATCH_SIZE", "5000"))
-PIPELINE_FLUSH_PAIRS = int(os.getenv("PIPELINE_FLUSH_PAIRS", "250"))
+PIPELINE_FLUSH_PAIRS = int(os.getenv("PIPELINE_FLUSH_PAIRS", "5000"))
 
 # Cache Directory for Resume capability
 SCRIPT_DIR = Path(__file__).parent.resolve()
@@ -325,6 +333,125 @@ def get_existing_pairs_for_keys(connection, from_type, to_type, method, pair_key
     finally:
         cursor.close()
 
+
+def get_car_distances_for_pairs(connection, from_type, to_type, pair_keys):
+    """Return {(from_id, to_id): distance_meters} for car rows matching pair_keys."""
+    if not pair_keys:
+        return {}
+    cursor = connection.cursor()
+    try:
+        result = {}
+        if len(pair_keys) >= BULK_PAIR_LOOKUP_THRESHOLD:
+            logger.info(
+                "    Loading car distances for %s->%s (%d pair keys)...",
+                from_type, to_type, len(pair_keys),
+            )
+            cursor.execute("""
+                SELECT from_id, to_id, distance_meters
+                FROM travel_distances
+                WHERE from_type = %s AND to_type = %s AND travel_method = 'car'
+            """, (from_type, to_type))
+            while True:
+                rows = cursor.fetchmany(EXISTING_PAIRS_FETCH_BATCH)
+                if not rows:
+                    break
+                for row in rows:
+                    key = (row["from_id"], row["to_id"])
+                    if key in pair_keys:
+                        result[key] = row["distance_meters"]
+            logger.info("    Found car distances for %d / %d pair(s)", len(result), len(pair_keys))
+            return result
+
+        keys_list = list(pair_keys)
+        chunk = 5000
+        for i in range(0, len(keys_list), chunk):
+            sub = keys_list[i:i + chunk]
+            from_ids = [p[0] for p in sub]
+            to_ids = [p[1] for p in sub]
+            cursor.execute("""
+                SELECT from_id, to_id, distance_meters
+                FROM travel_distances
+                WHERE from_type = %s AND to_type = %s AND travel_method = 'car'
+                  AND (from_id, to_id) IN (
+                    SELECT * FROM UNNEST(%s::bigint[], %s::bigint[]) AS t(from_id, to_id)
+                  )
+            """, (from_type, to_type, from_ids, to_ids))
+            for row in cursor.fetchall():
+                result[(row["from_id"], row["to_id"])] = row["distance_meters"]
+        return result
+    finally:
+        cursor.close()
+
+
+def _fetch_and_insert_missing_car_distances(
+    connection,
+    cursor,
+    source_entities,
+    target_entities,
+    missing_car_pairs,
+    from_type,
+    to_type,
+    state=None,
+    segment_key=None,
+):
+    """
+    Fetch car distances for pairs that should already exist but are missing.
+    Inserts them into travel_distances and returns {(from_id, to_id): distance_meters}.
+    """
+    if not missing_car_pairs:
+        return {}
+
+    logger.warning(
+        "    ANOMALY: %d pair(s) missing car distance for %s->%s; "
+        "fetching driving-car via OSRM before applying walk/bike shortcut.",
+        len(missing_car_pairs), from_type, to_type,
+    )
+
+    source_ids = {s for s, _t in missing_car_pairs}
+    target_ids = {t for _s, t in missing_car_pairs}
+    sources_to_calc = {sid: source_entities[sid] for sid in source_ids if sid in source_entities}
+    targets = {tid: target_entities[tid] for tid in target_ids if tid in target_entities}
+    if not sources_to_calc or not targets:
+        raise RuntimeError(
+            f"Cannot fetch missing car distances for {len(missing_car_pairs)} pair(s) "
+            f"({from_type}->{to_type}): sources/targets lack coordinates."
+        )
+
+    inserter = PipelineInserter(
+        connection, cursor, from_type, to_type, "car",
+        state=state, segment_key=segment_key, skip_conflict_check=True,
+        async_insert=True,
+    )
+    accumulated = {"distance": {}, "duration": {}}
+
+    def on_block(block_matrix):
+        accumulated["distance"].update(block_matrix.get("distance", {}))
+        accumulated["duration"].update(block_matrix.get("duration", {}))
+        inserter.add_block(block_matrix)
+
+    result = get_distance_matrix(
+        entities_info1=sources_to_calc,
+        entities_info2=targets,
+        travel_method="driving-car",
+        step_size=DEFAULT_STEP_SIZE,
+        on_block_complete=on_block,
+        required_pairs=missing_car_pairs,
+    )
+    attempted_rows, _batches = inserter.finish()
+    if result.get("errors"):
+        raise RuntimeError(
+            f"Failed to fetch missing car distances: {len(result['errors'])} OSRM block(s) failed."
+        )
+    logger.info(
+        "    Fetched and inserted %d missing car distance row(s).",
+        attempted_rows,
+    )
+    # Convert km back to meters for shortcut comparisons
+    return {
+        key: int(round(dist_km * 1000))
+        for key, dist_km in accumulated["distance"].items()
+        if dist_km is not None
+    }
 
 class PipelineInserter:
     """Buffer rows and flush via COPY + INSERT. DB work runs on a dedicated thread."""
@@ -855,6 +982,64 @@ def _log_expected_row_counts(scoped_pair_map, segments):
     logger.info("Expected travel_distances rows when complete: %d", total_rows)
 
 
+def _compute_missing_pairs_by_method(connection, scoped_pair_map, segments):
+    """Approx missing counts per travel method using required - COUNT(*) (cheap)."""
+    missing_by_method = {"car": 0, "bike": 0, "walk": 0}
+    if not scoped_pair_map:
+        return missing_by_method
+    for _segment_key, from_type, to_type, _osrm_method, db_method in segments:
+        required_pairs = scoped_pair_map.get((from_type, to_type), set())
+        if not required_pairs:
+            continue
+        required_count = len(required_pairs)
+        db_count = get_segment_row_count(connection, from_type, to_type, db_method)
+        missing = max(0, required_count - db_count)
+        if db_method in missing_by_method:
+            missing_by_method[db_method] += missing
+    return missing_by_method
+
+
+def _format_eta(seconds):
+    """Format seconds as 'Hh MMm' or 'MMm SSs'."""
+    if seconds is None or seconds < 0:
+        return "unknown"
+    seconds = int(seconds)
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours > 0:
+        return f"{hours}h {minutes:02d}m"
+    return f"{minutes}m {secs:02d}s"
+
+
+def _log_progress_eta(
+    total_processed,
+    total_expected_missing,
+    remaining_by_method,
+    run_start_time,
+):
+    """Log cumulative progress, rate, ETA, and remaining pairs by method."""
+    elapsed = time.monotonic() - run_start_time
+    total_remaining = sum(remaining_by_method.values())
+    parts = [
+        f"Progress: {total_processed}/{total_expected_missing} pair(s) processed (approx).",
+    ]
+    if total_processed > 0 and elapsed > 0:
+        rate = total_processed / elapsed
+        parts.append(f"Rate: {rate:.1f} pairs/sec.")
+        if total_remaining > 0 and rate > 0:
+            eta_sec = total_remaining / rate
+            parts.append(f"Estimated time remaining: {_format_eta(eta_sec)}.")
+        elif total_remaining == 0:
+            parts.append("Estimated time remaining: 0m 00s.")
+    logger.info("  %s", " ".join(parts))
+    logger.info(
+        "    Remaining by method (approx): car=%d, bike=%d, walk=%d",
+        remaining_by_method.get("car", 0),
+        remaining_by_method.get("bike", 0),
+        remaining_by_method.get("walk", 0),
+    )
+
+
 def process_missing_segment(
     connection,
     cursor,
@@ -869,7 +1054,10 @@ def process_missing_segment(
     segment_key=None,
     required_pairs=None,
 ):
-    """Legacy full-matrix segment processor (DISTANCE_MODE=full). Uses pipeline when no cache."""
+    """Legacy full-matrix segment processor (DISTANCE_MODE=full). Uses pipeline when no cache.
+
+    Returns (success, attempted_rows).
+    """
     if required_pairs is not None:
         return process_scoped_segment(
             connection, cursor, source_entities, target_entities,
@@ -879,15 +1067,17 @@ def process_missing_segment(
 
     if not missing_source_ids:
         logger.info(f"  {from_type}->{to_type} ({db_enum_method}): No missing pairs.")
-        return
+        return True, 0
     logger.info(f"  {from_type}->{to_type} ({db_enum_method}): Found {len(missing_source_ids)} sources with missing data.")
     matrix = load_cache(osrm_method, from_type, to_type)
     had_partial_errors = False
+    attempted_rows = 0
+    batches_committed = 0
     if not matrix:
         sources_to_calc = {sid: source_entities[sid] for sid in missing_source_ids if sid in source_entities}
         if not sources_to_calc:
             logger.warning("    No coordinate data found for missing source IDs.")
-            return
+            return True, 0
         logger.info(f"    >>> CALLING OSRM API: {len(sources_to_calc)} x {len(target_entities)}")
         inserter = PipelineInserter(
             connection, cursor, from_type, to_type, db_enum_method,
@@ -931,14 +1121,14 @@ def process_missing_segment(
                     "OSRM segment had failed block(s). No new successful pairs to insert; retry to calculate remaining missing pairs."
                 )
             clear_cache(osrm_method, from_type, to_type)
-            return
+            return True, 0
         logger.info("    Inserted/updated records (batches committed: %d).", batches_committed)
         if had_partial_errors:
             raise RuntimeError(
                 "OSRM segment had failed block(s). Inserted successful pairs; retry to calculate remaining missing pairs."
             )
         clear_cache(osrm_method, from_type, to_type)
-        return
+        return True, attempted_rows
 
     if attempted_rows == 0:
         logger.info("    No missing pairs to insert.")
@@ -947,13 +1137,14 @@ def process_missing_segment(
                 "OSRM segment had failed block(s). No new successful pairs to insert; retry to calculate remaining missing pairs."
             )
         clear_cache(osrm_method, from_type, to_type)
-        return
+        return True, 0
     logger.info("    Inserted/updated records (batches committed: %d).", batches_committed)
     if had_partial_errors:
         raise RuntimeError(
             "OSRM segment had failed block(s). Inserted successful pairs; retry to calculate remaining missing pairs."
         )
     clear_cache(osrm_method, from_type, to_type)
+    return True, attempted_rows
 
 
 def _build_segments_list(scoped_pair_map=None):
@@ -980,6 +1171,76 @@ def _build_segments_list(scoped_pair_map=None):
     return out
 
 
+def _apply_car_distance_shortcuts(
+    connection,
+    cursor,
+    source_entities,
+    target_entities,
+    missing,
+    from_type,
+    to_type,
+    db_enum_method,
+    inserter,
+    state=None,
+    segment_key=None,
+):
+    """
+    For walk/bike: skip OSRM when car distance exceeds the threshold.
+    Inserts fixed distance/duration rows and returns the remaining missing pairs.
+    """
+    shortcut = CAR_DISTANCE_SHORTCUTS.get(db_enum_method)
+    if not shortcut or not missing:
+        return missing
+
+    threshold_m = int(shortcut["car_threshold_km"] * 1000)
+    fixed_km = shortcut["fixed_km"]
+    fixed_dur = shortcut["fixed_duration_min"]
+
+    car_distances = get_car_distances_for_pairs(connection, from_type, to_type, missing)
+    pairs_without_car = missing - set(car_distances.keys())
+    if pairs_without_car:
+        fetched = _fetch_and_insert_missing_car_distances(
+            connection, cursor, source_entities, target_entities,
+            pairs_without_car, from_type, to_type,
+            state=state, segment_key=segment_key,
+        )
+        car_distances.update(fetched)
+        still_missing_car = pairs_without_car - set(fetched.keys())
+        if still_missing_car:
+            raise RuntimeError(
+                f"Still missing car distances for {len(still_missing_car)} pair(s) "
+                f"after on-demand fetch ({from_type}->{to_type})."
+            )
+
+    shortcut_distance = {}
+    shortcut_duration = {}
+    remaining = set()
+    for pair in missing:
+        car_m = car_distances.get(pair)
+        if car_m is not None and car_m >= threshold_m:
+            shortcut_distance[pair] = float(fixed_km)
+            shortcut_duration[pair] = fixed_dur
+        else:
+            remaining.add(pair)
+
+    if shortcut_distance:
+        logger.info(
+            "    Car-distance shortcut (%s): skipping OSRM for %d pair(s) "
+            "(car >= %d km → distance=%d km, duration=%d min). Remaining for OSRM: %d.",
+            db_enum_method,
+            len(shortcut_distance),
+            shortcut["car_threshold_km"],
+            fixed_km,
+            fixed_dur,
+            len(remaining),
+        )
+        inserter.add_block({
+            "distance": shortcut_distance,
+            "duration": shortcut_duration,
+        })
+    return remaining
+
+
 def process_scoped_segment(
     connection,
     cursor,
@@ -993,17 +1254,20 @@ def process_scoped_segment(
     state=None,
     segment_key=None,
 ):
-    """Compute and insert only missing pairs; OSRM and DB insert run in parallel."""
+    """Compute and insert only missing pairs; OSRM and DB insert run in parallel.
+
+    Returns (success, attempted_rows).
+    """
     if not required_pairs:
         logger.info(f"  {from_type}->{to_type} ({db_enum_method}): No required pairs.")
-        return True
+        return True, 0
 
     missing = _get_missing_pairs(connection, from_type, to_type, db_enum_method, required_pairs)
     if not missing:
         logger.info(
             f"  {from_type}->{to_type} ({db_enum_method}): All {len(required_pairs)} pair(s) already in DB."
         )
-        return True
+        return True, 0
 
     source_ids = {s for s, _t in missing}
     target_ids = {t for _s, t in missing}
@@ -1030,20 +1294,40 @@ def process_scoped_segment(
         async_insert=True,
     )
 
-    def on_block(block_matrix):
-        inserter.add_block(block_matrix)
-
-    result = get_distance_matrix(
-        entities_info1=sources_to_calc,
-        entities_info2=targets,
-        travel_method=osrm_method,
-        step_size=DEFAULT_STEP_SIZE,
-        on_block_complete=on_block,
-        required_pairs=missing,
+    missing = _apply_car_distance_shortcuts(
+        connection, cursor, source_entities, target_entities,
+        missing, from_type, to_type, db_enum_method, inserter,
+        state=state, segment_key=segment_key,
     )
 
+    had_partial_errors = False
+    if missing:
+        # Refresh sources/targets to only what OSRM still needs
+        source_ids = {s for s, _t in missing}
+        target_ids = {t for _s, t in missing}
+        sources_to_calc = {sid: source_entities[sid] for sid in source_ids if sid in source_entities}
+        targets = {tid: target_entities[tid] for tid in target_ids if tid in target_entities}
+
+        def on_block(block_matrix):
+            inserter.add_block(block_matrix)
+
+        result = get_distance_matrix(
+            entities_info1=sources_to_calc,
+            entities_info2=targets,
+            travel_method=osrm_method,
+            step_size=DEFAULT_STEP_SIZE,
+            on_block_complete=on_block,
+            required_pairs=missing,
+        )
+        had_partial_errors = bool(result.get("errors"))
+    else:
+        result = {}
+        logger.info(
+            "    All missing %s pairs covered by car-distance shortcut; skipping OSRM.",
+            db_enum_method,
+        )
+
     attempted_rows, batches_committed = inserter.finish()
-    had_partial_errors = bool(result.get("errors"))
     still_missing = _get_missing_pairs(connection, from_type, to_type, db_enum_method, required_pairs)
 
     if had_partial_errors:
@@ -1067,7 +1351,7 @@ def process_scoped_segment(
         )
 
     logger.info("    Inserted %d row(s) in %d batch(es). Segment complete.", attempted_rows, batches_committed)
-    return True
+    return True, attempted_rows
 
 
 def run(connection_manager=None, state=None, visit_csv_path=None):
@@ -1147,6 +1431,23 @@ def run(connection_manager=None, state=None, visit_csv_path=None):
 
         segments = _build_segments_list(scoped_pair_map)
         _log_expected_row_counts(scoped_pair_map, segments)
+
+        remaining_by_method = _compute_missing_pairs_by_method(
+            connection, scoped_pair_map, segments,
+        )
+        total_expected_missing = sum(remaining_by_method.values())
+        logger.info("Missing pairs by travel method (approx, before this run):")
+        for method_name in ("car", "bike", "walk"):
+            logger.info(
+                "  %s: %d missing pair(s)",
+                method_name,
+                remaining_by_method.get(method_name, 0),
+            )
+        logger.info("Total missing pairs to process (approx): %d", total_expected_missing)
+
+        run_start_time = time.monotonic()
+        total_rows_processed = 0
+
         for segment_key, from_type, to_type, osrm_method, db_enum_method in segments:
             required_pairs = None
             if scoped_pair_map is not None:
@@ -1192,7 +1493,7 @@ def run(connection_manager=None, state=None, visit_csv_path=None):
                     user_ids if from_type == ENTITY_TYPE_USER else client_ids, counts, expected_count
                 )
 
-            process_missing_segment(
+            _ok, attempted_rows = process_missing_segment(
                 connection, cursor,
                 source_entities=source_entities,
                 target_entities=target_entities,
@@ -1204,6 +1505,18 @@ def run(connection_manager=None, state=None, visit_csv_path=None):
                 state=state,
                 segment_key=segment_key,
                 required_pairs=required_pairs,
+            )
+
+            total_rows_processed += attempted_rows or 0
+            if db_enum_method in remaining_by_method:
+                remaining_by_method[db_enum_method] = max(
+                    0, remaining_by_method[db_enum_method] - (attempted_rows or 0),
+                )
+            _log_progress_eta(
+                total_rows_processed,
+                total_expected_missing,
+                remaining_by_method,
+                run_start_time,
             )
 
             if state:
