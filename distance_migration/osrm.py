@@ -178,7 +178,7 @@ def get_cross_distance_matrix(
 
 
 # Max concurrent OSRM block requests (avoid overwhelming server)
-OSRM_MAX_WORKERS = 4
+OSRM_MAX_WORKERS = 5
 
 
 def _block_covers_required_pairs(

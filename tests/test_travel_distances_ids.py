@@ -58,7 +58,7 @@ class TestTravelDistancesSqlTypes(unittest.TestCase):
 
         sql = cursor.execute.call_args[0][0]
         self.assertIn("bigint[]", sql)
-        self.assertNotIn("int[]", sql)
+        self.assertNotIn("::int[]", sql)
 
         args = cursor.execute.call_args[0][1]
         from_ids, to_ids = args[3], args[4]
