@@ -70,7 +70,7 @@ STEP_RUN = 5
 TOTAL_STEPS = 6
 
 # Wizard release version (shown in UI and window title on all platforms / frozen builds)
-WIZARD_VERSION = "0.0.7"
+WIZARD_VERSION = "0.0.8"
 
 # Migration option keys (must match checkbox keys and file keys)
 OPT_CAREGIVERS = "caregivers"

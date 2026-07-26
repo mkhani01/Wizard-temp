@@ -1,0 +1,13 @@
+---
+description: Bump WIZARD_VERSION on every wizard/migration code change
+alwaysApply: true
+---
+
+# Wizard version bump
+
+Whenever you change code that ships with the Migration Wizard (including `wizard.py`, migration modules it runs, shared helpers, tests for those flows, or packaging/build scripts), bump the release version in the same change set.
+
+- Constant: `WIZARD_VERSION` in `wizard.py`
+- Bump the patch segment by default (e.g. `0.0.8` → `0.0.9`) unless the user asks for a minor/major bump
+- Do this even if you did not edit `wizard.py` itself — any wizard-facing code change still needs a version bump
+- Do not leave the version unchanged across a coding session that modified wizard behavior
