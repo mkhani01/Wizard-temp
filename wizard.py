@@ -67,10 +67,28 @@ STEP_CHECKBOXES = 2
 STEP_FILES = 3
 STEP_SUMMARY = 4
 STEP_RUN = 5
-TOTAL_STEPS = 6
+STEP_TEST_TODAY = 6
+TOTAL_STEPS = 7
+
+# Top-level wizard modes (chosen on welcome)
+MODE_MIGRATION = "migration"
+MODE_TEST_TODAY = "test_today"
 
 # Wizard release version (shown in UI and window title on all platforms / frozen builds)
-WIZARD_VERSION = "0.0.8"
+WIZARD_VERSION = "0.0.11"
+
+# User-facing name for MODE_TEST_TODAY (internal id unchanged)
+LABEL_VALIDATE_ROSTER = "Validate today's roster"
+
+RUN_HELP_MIGRATION = (
+    "Do not close this window until the migration finishes. Cancel stops between steps. "
+    "If a step fails, use Retry after fixing the issue, or Continue from next to skip it. "
+    "The log below shows progress; a full log file is saved to the project folder."
+)
+RUN_HELP_VALIDATE = (
+    "Do not close this window until the checks finish. Progress appears in the log below; "
+    "a log file is saved when done. Review PASS/FAIL lines in the log for details."
+)
 
 # Migration option keys (must match checkbox keys and file keys)
 OPT_CAREGIVERS = "caregivers"
@@ -167,6 +185,23 @@ def _bind_mousewheel_recursive(widget, on_mousewheel, on_linux=None):
         _bind_mousewheel_recursive(child, on_mousewheel, on_linux)
 
 
+def _mousewheel_units(event):
+    """Normalize MouseWheel delta across Windows (±120) and macOS (small deltas)."""
+    d = getattr(event, "delta", 0)
+    if abs(d) >= 100:
+        return int(-d / 120)
+    return -1 if d > 0 else 1
+
+
+def _default_ui_font():
+    """Readable system font per platform."""
+    if sys.platform == "darwin":
+        return ("Helvetica", 11)
+    if sys.platform == "win32":
+        return ("Segoe UI", 10)
+    return ("TkDefaultFont", 10)
+
+
 def validate_location_json_file(file_path, root_key, label="File"):
     """
     Validate that a JSON backup file has the required structure for location import.
@@ -209,8 +244,8 @@ def try_load_logo(root, path, size=(64, 64)):
 class MigrationWizard:
     def __init__(self):
         self.root = Tk()
-        self.root.title("AOS System – Migration Wizard ({})".format(WIZARD_VERSION))
-        self.root.minsize(700, 560)
+        self.root.title("AOS System Wizard ({})".format(WIZARD_VERSION))
+        self.root.minsize(720, 560)
         self.root.geometry("780x640")
 
         # Window icon (favicon) – keep reference so it persists, especially on Mac
@@ -233,6 +268,9 @@ class MigrationWizard:
 
         self.current_step = 0
         self.frames = []
+        self._wrap_labels = []  # Labels whose wraplength tracks window width
+        self._wrap_labels_narrow = []  # Indented option descriptions (slightly narrower)
+        self._scroll_canvases = []  # Canvases to refresh scrollregion on resize
         self.db_config = {
             "host": StringVar(value=os.getenv("DB_HOST", "localhost")),
             "port": StringVar(value=os.getenv("DB_PORT", "5432")),
@@ -253,22 +291,29 @@ class MigrationWizard:
         self.geocode_ie_txt_path = StringVar(value="")
         self.update_today_visits_date = StringVar(value=datetime.now().strftime("%Y-%m-%d"))
         self.privacy_accepted = BooleanVar(value=False)
+        self.wizard_mode = StringVar(value=MODE_MIGRATION)
+        self.test_today_client_hours = StringVar(value="")
+        self.test_today_caregivers_xlsx = StringVar(value="")
+        self.test_today_date = StringVar(value=datetime.now().strftime("%Y-%m-%d"))
+        self.test_today_base_url = StringVar(value=os.getenv("API_BASE_URL", "http://localhost:3000"))
+        self.test_today_token = StringVar(value=os.getenv("API_TOKEN", ""))
 
         self._setup_styles()
         self._build_ui()
+        self.root.bind("<Configure>", self._on_root_configure)
         self._show_step(STEP_WELCOME)
 
     def _setup_styles(self):
-        """Apply consistent padding and fonts for better readability (especially on Mac)."""
+        """Apply consistent padding and fonts for better readability across platforms."""
         style = ttk.Style()
         try:
-            # Prefer a readable system font on Mac (e.g. San Francisco / Helvetica)
-            default_font = ("Helvetica", 11) if sys.platform == "darwin" else ("", 10)
+            default_font = _default_ui_font()
         except Exception:
             default_font = ("", 10)
         style.configure("TLabel", padding=(0, 4), font=default_font)
         style.configure("TButton", padding=(10, 6), font=default_font)
         style.configure("TCheckbutton", padding=(0, 6), font=default_font)
+        style.configure("TRadiobutton", padding=(0, 4), font=default_font)
         style.configure("TEntry", padding=4)
 
     def _build_ui(self):
@@ -280,7 +325,7 @@ class MigrationWizard:
         main.rowconfigure(1, weight=1)
 
         # Progress + version (constant row visible on every step)
-        self.step_label = ttk.Label(main, text="Step 1 of 6 – Welcome", font=("", 10, "bold"))
+        self.step_label = ttk.Label(main, text="Step 1 of 3 – Welcome", font=("", 10, "bold"))
         self.step_label.grid(row=0, column=0, sticky=W, pady=(0, 8))
         self.version_label = ttk.Label(main, text="Version {}".format(WIZARD_VERSION), font=("", 9))
         self.version_label.grid(row=0, column=1, sticky=E, pady=(0, 8))
@@ -303,6 +348,7 @@ class MigrationWizard:
         self._build_step_files(self.frames[STEP_FILES])
         self._build_step_summary(self.frames[STEP_SUMMARY])
         self._build_step_run(self.frames[STEP_RUN])
+        self._build_step_test_today(self.frames[STEP_TEST_TODAY])
 
         # Buttons
         btn_frame = ttk.Frame(main)
@@ -321,10 +367,10 @@ class MigrationWizard:
         self.btn_run_again = ttk.Button(btn_frame, text="Run again", command=self._on_run_again)
         self.btn_run_again.pack(side="right", padx=4)
         self.btn_run_again.pack_forget()
-        self.btn_check_migration = ttk.Button(btn_frame, text="Check the migration", command=self._on_check_migration)
+        self.btn_check_migration = ttk.Button(btn_frame, text="Check migration", command=self._on_check_migration)
         self.btn_check_migration.pack(side="right", padx=4)
         self.btn_check_migration.pack_forget()
-        self.btn_check_files = ttk.Button(btn_frame, text="Check migration", command=self._on_check_files)
+        self.btn_check_files = ttk.Button(btn_frame, text="Check files", command=self._on_check_files)
         self.btn_check_files.pack(side="right", padx=4)
         self.btn_check_files.pack_forget()
         self.btn_back = ttk.Button(btn_frame, text="Back", command=self._on_back)
@@ -348,42 +394,259 @@ class MigrationWizard:
             return start_row + 1
         return start_row
 
-    def _build_step_welcome(self, parent):
+    def _register_wrap(self, label, narrow=False):
+        """Track a label so wraplength updates when the window is resized."""
+        if narrow:
+            self._wrap_labels_narrow.append(label)
+        else:
+            self._wrap_labels.append(label)
+        return label
+
+    def _wrap_label(self, parent, text, narrow=False, **kwargs):
+        """Create a Label with wraplength that tracks window width."""
+        kwargs.setdefault("wraplength", 560)
+        lbl = ttk.Label(parent, text=text, **kwargs)
+        return self._register_wrap(lbl, narrow=narrow)
+
+    def _on_root_configure(self, event):
+        if event.widget is not self.root:
+            return
+        self._update_wraplengths()
+
+    def _update_wraplengths(self):
+        try:
+            content_w = self.content.winfo_width()
+        except Exception:
+            return
+        if content_w < 50:
+            return
+        width = max(320, content_w - 48)
+        narrow = max(280, width - 40)
+        for lbl in self._wrap_labels:
+            try:
+                lbl.configure(wraplength=width)
+            except Exception:
+                pass
+        for lbl in self._wrap_labels_narrow:
+            try:
+                lbl.configure(wraplength=narrow)
+            except Exception:
+                pass
+        for canvas in self._scroll_canvases:
+            try:
+                canvas.update_idletasks()
+                canvas.configure(scrollregion=canvas.bbox(ALL))
+            except Exception:
+                pass
+
+    def _create_scrollable_area(self, parent, prefix):
+        """
+        Fill parent with a Canvas + scrollbar. Returns the inner frame for content.
+        Stores canvas/wheel handlers as self._{prefix}_canvas etc. for bind_all.
+        """
         parent.columnconfigure(0, weight=1)
-        row = self._add_step_header(parent, 0)
-        ttk.Label(parent, text="Migration Wizard", font=("", 16, "bold")).grid(row=row, column=0, sticky=W, pady=(0, 12))
+        parent.rowconfigure(0, weight=1)
+
+        canvas = Canvas(parent, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        scroll_frame = ttk.Frame(canvas)
+        scroll_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox(ALL)),
+        )
+        canvas_window = canvas.create_window((0, 0), window=scroll_frame, anchor=NW)
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        def _on_canvas_configure(event):
+            canvas.itemconfig(canvas_window, width=event.width)
+
+        def _on_mousewheel(event):
+            canvas.yview_scroll(_mousewheel_units(event), "units")
+
+        def _on_mousewheel_linux(event):
+            if event.num == 5:
+                canvas.yview_scroll(1, "units")
+            elif event.num == 4:
+                canvas.yview_scroll(-1, "units")
+
+        def _focus_canvas(_event):
+            canvas.focus_set()
+
+        canvas.bind("<Configure>", _on_canvas_configure)
+        canvas.bind("<MouseWheel>", _on_mousewheel)
+        canvas.bind("<Button-4>", _on_mousewheel_linux)
+        canvas.bind("<Button-5>", _on_mousewheel_linux)
+        canvas.bind("<Enter>", _focus_canvas)
+        scroll_frame.bind("<MouseWheel>", _on_mousewheel)
+        scroll_frame.bind("<Button-4>", _on_mousewheel_linux)
+        scroll_frame.bind("<Button-5>", _on_mousewheel_linux)
+        scroll_frame.bind("<Enter>", _focus_canvas)
+        canvas.bind("<Up>", lambda e: canvas.yview_scroll(-1, "units"))
+        canvas.bind("<Down>", lambda e: canvas.yview_scroll(1, "units"))
+        canvas.bind("<Prior>", lambda e: canvas.yview_scroll(-1, "pages"))
+        canvas.bind("<Next>", lambda e: canvas.yview_scroll(1, "pages"))
+        canvas.bind("<Home>", lambda e: canvas.yview_moveto(0))
+        canvas.bind("<End>", lambda e: canvas.yview_moveto(1))
+
+        canvas.grid(row=0, column=0, sticky=(N, S, E, W))
+        scrollbar.grid(row=0, column=1, sticky=(N, S))
+
+        setattr(self, "_%s_canvas" % prefix, canvas)
+        setattr(self, "_%s_on_mousewheel" % prefix, _on_mousewheel)
+        setattr(self, "_%s_on_mousewheel_linux" % prefix, _on_mousewheel_linux)
+        setattr(self, "_%s_scroll_frame" % prefix, scroll_frame)
+        self._scroll_canvases.append(canvas)
+        return scroll_frame
+
+    def _bind_step_scroll(self, prefix):
+        """Enable bind_all mousewheel for a scrollable step (needed on Windows)."""
+        on_wheel = getattr(self, "_%s_on_mousewheel" % prefix, None)
+        on_linux = getattr(self, "_%s_on_mousewheel_linux" % prefix, None)
+        if on_wheel:
+            self.root.bind_all("<MouseWheel>", on_wheel)
+        if on_linux:
+            self.root.bind_all("<Button-4>", on_linux)
+            self.root.bind_all("<Button-5>", on_linux)
+        canvas = getattr(self, "_%s_canvas" % prefix, None)
+        if canvas is not None:
+            canvas.focus_set()
+
+    def _build_step_welcome(self, parent):
+        body = self._create_scrollable_area(parent, "welcome")
+        body.columnconfigure(0, weight=1)
+        row = self._add_step_header(body, 0)
+        ttk.Label(body, text="AOS System Wizard", font=("", 16, "bold")).grid(
+            row=row, column=0, sticky=W, pady=(0, 12)
+        )
         row += 1
         hint = (
-            "This wizard guides you through migrating your existing data (caregivers, clients, availability, etc.) "
-            "into the new AOS system.\n\n"
-            "What to do:\n"
-            "• Enter your PostgreSQL database details in the next step.\n"
-            "• Choose which data to migrate (e.g. Caregivers, Clients, Availability types).\n"
-            "• Select the CSV or Excel files that contain your export data.\n"
-            "• Run the migration; a detailed log file will be saved so you can review any warnings or errors.\n\n"
-            "Important: Do not close this window until the migration has finished. "
-            "If you use Google Maps geocoding, ensure you have a stable internet connection."
+            "Choose what you want to do, then continue.\n\n"
+            "• Migration – import caregivers, clients, availability, geocode, distances, and related data "
+            "into the AOS database from CSV/Excel exports.\n\n"
+            "• Validate today's roster – compare Excel exports to the live app API for a selected date "
+            "(unallocated visits, cancellations, caregiver availability). No database connection required. "
+            "This does not change data (unlike \"Update today visits\" in Migration)."
         )
-        ttk.Label(parent, text=hint, justify="left", wraplength=580, padding=(0, 8)).grid(row=row, column=0, sticky=W, pady=(0, 12))
+        self._wrap_label(body, hint, justify="left", padding=(0, 8)).grid(
+            row=row, column=0, sticky=W, pady=(0, 12)
+        )
         row += 1
-        ttk.Label(parent, text="More information:", font=("", 10, "bold")).grid(row=row, column=0, sticky=W, pady=(8, 2))
+        ttk.Label(body, text="What do you want to do?", font=("", 10, "bold")).grid(
+            row=row, column=0, sticky=W, pady=(4, 4)
+        )
         row += 1
-        link = ttk.Label(parent, text=AOS_URL, foreground="blue", cursor="hand2")
+        mode_frame = ttk.Frame(body)
+        mode_frame.grid(row=row, column=0, sticky=W, pady=(0, 12))
+        ttk.Radiobutton(
+            mode_frame,
+            text="Migration",
+            variable=self.wizard_mode,
+            value=MODE_MIGRATION,
+        ).pack(anchor=W, pady=2)
+        ttk.Radiobutton(
+            mode_frame,
+            text=LABEL_VALIDATE_ROSTER,
+            variable=self.wizard_mode,
+            value=MODE_TEST_TODAY,
+        ).pack(anchor=W, pady=2)
+        row += 1
+        ttk.Label(body, text="More information:", font=("", 10, "bold")).grid(
+            row=row, column=0, sticky=W, pady=(8, 2)
+        )
+        row += 1
+        link = ttk.Label(body, text=AOS_URL, foreground="blue", cursor="hand2")
         link.grid(row=row, column=0, sticky=W, pady=(0, 8))
         link.bind("<Button-1>", lambda e: webbrowser.open(AOS_URL))
-        parent.rowconfigure(row, weight=0)
+        _bind_mousewheel_recursive(
+            body,
+            self._welcome_on_mousewheel,
+            self._welcome_on_mousewheel_linux,
+        )
+
+    def _build_step_test_today(self, parent):
+        body = self._create_scrollable_area(parent, "validate")
+        body.columnconfigure(1, weight=1)
+        row = self._add_step_header(body, 0)
+        ttk.Label(body, text=LABEL_VALIDATE_ROSTER, font=("", 13, "bold")).grid(
+            row=row, column=0, columnspan=3, sticky=W, pady=(0, 6)
+        )
+        row += 1
+        self._wrap_label(
+            body,
+            "Compare your Excel exports to the live app for one date. Checks unallocated visits, "
+            "cancellations, and caregiver availability windows. Nothing is written to the database.",
+            padding=(0, 4),
+        ).grid(row=row, column=0, columnspan=3, sticky=W, pady=(0, 12))
+        row += 1
+
+        fields = [
+            (
+                "Client Hours with Service Type (XLSX):",
+                self.test_today_client_hours,
+                "file",
+                "Same Client Hours export used for migration / Update today visits.",
+            ),
+            (
+                "Caregivers Availability (XLSX):",
+                self.test_today_caregivers_xlsx,
+                "file",
+                "Caregiver availability workbook (e.g. userAvailabilities.xlsx).",
+            ),
+            (
+                "Date to check (YYYY-MM-DD):",
+                self.test_today_date,
+                "text",
+                "Defaults to today; any date in YYYY-MM-DD format is allowed.",
+            ),
+            (
+                "App API base URL:",
+                self.test_today_base_url,
+                "text",
+                "Root URL of the app API, e.g. http://localhost:3000 (no trailing path).",
+            ),
+            (
+                "API token:",
+                self.test_today_token,
+                "secret",
+                "Auth token from the panel (JWT). A \"Bearer \" prefix is optional.",
+            ),
+        ]
+        for label, var, kind, hint in fields:
+            ttk.Label(body, text=label).grid(row=row, column=0, sticky=W, padx=(0, 8), pady=(6, 2))
+            show = "*" if kind == "secret" else None
+            e = Entry(body, textvariable=var, width=42, show=show)
+            e.grid(row=row, column=1, sticky=(E, W), pady=(6, 2))
+            if kind == "file":
+                ttk.Button(
+                    body,
+                    text="Browse…",
+                    command=lambda v=var, p=body: self._browse_file(v, p),
+                ).grid(row=row, column=2, padx=4, pady=(6, 2))
+            row += 1
+            self._wrap_label(body, hint, padding=(0, 0, 0, 8)).grid(
+                row=row, column=1, columnspan=2, sticky=W, padx=(0, 8)
+            )
+            row += 1
+
+        _bind_mousewheel_recursive(
+            body,
+            self._validate_on_mousewheel,
+            self._validate_on_mousewheel_linux,
+        )
 
     def _build_step_db(self, parent):
-        parent.columnconfigure(0, weight=1)
-        parent.rowconfigure(1, weight=1)
-        row = self._add_step_header(parent, 0)
-        ttk.Label(parent, text="Database connection (PostgreSQL)", font=("", 13, "bold")).grid(row=row, column=0, columnspan=2, sticky=W, pady=(0, 6))
+        body = self._create_scrollable_area(parent, "db")
+        body.columnconfigure(1, weight=1)
+        row = self._add_step_header(body, 0)
+        ttk.Label(body, text="Database connection (PostgreSQL)", font=("", 13, "bold")).grid(
+            row=row, column=0, columnspan=2, sticky=W, pady=(0, 6)
+        )
         row += 1
-        ttk.Label(
-            parent,
-            text="Enter the connection details for the PostgreSQL database where AOS data will be stored. "
-                 "These settings are used for every migration step (caregivers, clients, availability, etc.).",
-            wraplength=560, padding=(0, 4)
+        self._wrap_label(
+            body,
+            "Enter the PostgreSQL connection details for the AOS database. "
+            "These settings are used for every migration step.",
+            padding=(0, 4),
         ).grid(row=row, column=0, columnspan=2, sticky=W, pady=(0, 14))
         row += 1
         hints = {
@@ -393,28 +656,50 @@ class MigrationWizard:
             "user": "PostgreSQL username with write access to the database.",
             "password": "Password for the user above.",
         }
-        for label, key in [("Host", "host"), ("Port", "port"), ("Database", "database"), ("User", "user"), ("Password", "password")]:
-            ttk.Label(parent, text=label + ":").grid(row=row, column=0, sticky=W, padx=(0, 12), pady=(6, 2))
-            w = Entry(parent, textvariable=self.db_config[key], width=38, show="*" if key == "password" else None)
+        for label, key in [
+            ("Host", "host"),
+            ("Port", "port"),
+            ("Database", "database"),
+            ("User", "user"),
+            ("Password", "password"),
+        ]:
+            ttk.Label(body, text=label + ":").grid(
+                row=row, column=0, sticky=W, padx=(0, 12), pady=(6, 2)
+            )
+            w = Entry(
+                body,
+                textvariable=self.db_config[key],
+                width=38,
+                show="*" if key == "password" else None,
+            )
             w.grid(row=row, column=1, sticky=(E, W), pady=(6, 2), padx=(0, 8))
             row += 1
-            ttk.Label(parent, text=hints[key], wraplength=520, padding=(0, 0, 0, 8)).grid(row=row, column=1, sticky=W, padx=(0, 8))
+            self._wrap_label(body, hints[key], padding=(0, 0, 0, 8)).grid(
+                row=row, column=1, sticky=W, padx=(0, 8)
+            )
             row += 1
-        parent.columnconfigure(1, weight=1)
+        _bind_mousewheel_recursive(
+            body,
+            self._db_on_mousewheel,
+            self._db_on_mousewheel_linux,
+        )
 
     def _build_step_checkboxes(self, parent):
         parent.columnconfigure(0, weight=1)
         row = self._add_step_header(parent, 0)
-        ttk.Label(parent, text="Select data to migrate", font=("", 13, "bold")).grid(row=row, column=0, sticky=W, pady=(0, 6))
+        ttk.Label(parent, text="Select data to migrate", font=("", 13, "bold")).grid(
+            row=row, column=0, sticky=W, pady=(0, 6)
+        )
         row += 1
         intro = (
-            "Tick each type of data you want to import. In the next step you will choose the file (or folder) for each option.\n\n"
-            "Hint: If you want to migrate Caregivers Availability or Clients Availability, you must tick \"Availability types\" as well, "
-            "and run that step first (the wizard runs steps in the correct order).\n\n"
-            "Scroll down in the list below (mouse wheel, scrollbar, or arrow/Page keys) to see more options "
-            "(Caregivers, Clients, Geocode, Calculate distances, Feasible pairs, etc.)."
+            "Tick each type of data to import. Next you will choose a file (or folder) for each option.\n\n"
+            "If you migrate Caregivers or Clients Availability, also tick Availability types "
+            "(the wizard runs steps in the correct order).\n\n"
+            "Scroll the list below for more options (Caregivers, Clients, Geocode, Distances, etc.)."
         )
-        ttk.Label(parent, text=intro, wraplength=560, padding=(0, 6)).grid(row=row, column=0, sticky=W, pady=(0, 8))
+        self._wrap_label(parent, intro, padding=(0, 6)).grid(
+            row=row, column=0, sticky=W, pady=(0, 8)
+        )
         row += 1
 
         # Pin "Update today visits" above the scroll list so it is always visible on Windows
@@ -428,17 +713,18 @@ class MigrationWizard:
             variable=self.check_vars[OPT_UPDATE_TODAY_VISITS],
             command=self._sync_checkbox_dependencies,
         ).grid(row=0, column=0, sticky=W)
-        ttk.Label(
+        self._wrap_label(
             pinned,
-            text=(
-                "Update roster visits for a selected date using Client Hours with Service Type. "
-                "Rows with Cancellation Description cancel matching ALLOCATED/UNALLOCATED visits; "
-                "terminated clients' visits that day are cancelled with type Terminated. "
-                "Personal Care rows with empty Requirement start/end create a one-day temporary "
+            (
+                "Writes to the database for a selected date using Client Hours with Service Type. "
+                "Cancels matching visits when a Cancellation Description is present; "
+                "terminated clients' visits that day use type Terminated. "
+                "Personal Care rows with empty Requirement times create a one-day temporary "
                 "client schedule and UNALLOCATED visit from Actual Start/End. "
-                "Missing cancel matches are skipped and logged. You will pick the file and date in the next step."
+                "Missing cancel matches are skipped and logged. Pick the file and date next. "
+                "(Not the same as Validate today's roster, which only compares to the API.)"
             ),
-            wraplength=560,
+            narrow=True,
             padding=(28, 4, 8, 4),
         ).grid(row=1, column=0, sticky=W)
         ttk.Separator(pinned, orient="horizontal").grid(row=2, column=0, sticky=(E, W), pady=(8, 0))
@@ -462,13 +748,7 @@ class MigrationWizard:
             canvas.itemconfig(canvas_window, width=event.width)
 
         def _on_mousewheel(event):
-            # Windows: delta is ±120 per notch; Mac: often ±1 or similar small value
-            d = getattr(event, "delta", 0)
-            if abs(d) >= 100:
-                units = int(-d / 120)
-            else:
-                units = -1 if d > 0 else 1
-            canvas.yview_scroll(units, "units")
+            canvas.yview_scroll(_mousewheel_units(event), "units")
 
         def _on_mousewheel_linux(event):
             if event.num == 5:
@@ -488,17 +768,16 @@ class MigrationWizard:
         scroll_frame.bind("<Button-4>", _on_mousewheel_linux)
         scroll_frame.bind("<Button-5>", _on_mousewheel_linux)
         scroll_frame.bind("<Enter>", _focus_canvas)
-        # Keyboard scrolling as a fallback when wheel/touchpad events don't reach the canvas
         canvas.bind("<Up>", lambda e: canvas.yview_scroll(-1, "units"))
         canvas.bind("<Down>", lambda e: canvas.yview_scroll(1, "units"))
-        canvas.bind("<Prior>", lambda e: canvas.yview_scroll(-1, "pages"))  # Page Up
-        canvas.bind("<Next>", lambda e: canvas.yview_scroll(1, "pages"))  # Page Down
+        canvas.bind("<Prior>", lambda e: canvas.yview_scroll(-1, "pages"))
+        canvas.bind("<Next>", lambda e: canvas.yview_scroll(1, "pages"))
         canvas.bind("<Home>", lambda e: canvas.yview_moveto(0))
         canvas.bind("<End>", lambda e: canvas.yview_moveto(1))
-        # Used by _show_step to bind_all while this step is visible (Windows)
         self._checkbox_canvas = canvas
         self._checkbox_on_mousewheel = _on_mousewheel
         self._checkbox_on_mousewheel_linux = _on_mousewheel_linux
+        self._scroll_canvases.append(canvas)
 
         canvas.grid(row=row_for_scroll, column=0, sticky=(N, S, E, W))
         scrollbar.grid(row=row_for_scroll, column=1, sticky=(N, S))
@@ -508,27 +787,25 @@ class MigrationWizard:
         # Content inside scroll_frame (Update today visits is pinned above, not listed again)
         inner = scroll_frame
         inner.columnconfigure(0, weight=1)
-        wrap = 540
 
         opts = [
-            (OPT_CAREGIVERS, "Caregivers", "Import care assistants (caregivers) from a CSV export. Hint: Use a file like CareAssistantExport.csv with columns such as First Name, Last Name, Email, Mobile. You will pick the file in the next step."),
-            (OPT_AVAILABILITY_TYPES, "Availability types", "Import availability type definitions (e.g. name, type, category, description) from CSV. Required before Caregivers Availability or Clients Availability. Hint: Add this if you use availability or shifts."),
-            (OPT_CAREGIVERS_AVAILABILITY, "Caregivers Availability", "Import each caregiver’s availability from an Excel workbook. Hint: Requires Availability types. File is usually userAvailabilities.xlsx. You will select it in the next step."),
-            (OPT_CLIENTS, "Clients", "Import clients from a CSV export. Hint: Use a file like CustomerExport.csv. You will choose the file in the next step."),
-            (OPT_CLIENTS_AVAILABILITY, "Clients Availability", "Import client availability from Excel. Hint: Requires Availability types. You can select one file or a folder of workbooks (e.g. Client Hours with Service Type)."),
-            (OPT_GEOCODE_CLIENT_FILE, "Get clients location from file", "Update client latitude/longitude from a JSON backup file (e.g. clientbackup.json). File must contain \"latitude\", \"longitude\", \"name\", \"lastname\" for each record. This is useful for manually seeding known coordinates before using the Google API."),
-            (OPT_GEOCODE_CAREGIVER_FILE, "Get users location from file", "Update user (caregiver) latitude/longitude from a JSON backup file (e.g. usersBackup.json). File must contain \"latitude\", \"longitude\", \"name\", \"lastname\" for each record. This is useful for manually seeding known coordinates before using the Google API."),
-            (OPT_GEOCODE_API, "Calculated Geocode (Google API)", "Use Google Maps API to fill in latitude/longitude from postcodes for users and clients that have NULL coordinates. This runs AFTER file-based location imports (if selected), only geocoding records with postcodes but missing lat/long. You need a Google Maps API key and the Irish cities file (IE.txt). Can be combined with file-based options."),
-            (OPT_GEOCODE_ALL_CLIENTS, "Geocode all Clients", "Re-geocode ALL clients with a postcode, including records that already have latitude/longitude. Use this to refresh all client coordinates from postcode before distance migration."),
-            (OPT_GEOCODE_ALL_USERS, "Geocode all Users", "Re-geocode ALL users with a postcode, including records that already have latitude/longitude. Use this to refresh all user coordinates from postcode before distance migration."),
-            (OPT_CALCULATE_DISTANCES, "Calculate distances", "Compute full travel distance matrix for all users and clients with coordinates (default). Reads coordinates from DB, calls OSRM, inserts via pipeline COPY. Set DISTANCE_MODE=scoped to limit pairs to feasible/profile/route sets only."),
-            (OPT_FVISIT_HISTORY, "Feasible pairs (visit history)", "Seed feasible_pairs and profile Must/Preferred/Only (two-way sync on user and client profiles) from VisitExport CSV (Personal Care, last 16 weeks, Actual Employee Name). Run before Calculate distances."),
-            (OPT_CLIENT_WINDOWS, "Client windows analyzer", "Update client_schedule_preferences (window_start, window_end, suggested_duration, min_duration) from full VisitExport history using the Patient_Analyzer pipeline. Requires Clients Availability. Same VisitExport file as Feasible pairs is fine."),
-            (OPT_CARER_TRAVEL_LIMITS, "Carer travel limits (max distance)", "Set user.max_distance_km and max_p2p_distance_km from VisitExport daily routes and the travel_distances table. Requires Calculate distances first. Same VisitExport file as Feasible pairs is fine."),
+            (OPT_CAREGIVERS, "Caregivers", "Import care assistants from a CSV (e.g. CareAssistantExport.csv). Pick the file in the next step."),
+            (OPT_AVAILABILITY_TYPES, "Availability types", "Import availability type definitions from CSV. Required before Caregivers or Clients Availability."),
+            (OPT_CAREGIVERS_AVAILABILITY, "Caregivers Availability", "Import caregiver availability from Excel (usually userAvailabilities.xlsx). Requires Availability types."),
+            (OPT_CLIENTS, "Clients", "Import clients from a CSV (e.g. CustomerExport.csv). Pick the file in the next step."),
+            (OPT_CLIENTS_AVAILABILITY, "Clients Availability", "Import client availability from Excel (one file or a folder). Requires Availability types."),
+            (OPT_GEOCODE_CLIENT_FILE, "Get clients location from file", "Set client lat/long from a JSON backup (latitude, longitude, name, lastname). Useful before Google API geocoding."),
+            (OPT_GEOCODE_CAREGIVER_FILE, "Get users location from file", "Set caregiver lat/long from a JSON backup (latitude, longitude, name, lastname). Useful before Google API geocoding."),
+            (OPT_GEOCODE_API, "Calculated Geocode (Google API)", "Fill missing lat/long from postcodes via Google Maps. Runs after file-based location imports. Needs an API key and IE.txt."),
+            (OPT_GEOCODE_ALL_CLIENTS, "Geocode all Clients", "Re-geocode all clients with a postcode, including those that already have coordinates."),
+            (OPT_GEOCODE_ALL_USERS, "Geocode all Users", "Re-geocode all users with a postcode, including those that already have coordinates."),
+            (OPT_CALCULATE_DISTANCES, "Calculate distances", "Build the travel distance matrix via OSRM for users and clients with coordinates. See More info for modes."),
+            (OPT_FVISIT_HISTORY, "Feasible pairs (visit history)", "Seed feasible pairs and profile Must/Preferred/Only from VisitExport CSV. Run before Calculate distances."),
+            (OPT_CLIENT_WINDOWS, "Client windows analyzer", "Update client schedule windows from VisitExport history. Requires Clients Availability."),
+            (OPT_CARER_TRAVEL_LIMITS, "Carer travel limits (max distance)", "Set caregiver max distance from VisitExport routes and travel_distances. Requires Calculate distances first."),
         ]
         row = 0
         for key, title, hint in opts:
-            # Card-like block: checkbox + description
             block = ttk.Frame(inner, padding=(0, 6, 0, 10))
             block.grid(row=row, column=0, sticky=(E, W), pady=2)
             block.columnconfigure(0, weight=1)
@@ -541,14 +818,16 @@ class MigrationWizard:
                 setattr(self, "_cb_%s" % key, cb)
             if key in (OPT_CAREGIVERS_AVAILABILITY, OPT_CLIENTS_AVAILABILITY, OPT_CLIENT_WINDOWS):
                 setattr(self, "_cb_%s" % key, cb)
-            desc = ttk.Label(block, text=hint, wraplength=wrap, padding=(28, 4, 8, 4))
+            desc = self._wrap_label(block, hint, narrow=True, padding=(28, 4, 8, 4))
             desc.grid(row=1, column=0, sticky=W)
             row += 1
-        # More info button in its own row
         dist_frame = ttk.Frame(inner)
         dist_frame.grid(row=row, column=0, sticky=W, pady=(12, 8))
-        ttk.Button(dist_frame, text="More info (Extra Cost) – Calculate distances", command=self._show_distance_info).pack(side="left", padx=(0, 8))
-        # Windows: wheel events hit child widgets; bind recursively so the full list is scrollable
+        ttk.Button(
+            dist_frame,
+            text="More info – Calculate distances",
+            command=self._show_distance_info,
+        ).pack(side="left", padx=(0, 8))
         _bind_mousewheel_recursive(scroll_frame, _on_mousewheel, _on_mousewheel_linux)
         canvas.update_idletasks()
         canvas.configure(scrollregion=canvas.bbox(ALL))
@@ -623,11 +902,11 @@ class MigrationWizard:
         row = self._add_step_header(parent, 0)
         ttk.Label(parent, text="Select files for each migration", font=("", 13, "bold")).grid(row=row, column=0, columnspan=3, sticky=W, pady=(0, 6))
         row += 1
-        ttk.Label(
+        self._wrap_label(
             parent,
-            text="For each option you ticked above, choose the corresponding file (or folder). "
-                 "Hint: \"Calculated Geocode\" and \"Calculate distances\" use their own settings and do not need a file here.",
-            wraplength=560, padding=(0, 4)
+            "For each option you ticked, choose the matching file (or folder). "
+            "Calculated Geocode and Calculate distances use their own settings and do not need a file here.",
+            padding=(0, 4),
         ).grid(row=row, column=0, columnspan=3, sticky=W, pady=(0, 12))
         row += 1
         row_for_scroll = row
@@ -643,9 +922,7 @@ class MigrationWizard:
             canvas.itemconfig(canvas_window, width=event.width)
 
         def _on_mousewheel(event):
-            d = getattr(event, "delta", 0)
-            units = int(-d / 120) if abs(d) >= 100 else (-1 if d > 0 else 1)
-            canvas.yview_scroll(units, "units")
+            canvas.yview_scroll(_mousewheel_units(event), "units")
 
         def _on_mousewheel_linux(event):
             if event.num == 5:
@@ -678,6 +955,7 @@ class MigrationWizard:
         parent.rowconfigure(row_for_scroll, weight=1)
         self._files_scroll_frame = scroll_frame
         self._files_canvas = canvas
+        self._scroll_canvases.append(canvas)
         self._files_start_row = 0  # row inside scroll_frame
         self.file_rows = []
         self.file_widgets = []
@@ -777,26 +1055,41 @@ class MigrationWizard:
             var.set(path)
 
     def _build_step_summary(self, parent):
-        parent.columnconfigure(0, weight=1)
-        parent.rowconfigure(3, weight=1)
-        row = self._add_step_header(parent, 0)
-        ttk.Label(parent, text="Review and confirm", font=("", 13, "bold")).grid(row=row, column=0, sticky=W, pady=(0, 6))
+        body = self._create_scrollable_area(parent, "summary")
+        body.columnconfigure(0, weight=1)
+        row = self._add_step_header(body, 0)
+        ttk.Label(body, text="Review and confirm", font=("", 13, "bold")).grid(
+            row=row, column=0, sticky=W, pady=(0, 6)
+        )
         row += 1
-        ttk.Label(
-            parent,
-            text="Check the summary below. When you click \"Start migration\", the wizard will run each step in order and write a detailed log file. You must accept the privacy policy to continue.",
-            wraplength=560, padding=(0, 4)
+        self._wrap_label(
+            body,
+            "Review the summary. \"Start migration\" runs each step in order and writes a log file. "
+            "You must accept the privacy policy to continue.",
+            padding=(0, 4),
         ).grid(row=row, column=0, sticky=W, pady=(0, 10))
         row += 1
-        self.summary_text = scrolledtext.ScrolledText(parent, height=12, width=72, wrap="word", state="disabled")
+        self.summary_text = scrolledtext.ScrolledText(
+            body, height=12, width=72, wrap="word", state="disabled"
+        )
         self.summary_text.grid(row=row, column=0, sticky=(N, S, E, W), pady=(4, 8))
+        body.rowconfigure(row, weight=1)
         row += 1
-        cb = ttk.Checkbutton(parent, text="I accept the privacy policy of AOS system", variable=self.privacy_accepted)
+        cb = ttk.Checkbutton(
+            body,
+            text="I accept the privacy policy of AOS system",
+            variable=self.privacy_accepted,
+        )
         cb.grid(row=row, column=0, sticky=W, pady=(4, 4))
         row += 1
-        link = ttk.Label(parent, text=PRIVACY_URL, foreground="blue", cursor="hand2")
+        link = ttk.Label(body, text=PRIVACY_URL, foreground="blue", cursor="hand2")
         link.grid(row=row, column=0, sticky=W, pady=(0, 4))
         link.bind("<Button-1>", lambda e: webbrowser.open(PRIVACY_URL))
+        _bind_mousewheel_recursive(
+            body,
+            self._summary_on_mousewheel,
+            self._summary_on_mousewheel_linux,
+        )
 
     def _refresh_summary(self):
         self.summary_text.config(state="normal")
@@ -824,17 +1117,23 @@ class MigrationWizard:
 
     def _build_step_run(self, parent):
         parent.columnconfigure(0, weight=1)
-        parent.rowconfigure(3, weight=1)
+        parent.rowconfigure(2, weight=1)
         row = self._add_step_header(parent, 0)
-        ttk.Label(parent, text="Migration in progress", font=("", 13, "bold")).grid(row=row, column=0, sticky=W, pady=(0, 6))
+        self.run_title_label = ttk.Label(
+            parent, text="Migration in progress", font=("", 13, "bold")
+        )
+        self.run_title_label.grid(row=row, column=0, sticky=W, pady=(0, 6))
         row += 1
-        ttk.Label(
+        self.run_help_label = self._wrap_label(
             parent,
-            text="Do not close this window until the migration finishes. You can click Cancel to stop between steps. If a step fails (e.g. database connection lost), use \"Retry failed step\" after fixing the issue, or \"Continue from next\" to skip and run the rest. The log below shows progress; a full log file will be saved to the project folder.",
-            wraplength=560, padding=(0, 4)
-        ).grid(row=row, column=0, sticky=W, pady=(0, 10))
+            RUN_HELP_MIGRATION,
+            padding=(0, 4),
+        )
+        self.run_help_label.grid(row=row, column=0, sticky=W, pady=(0, 10))
         row += 1
-        self.run_log = scrolledtext.ScrolledText(parent, height=16, width=72, wrap="word", state="disabled")
+        self.run_log = scrolledtext.ScrolledText(
+            parent, height=16, width=72, wrap="word", state="disabled"
+        )
         self.run_log.grid(row=row, column=0, sticky=(N, S, E, W), pady=(4, 8))
         row += 1
         self._connection_lost_frame = ttk.Frame(parent)
@@ -847,57 +1146,57 @@ class MigrationWizard:
             foreground="darkred",
             font=("", 10, "bold"),
         )
+        self._register_wrap(self._connection_lost_label)
         self._connection_lost_label.grid(row=0, column=0, sticky=W)
         self._connection_lost_frame.grid_remove()
         row += 1
         self.run_progress = ttk.Progressbar(parent, mode="indeterminate")
         self.run_progress.grid(row=row, column=0, sticky=(E, W), pady=(0, 4))
-        parent.columnconfigure(0, weight=1)
 
     def _show_step(self, step: int):
         self.current_step = step
         for i, f in enumerate(self.frames):
             f.grid_remove() if i != step else f.grid()
-        titles = [
-            "Step 1 of 6 – Welcome",
-            "Step 2 of 6 – Database connection",
-            "Step 3 of 6 – Select data to migrate",
-            "Step 4 of 6 – Select files",
-            "Step 5 of 6 – Review and confirm",
-            "Step 6 of 6 – Running migration",
-        ]
-        self.step_label.config(text=titles[step])
+        is_test = self.wizard_mode.get() == MODE_TEST_TODAY
+        if is_test:
+            titles = {
+                STEP_WELCOME: "Step 1 of 3 – Welcome",
+                STEP_TEST_TODAY: "Step 2 of 3 – Roster files & API",
+                STEP_RUN: "Step 3 of 3 – Running validation",
+            }
+            self.step_label.config(text=titles.get(step, LABEL_VALIDATE_ROSTER))
+        else:
+            titles = [
+                "Step 1 of 6 – Welcome",
+                "Step 2 of 6 – Database connection",
+                "Step 3 of 6 – Select data to migrate",
+                "Step 4 of 6 – Select files",
+                "Step 5 of 6 – Review and confirm",
+                "Step 6 of 6 – Running migration",
+            ]
+            if step <= STEP_RUN:
+                self.step_label.config(text=titles[step])
+            else:
+                self.step_label.config(text="Migration Wizard")
         self.btn_back.config(state="normal" if step > 0 else "disabled")
 
-        # Global mousewheel only while on scrollable checkbox/files steps (Windows needs bind_all)
+        # Global mousewheel for scrollable steps (Windows needs bind_all)
         self.root.unbind_all("<MouseWheel>")
         self.root.unbind_all("<Button-4>")
         self.root.unbind_all("<Button-5>")
-        if step == STEP_CHECKBOXES:
-            on_wheel = getattr(self, "_checkbox_on_mousewheel", None)
-            on_linux = getattr(self, "_checkbox_on_mousewheel_linux", None)
-            if on_wheel:
-                self.root.bind_all("<MouseWheel>", on_wheel)
-            if on_linux:
-                self.root.bind_all("<Button-4>", on_linux)
-                self.root.bind_all("<Button-5>", on_linux)
-            checkbox_canvas = getattr(self, "_checkbox_canvas", None)
-            if checkbox_canvas is not None:
-                checkbox_canvas.focus_set()
-        elif step == STEP_FILES:
-            on_wheel = getattr(self, "_files_on_mousewheel", None)
-            on_linux = getattr(self, "_files_on_mousewheel_linux", None)
-            if on_wheel:
-                self.root.bind_all("<MouseWheel>", on_wheel)
-            if on_linux:
-                self.root.bind_all("<Button-4>", on_linux)
-                self.root.bind_all("<Button-5>", on_linux)
-            files_canvas = getattr(self, "_files_canvas", None)
-            if files_canvas is not None:
-                files_canvas.focus_set()
+        scroll_prefixes = {
+            STEP_WELCOME: "welcome",
+            STEP_DB: "db",
+            STEP_TEST_TODAY: "validate",
+            STEP_SUMMARY: "summary",
+            STEP_CHECKBOXES: "checkbox",
+            STEP_FILES: "files",
+        }
+        if step in scroll_prefixes:
+            self._bind_step_scroll(scroll_prefixes[step])
 
-        # Show/hide Check Migration button for file selection step
-        if step == STEP_FILES:
+        # Show/hide Check files button for file selection step
+        if step == STEP_FILES and not is_test:
             self._refresh_file_step()
             self.btn_check_files.pack(side="right", padx=4)
         else:
@@ -912,14 +1211,23 @@ class MigrationWizard:
             self.btn_cancel.config(state="normal")
             self.btn_cancel.config(text="Cancel")
             self._hide_retry_continue_buttons()
+            if is_test:
+                self.run_title_label.config(text="%s in progress" % LABEL_VALIDATE_ROSTER)
+                self.run_help_label.config(text=RUN_HELP_VALIDATE)
+            else:
+                self.run_title_label.config(text="Migration in progress")
+                self.run_help_label.config(text=RUN_HELP_MIGRATION)
         else:
             self.btn_continue.config(state="normal")
             self.btn_cancel.config(state="normal")
             if step == STEP_SUMMARY:
                 self.btn_continue.config(text="Start migration")
+            elif step == STEP_TEST_TODAY:
+                self.btn_continue.config(text="Start validation")
             else:
                 self.btn_continue.config(text="Continue")
 
+        self.root.after_idle(self._update_wraplengths)
     def _hide_retry_continue_buttons(self):
         self.btn_retry.pack_forget()
         self.btn_continue_next.pack_forget()
@@ -963,12 +1271,114 @@ class MigrationWizard:
 
     def _on_cancel(self):
         if self.current_step == STEP_RUN and getattr(self, "_run_in_progress", False):
-            if messagebox.askyesno("Cancel", "Stop the migration? You can retry or continue from the next step when it stops."):
-                self._run_cancelled = True
+            if self.wizard_mode.get() == MODE_TEST_TODAY:
+                if messagebox.askyesno(
+                    "Cancel",
+                    "Request to stop %s? The current API checks may finish before the run ends."
+                    % LABEL_VALIDATE_ROSTER,
+                ):
+                    self._run_cancelled = True
+            else:
+                if messagebox.askyesno(
+                    "Cancel",
+                    "Stop the migration? You can retry or continue when it stops.",
+                ):
+                    self._run_cancelled = True
             return
         if messagebox.askyesno("Cancel", "Are you sure you want to cancel the wizard?"):
             self.root.quit()
             self.root.destroy()
+
+    def _run_test_today(self):
+        """Start Validate today's roster API validation in a background thread."""
+        self._run_cancelled = False
+        self._run_in_progress = True
+        self._hide_retry_continue_buttons()
+        self.btn_run_again.pack_forget()
+        self.btn_check_migration.pack_forget()
+        self.btn_back.config(state="disabled")
+        self.run_log.config(state="normal")
+        self.run_log.delete("1.0", "end")
+        self.run_log.config(state="disabled")
+        log_path = PROJECT_ROOT / ("test_today_%s.log" % datetime.now().strftime("%Y%m%d_%H%M%S"))
+        self._run_log_path = log_path
+        self._append_log("Log file: %s\n" % log_path)
+        self.run_progress.start()
+        thread = threading.Thread(target=self._do_run_test_today, args=(log_path,), daemon=True)
+        thread.start()
+
+    def _do_run_test_today(self, log_path: Path):
+        """Background worker for Validate today's roster API validation."""
+        all_msgs: list = []
+        all_passed = False
+        try:
+            if str(BUNDLE_ROOT) not in sys.path:
+                sys.path.insert(0, str(BUNDLE_ROOT))
+            from tests.test_today_api_validation import run_test_today
+
+            def _log_line(msg):
+                all_msgs.append(msg)
+                self.root.after(0, lambda m=msg: self._append_log(m + "\n"))
+
+            all_passed, msgs = run_test_today(
+                client_hours_path=self.test_today_client_hours.get().strip(),
+                caregivers_availability_path=self.test_today_caregivers_xlsx.get().strip(),
+                target_date=self.test_today_date.get().strip(),
+                base_url=self.test_today_base_url.get().strip(),
+                token=self.test_today_token.get().strip(),
+                log_callback=_log_line,
+            )
+            if msgs and not all_msgs:
+                all_msgs = list(msgs)
+        except Exception as e:
+            err = "%s error: %s" % (LABEL_VALIDATE_ROSTER, e)
+            all_msgs.append(err)
+            self.root.after(0, lambda m=err: self._append_log(m + "\n"))
+            logging.exception("%s failed", LABEL_VALIDATE_ROSTER)
+            all_passed = False
+        finally:
+            try:
+                log_path.write_text("\n".join(all_msgs) + "\n", encoding="utf-8")
+            except OSError:
+                pass
+            self.run_progress.stop()
+            self.root.after(0, lambda: self._test_today_finished(log_path, all_passed))
+
+    def _test_today_finished(self, log_path: Path, all_passed: bool):
+        self._run_in_progress = False
+        self._append_log("\nDetailed log saved to: %s\n" % log_path)
+        self.btn_cancel.config(state="normal")
+        self.btn_cancel.config(text="Close")
+        self.btn_back.config(state="normal")
+        self.btn_run_again.pack(side="right", padx=4)
+        if all_passed:
+            self._append_log("\nDone successfully.\n")
+            messagebox.showinfo(
+                LABEL_VALIDATE_ROSTER,
+                "All checks passed.\n\nSee the log on this screen for PASS/FAIL detail.\n\nLog saved to:\n%s"
+                % log_path,
+            )
+        else:
+            self._append_log("\nFinished with failures.\n")
+            messagebox.showwarning(
+                LABEL_VALIDATE_ROSTER,
+                "Some checks failed. Review PASS/FAIL lines in the log on this screen.\n\nLog file:\n%s"
+                % log_path,
+            )
+
+    def _on_run_again(self):
+        """Re-run the full migration / Validate today's roster (same options and files)."""
+        self.btn_run_again.pack_forget()
+        self.btn_check_migration.pack_forget()
+        self.btn_cancel.config(text="Cancel")
+        self.btn_back.config(state="disabled")
+        self.run_log.config(state="normal")
+        self.run_log.delete("1.0", "end")
+        self.run_log.config(state="disabled")
+        if self.wizard_mode.get() == MODE_TEST_TODAY:
+            self._run_test_today()
+        else:
+            self._run_migrations(start_from=0)
 
     def _on_test_connection(self):
         """Test database connection (e.g. after restoring port-forward)."""
@@ -1028,17 +1438,45 @@ class MigrationWizard:
                 if path_var is not None and hasattr(path_var, "set"):
                     path_var.set("")
             self.file_paths.clear()
+        elif step == STEP_TEST_TODAY:
+            self.test_today_client_hours.set("")
+            self.test_today_caregivers_xlsx.set("")
+            self.test_today_date.set(datetime.now().strftime("%Y-%m-%d"))
+            self.test_today_base_url.set(os.getenv("API_BASE_URL", "http://localhost:3000"))
+            self.test_today_token.set(os.getenv("API_TOKEN", ""))
 
     def _on_back(self):
-        if self.current_step > 0:
-            prev_step = self.current_step - 1
-            self._clear_step_inputs(prev_step)
-            self._show_step(prev_step)
+        if self.current_step <= 0:
+            return
+        if self.wizard_mode.get() == MODE_TEST_TODAY:
+            if self.current_step == STEP_TEST_TODAY:
+                self._clear_step_inputs(STEP_TEST_TODAY)
+                self._show_step(STEP_WELCOME)
+            elif self.current_step == STEP_RUN:
+                self.btn_run_again.pack_forget()
+                self.btn_check_migration.pack_forget()
+                self.btn_cancel.config(text="Cancel")
+                self._hide_retry_continue_buttons()
+                self._show_step(STEP_TEST_TODAY)
+            return
+        prev_step = self.current_step - 1
+        self._clear_step_inputs(prev_step)
+        self._show_step(prev_step)
 
     def _on_continue(self):
         if self.current_step == STEP_WELCOME:
-            self._show_step(STEP_DB)
-        elif self.current_step == STEP_DB:
+            if self.wizard_mode.get() == MODE_TEST_TODAY:
+                self._show_step(STEP_TEST_TODAY)
+            else:
+                self._show_step(STEP_DB)
+            return
+        if self.current_step == STEP_TEST_TODAY:
+            if not self._validate_test_today():
+                return
+            self._show_step(STEP_RUN)
+            self._run_test_today()
+            return
+        if self.current_step == STEP_DB:
             if not self._validate_db():
                 return
             self._show_step(STEP_CHECKBOXES)
@@ -1056,6 +1494,44 @@ class MigrationWizard:
                 return
             self._show_step(STEP_RUN)
             self._run_migrations()
+
+    def _validate_test_today(self):
+        client_hours = self.test_today_client_hours.get().strip()
+        caregivers = self.test_today_caregivers_xlsx.get().strip()
+        date_str = self.test_today_date.get().strip()
+        base_url = self.test_today_base_url.get().strip()
+        token = self.test_today_token.get().strip()
+        title = LABEL_VALIDATE_ROSTER
+        if not client_hours:
+            messagebox.showwarning(title, "Please select the Client Hours with Service Type Excel file.")
+            return False
+        if not Path(client_hours).exists():
+            messagebox.showwarning(title, "Client Hours file does not exist:\n%s" % client_hours)
+            return False
+        if not caregivers:
+            messagebox.showwarning(title, "Please select the Caregivers Availability Excel file.")
+            return False
+        if not Path(caregivers).exists():
+            messagebox.showwarning(title, "Caregivers Availability file does not exist:\n%s" % caregivers)
+            return False
+        if not date_str:
+            messagebox.showwarning(title, "Please enter a date to check (YYYY-MM-DD).")
+            return False
+        try:
+            datetime.strptime(date_str, "%Y-%m-%d")
+        except ValueError:
+            messagebox.showwarning(
+                title,
+                "Date must be YYYY-MM-DD (e.g. %s)." % datetime.now().strftime("%Y-%m-%d"),
+            )
+            return False
+        if not base_url:
+            messagebox.showwarning(title, "Please enter the app API base URL.")
+            return False
+        if not token:
+            messagebox.showwarning(title, "Please enter the API token from the panel.")
+            return False
+        return True
 
     def _validate_db(self):
         if not self.db_config["database"].get().strip():
@@ -1314,16 +1790,6 @@ class MigrationWizard:
             self.btn_check_migration.pack(side="right", padx=4)
         self.btn_cancel.config(state="normal")
         self.btn_cancel.config(text="Close")
-
-    def _on_run_again(self):
-        """Re-run the full migration from the beginning (same options and files)."""
-        self.btn_run_again.pack_forget()
-        self.btn_check_migration.pack_forget()
-        self.btn_cancel.config(text="Cancel")
-        self.run_log.config(state="normal")
-        self.run_log.delete("1.0", "end")
-        self.run_log.config(state="disabled")
-        self._run_migrations(start_from=0)
 
     def _on_check_migration(self):
         """Run post-migration validation checks in a background thread."""
