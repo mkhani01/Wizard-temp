@@ -7,7 +7,9 @@ Update roster visits for a selected calendar date using Client Hours with Servic
    visits (client + start/end minutes) with that cancellation type (insert type if missing).
 2. All ALLOCATED/UNALLOCATED visits for terminated clients on that date → cancel with
    type "Terminated" (insert if missing).
-3. Personal Care rows where Service Requirement start AND end are empty, but Actual
+3. UNALLOCATED visits with no matching Personal Care Client Hours row for the date
+   (±1 minute) → cancel with type "DELETED" (insert if missing).
+4. Personal Care rows where Service Requirement start AND end are empty, but Actual
    start/end are present → create a one-day-occurrence temporary client_schedule
    (is_temporary, not_send_to_engine=false so engine gets a PRID) and an UNALLOCATED
    roster_visit linked to it. effective_date_from is the target date;
@@ -63,7 +65,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TERMINATED_CANCELLATION_TYPE = "Terminated"
+DELETED_CANCELLATION_TYPE = "DELETED"
 ACTIVE_VISIT_STATUSES = ("UNALLOCATED", "ALLOCATED")
+MINUTE_MATCH_TOLERANCE = 1
 PERSONAL_CARE = "Personal Care"
 DAYS_OF_WEEK = [
     "Monday",
@@ -149,7 +153,18 @@ def parse_datetime_value(datetime_val) -> Optional[datetime]:
 
 
 def datetime_to_minutes(dt: datetime) -> int:
-    return dt.hour * 60 + dt.minute
+    """Minutes from midnight, rounded (Excel serial floats often land 1µs short of a minute)."""
+    total_seconds = (
+        dt.hour * 3600
+        + dt.minute * 60
+        + dt.second
+        + dt.microsecond / 1_000_000
+    )
+    return int(round(total_seconds / 60))
+
+
+def minutes_close(a: int, b: int, tolerance: int = MINUTE_MATCH_TOLERANCE) -> bool:
+    return abs(int(a) - int(b)) <= int(tolerance)
 
 
 def parse_target_date(value: Any) -> date:
@@ -791,6 +806,178 @@ def cancel_terminated_client_visits(
     return cancelled
 
 
+def extract_personal_care_file_slots(
+    filepath: Path,
+    target_date: date,
+    clients_map: Dict[str, List[Dict[str, Any]]],
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """
+    All Personal Care Client Hours rows for target_date (cancelled or not).
+    Used to detect DELETED orphans: UNALLOCATED DB visits absent from this set.
+    """
+    stats = {
+        "total_rows": 0,
+        "personal_care": 0,
+        "on_target_date": 0,
+        "skipped_not_personal_care": 0,
+        "skipped_missing_datetime": 0,
+        "skipped_unknown_client": 0,
+        "skipped_wrong_date": 0,
+        "skipped_empty_location": 0,
+    }
+    wb = openpyxl.load_workbook(filepath, read_only=True, data_only=True)
+    try:
+        if "Data" not in wb.sheetnames:
+            raise MigrationError("Sheet 'Data' not found in workbook")
+        ws = wb["Data"]
+        rows_iter = ws.iter_rows(values_only=True)
+        header = next(rows_iter, None)
+        if not header:
+            raise MigrationError("Workbook has no header row")
+
+        col_loc = _col_idx(header, ["Service Location Name"])
+        col_addr = _col_idx(header, ["Service Location Address"])
+        col_req_start = _col_idx(header, ["Service Requirement Start Date And Time"])
+        col_req_end = _col_idx(header, ["Service Requirement End Date And Time"])
+        col_act_start = _col_idx(header, ["Actual Start Date And Time"])
+        col_act_end = _col_idx(header, ["Actual End Date And Time"])
+        col_svc_type = _col_idx(header, ["Planned Service Type Description"])
+        col_svc_req = _col_idx(header, ["Planned Service Requirement Type Description"])
+        col_count = _col_idx(header, ["Count"])
+
+        if col_loc == -1:
+            raise MigrationError("Missing required column: Service Location Name")
+        if col_svc_type == -1 or col_svc_req == -1:
+            raise MigrationError(
+                "Missing Planned Service Type / Requirement Type Description columns"
+            )
+
+        results: List[Dict[str, Any]] = []
+        for row_num, row in enumerate(rows_iter, start=2):
+            stats["total_rows"] += 1
+            if not row:
+                continue
+            svc_type = str(row[col_svc_type]).strip() if col_svc_type < len(row) and row[col_svc_type] else ""
+            svc_req = str(row[col_svc_req]).strip() if col_svc_req < len(row) and row[col_svc_req] else ""
+            if svc_type != PERSONAL_CARE or svc_req != PERSONAL_CARE:
+                stats["skipped_not_personal_care"] += 1
+                continue
+            stats["personal_care"] += 1
+
+            raw_loc = row[col_loc] if col_loc < len(row) else None
+            loc = fix_utf8_mojibake(raw_loc) if raw_loc is not None else None
+            loc_str = str(loc).strip() if loc is not None else ""
+            if not loc_str:
+                stats["skipped_empty_location"] += 1
+                continue
+
+            raw_addr = row[col_addr] if col_addr != -1 and col_addr < len(row) else None
+            addr = fix_utf8_mojibake(raw_addr) if raw_addr is not None else None
+            source_eircode = extract_eircode_from_address(addr)
+            client_key = normalize_name_for_match(loc_str)
+            client_id = resolve_person_id(clients_map.get(client_key) or [], source_eircode)
+            if not client_id:
+                stats["skipped_unknown_client"] += 1
+                continue
+
+            req_start = row[col_req_start] if col_req_start != -1 and col_req_start < len(row) else None
+            req_end = row[col_req_end] if col_req_end != -1 and col_req_end < len(row) else None
+            act_start = row[col_act_start] if col_act_start != -1 and col_act_start < len(row) else None
+            act_end = row[col_act_end] if col_act_end != -1 and col_act_end < len(row) else None
+            start_dt, end_dt, _source = resolve_start_end(req_start, req_end, act_start, act_end)
+            if not start_dt or not end_dt:
+                stats["skipped_missing_datetime"] += 1
+                continue
+            if start_dt.date() != target_date:
+                stats["skipped_wrong_date"] += 1
+                continue
+            stats["on_target_date"] += 1
+
+            count = 1
+            if col_count != -1 and col_count < len(row) and row[col_count] is not None:
+                try:
+                    count = max(1, int(row[col_count]))
+                except (TypeError, ValueError):
+                    count = 1
+            start_m = datetime_to_minutes(start_dt)
+            end_m = datetime_to_minutes(end_dt)
+            for _slot in range(count):
+                results.append(
+                    {
+                        "row_num": row_num,
+                        "client_id": int(client_id),
+                        "client_name": loc_str,
+                        "start_minute": start_m,
+                        "end_minute": end_m,
+                    }
+                )
+        return results, stats
+    finally:
+        wb.close()
+
+
+def visit_matches_file_slot(
+    visit: Dict[str, Any],
+    slot: Dict[str, Any],
+) -> bool:
+    if int(visit["receiver_client_id"]) != int(slot["client_id"]):
+        return False
+    if not minutes_close(int(visit["start_minute"]), int(slot["start_minute"])):
+        return False
+    if not minutes_close(int(visit["end_minute"]), int(slot["end_minute"])):
+        return False
+    return True
+
+
+def cancel_deleted_orphan_visits(
+    connection,
+    visits: List[Dict[str, Any]],
+    file_slots: List[Dict[str, Any]],
+    deleted_type_id: int,
+) -> int:
+    """
+    Cancel UNALLOCATED visits that do not appear in Client Hours Personal Care rows
+    for the date (treat as DELETED orphans).
+    """
+    cancelled = 0
+    cursor = connection.cursor()
+    try:
+        for visit in visits:
+            if visit.get("status") != "UNALLOCATED":
+                continue
+            if any(visit_matches_file_slot(visit, slot) for slot in file_slots):
+                continue
+            cursor.execute(
+                """
+                UPDATE roster_visit
+                SET status = 'CANCELLED',
+                    cancellation_type_id = %s,
+                    updated_at = NOW()
+                WHERE id = %s
+                  AND status::text = 'UNALLOCATED'
+                """,
+                (deleted_type_id, visit["id"]),
+            )
+            if cursor.rowcount:
+                visit["status"] = "CANCELLED"
+                visit["cancellation_type_id"] = deleted_type_id
+                cancelled += 1
+                logger.info(
+                    "Cancelled DELETED orphan visit %s | client_id=%s start=%s end=%s",
+                    visit["id"],
+                    visit["receiver_client_id"],
+                    visit["start_minute"],
+                    visit["end_minute"],
+                )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        cursor.close()
+    return cancelled
+
+
 def find_personal_care_service_type_id(connection) -> Optional[int]:
     cursor = connection.cursor()
     try:
@@ -1250,17 +1437,32 @@ def run(
 
         type_names = [r["cancellation_name"] for r in cancel_rows]
         type_names.append(TERMINATED_CANCELLATION_TYPE)
+        type_names.append(DELETED_CANCELLATION_TYPE)
         type_ids = ensure_cancellation_types(connection, type_names)
         terminated_type_id = type_ids.get(TERMINATED_CANCELLATION_TYPE)
+        deleted_type_id = type_ids.get(DELETED_CANCELLATION_TYPE)
         if terminated_type_id is None:
             raise MigrationError("Failed to ensure Terminated cancellation type")
+        if deleted_type_id is None:
+            raise MigrationError("Failed to ensure DELETED cancellation type")
 
         terminated_ids = get_terminated_client_ids(connection, parsed_date)
+
+        file_slots, slot_stats = extract_personal_care_file_slots(
+            filepath, parsed_date, clients_map
+        )
+        logger.info(
+            "Personal Care file slots on date: %s (pc=%s unknown_client=%s)",
+            slot_stats["on_target_date"],
+            slot_stats["personal_care"],
+            slot_stats["skipped_unknown_client"],
+        )
 
         roster_id, visits = load_roster_visits_for_date(connection, parsed_date)
         file_cancelled = 0
         file_skipped = 0
         term_cancelled = 0
+        deleted_cancelled = 0
 
         if not roster_id and temp_rows:
             roster_id = ensure_roster_for_date(connection, parsed_date)
@@ -1283,6 +1485,12 @@ def run(
             term_cancelled = cancel_terminated_client_visits(
                 connection, visits, terminated_ids, terminated_type_id
             )
+
+        if roster_id and visits:
+            deleted_cancelled = cancel_deleted_orphan_visits(
+                connection, visits, file_slots, deleted_type_id
+            )
+            logger.info("DELETED orphans cancelled: %s", deleted_cancelled)
 
         temp_counts = {
             "created_schedules": 0,
@@ -1318,6 +1526,7 @@ def run(
         print(f"  Skipped unmatched file rows: {file_skipped}")
         print(f"  Terminated clients: {len(terminated_ids)}")
         print(f"  Cancelled for terminated: {term_cancelled}")
+        print(f"  DELETED orphans cancelled: {deleted_cancelled}")
         print(f"  Temp candidates: {len(temp_rows)}")
         print(f"  Temp schedules created: {temp_counts['created_schedules']}")
         print(f"  Temp visits created: {temp_counts['created_visits']}")

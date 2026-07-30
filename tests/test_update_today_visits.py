@@ -18,6 +18,7 @@ from updateTodayVisitsMigration.main import (
     resolve_start_end,
     match_and_cancel_from_file,
     cancel_terminated_client_visits,
+    cancel_deleted_orphan_visits,
     extract_temp_visit_rows,
     create_temp_schedules_and_visits,
     _is_empty_datetime_val,
@@ -36,6 +37,10 @@ class TestDatetimeHelpers(unittest.TestCase):
     def test_datetime_to_minutes(self):
         self.assertEqual(datetime_to_minutes(datetime(2026, 7, 16, 9, 30)), 570)
         self.assertEqual(datetime_to_minutes(datetime(2026, 7, 16, 0, 0)), 0)
+        # Excel float near 12:30 lands as 12:29:59.999997 — round up
+        near = parse_datetime_value(46232.5208333333)
+        self.assertIsNotNone(near)
+        self.assertEqual(datetime_to_minutes(near), 12 * 60 + 30)
 
     def test_resolve_start_end_prefers_requirement(self):
         start, end, source = resolve_start_end(
@@ -146,6 +151,49 @@ class TestMatchAndCancel(unittest.TestCase):
         )
         self.assertEqual(cancelled, 0)
         self.assertEqual(skipped, 1)
+
+    def test_deleted_orphan_cancels_unallocated_not_in_file(self):
+        connection = MagicMock()
+        cursor = MagicMock()
+        connection.cursor.return_value = cursor
+        cursor.rowcount = 1
+
+        visits = [
+            {
+                "id": "orphan",
+                "receiver_client_id": 42,
+                "start_minute": 18 * 60,
+                "end_minute": 18 * 60 + 30,
+                "status": "UNALLOCATED",
+                "cancellation_type_id": None,
+            },
+            {
+                "id": "kept",
+                "receiver_client_id": 10,
+                "start_minute": 540,
+                "end_minute": 600,
+                "status": "UNALLOCATED",
+                "cancellation_type_id": None,
+            },
+            {
+                "id": "allocated",
+                "receiver_client_id": 99,
+                "start_minute": 700,
+                "end_minute": 760,
+                "status": "ALLOCATED",
+                "cancellation_type_id": None,
+            },
+        ]
+        file_slots = [
+            {"client_id": 10, "start_minute": 540, "end_minute": 600, "row_num": 1},
+        ]
+        cancelled = cancel_deleted_orphan_visits(connection, visits, file_slots, 77)
+        self.assertEqual(cancelled, 1)
+        self.assertEqual(visits[0]["status"], "CANCELLED")
+        self.assertEqual(visits[0]["cancellation_type_id"], 77)
+        self.assertEqual(visits[1]["status"], "UNALLOCATED")
+        self.assertEqual(visits[2]["status"], "ALLOCATED")
+        connection.commit.assert_called()
 
 
 class TestTerminatedCancel(unittest.TestCase):

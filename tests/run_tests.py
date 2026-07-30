@@ -51,6 +51,11 @@ def main():
     update_result = unittest.TextTestRunner(verbosity=1).run(update_suite)
     if not update_result.wasSuccessful():
         return 1
+    print("Preference Check / roster matching tests...")
+    pref_suite = loader.loadTestsFromName("tests.test_preference_check")
+    pref_result = unittest.TextTestRunner(verbosity=1).run(pref_suite)
+    if not pref_result.wasSuccessful():
+        return 1
     print("\n✓ All tests OK. You can run the wizard or CLI.")
     return 0
 

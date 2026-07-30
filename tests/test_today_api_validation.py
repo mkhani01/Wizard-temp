@@ -9,6 +9,7 @@ No database reads; API is the source of actual state.
 from __future__ import annotations
 
 import logging
+import re
 from collections import Counter, defaultdict
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
@@ -96,7 +97,19 @@ def hhmm_to_minutes(hhmm: str) -> int:
 
 
 def datetime_to_minutes(dt: datetime) -> int:
-    return dt.hour * 60 + dt.minute
+    """Convert datetime to minutes-from-midnight, rounding to nearest minute.
+
+    Excel serial floats often land a few microseconds short of an exact minute
+    (e.g. 12:29:59.999997 instead of 12:30:00). Truncating would then report
+    12:29; rounding matches what Excel displays and what the API stores.
+    """
+    total_seconds = (
+        dt.hour * 3600
+        + dt.minute * 60
+        + dt.second
+        + dt.microsecond / 1_000_000
+    )
+    return int(round(total_seconds / 60))
 
 
 def strip_title(full_name: str) -> str:
@@ -119,8 +132,27 @@ def normalize_person_key(value: Optional[str]) -> str:
     return raw
 
 
-def name_match_keys(value: Optional[str]) -> Set[str]:
-    """Return alternate keys for a person name (space and comma forms)."""
+def strip_name_annotations(value: Optional[str]) -> str:
+    """
+    Strip Excel location annotations that the API usually does not store in name/lastname.
+
+    Examples:
+      '*Ryan (C), Martin'  -> 'Ryan, Martin'
+      'Keane (DS), Patrick' -> 'Keane, Patrick'
+      'Bagnall(DU), George' -> 'Bagnall, George'
+    """
+    s = fix_utf8_mojibake(value or "").strip()
+    if not s:
+        return ""
+    s = re.sub(r"^\*+\s*", "", s)
+    s = re.sub(r"\([^)]*\)", " ", s)
+    s = re.sub(r"\s*,\s*", ", ", s)
+    s = re.sub(r"\s+", " ", s)
+    return s.strip(" ,")
+
+
+def _name_forms(value: str) -> Set[str]:
+    """Build space/comma alternate forms for one display string (no annotation stripping)."""
     keys: Set[str] = set()
     fixed = fix_utf8_mojibake(value or "")
     base = normalize_name_for_match(fixed)
@@ -136,6 +168,41 @@ def name_match_keys(value: Optional[str]) -> Set[str]:
         if len(parts) >= 2:
             keys.add(normalize_name_for_match(f"{parts[-1]}, {' '.join(parts[:-1])}"))
     return {k for k in keys if k}
+
+
+def name_match_keys(value: Optional[str]) -> Set[str]:
+    """
+    Return alternate keys for a person name (space and comma forms).
+
+    Also includes annotation-stripped forms so Excel names like 'Keane (DS), Patrick'
+    match API 'Patrick Keane'.
+    """
+    fixed = fix_utf8_mojibake(value or "")
+    keys = _name_forms(fixed)
+    scrubbed = strip_name_annotations(fixed)
+    if scrubbed and normalize_name_for_match(scrubbed) != normalize_name_for_match(fixed):
+        keys |= _name_forms(scrubbed)
+    return keys
+
+
+MINUTE_MATCH_TOLERANCE = 1
+
+
+def minutes_close(a: int, b: int, tolerance: int = MINUTE_MATCH_TOLERANCE) -> bool:
+    """True when two minute-of-day values are within tolerance (API often truncates end by 1)."""
+    return abs(int(a) - int(b)) <= int(tolerance)
+
+
+def visit_matches_slot(visit: Dict[str, Any], row: Dict[str, Any]) -> bool:
+    """True when API visit and Excel slot refer to the same client + window (±1 min)."""
+    vkeys = name_match_keys(visit_client_name(visit))
+    if not (vkeys & row["name_keys"]):
+        return False
+    if not minutes_close(int(visit.get("startMinute") or 0), int(row["start_minute"])):
+        return False
+    if not minutes_close(int(visit.get("endMinute") or 0), int(row["end_minute"])):
+        return False
+    return True
 
 
 def parse_datetime_value(datetime_val) -> Optional[datetime]:
@@ -693,14 +760,46 @@ def load_caregiver_availability_slots(
     slots: List[Dict[str, Any]] = []
     unmatched_types: List[str] = []
 
-    wb = openpyxl.load_workbook(filepath, data_only=True)
+    # read_only avoids openpyxl crashes on Client Hours workbooks with pivot caches
+    # (TypeError: Nested.from_tree() missing ...), and is enough for value iteration.
     try:
-        sheet_name = "Care Assistant Availability"
-        if sheet_name not in wb.sheetnames:
+        wb = openpyxl.load_workbook(filepath, read_only=True, data_only=True)
+    except Exception as e:
+        raise TestTodayError(
+            f"Failed to open caregivers availability file {filepath.name!r}: {e}. "
+            "Select an Availability Export XLSX (sheet 'Care Assistant Availability'), "
+            "not the Client Hours file."
+        ) from e
+
+    try:
+        preferred = "Care Assistant Availability"
+        if preferred in wb.sheetnames:
+            sheet_name = preferred
+        elif wb.sheetnames:
             sheet_name = wb.sheetnames[0]
+        else:
+            raise TestTodayError(
+                f"Caregivers availability file {filepath.name!r} has no sheets. "
+                "Select an Availability Export XLSX."
+            )
         ws = wb[sheet_name]
 
-        for row_num, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+        rows_iter = ws.iter_rows(values_only=True)
+        header = next(rows_iter, None)
+        if not header:
+            raise TestTodayError(
+                f"Caregivers availability file {filepath.name!r} has no header row."
+            )
+        header0 = str(header[0] or "").strip().lower() if len(header) > 0 else ""
+        if sheet_name != preferred and header0 != "care assistant name":
+            raise TestTodayError(
+                f"File {filepath.name!r} does not look like a Caregivers Availability export "
+                f"(sheets={list(wb.sheetnames)!r}). "
+                "Select an Availability Export XLSX with sheet "
+                "'Care Assistant Availability', not Client Hours."
+            )
+
+        for row_num, row in enumerate(rows_iter, start=2):
             stats["total_rows"] += 1
             care_name = row[COL_CARE_ASSISTANT_NAME] if len(row) > COL_CARE_ASSISTANT_NAME else None
             start_date_val = row[COL_START_DATE] if len(row) > COL_START_DATE else None
@@ -1138,97 +1237,138 @@ def run_test_today(
     )
     _log(msgs, log_callback, f"  Actual (API unallocated): {sum(act_counter.values())}")
 
-    # Fuzzy match: file name_key may not equal API name_key — rebuild using name_keys
-    # Match by finding API visits whose name keys intersect file row keys + same minutes
-    used_api_ids: Set[str] = set()
+    # Fuzzy match: file name_key may not equal API name_key — rebuild using name_keys.
+    # Track matched API rows by index so extras are detected even when id is blank.
+    used_api_indices: Set[int] = set()
     matched = 0
     only_file: List[Dict[str, Any]] = []
     for row in expected_unalloc:
-        found = None
-        for visit in api_unalloc:
-            vid = str(visit.get("id") or "")
-            if vid and vid in used_api_ids:
+        found_idx: Optional[int] = None
+        for idx, visit in enumerate(api_unalloc):
+            if idx in used_api_indices:
                 continue
-            vname = visit_client_name(visit)
-            vkeys = name_match_keys(vname)
-            if not (vkeys & row["name_keys"]):
-                continue
-            if int(visit.get("startMinute") or 0) != row["start_minute"]:
-                continue
-            if int(visit.get("endMinute") or 0) != row["end_minute"]:
-                continue
-            found = visit
-            break
-        if found:
+            if visit_matches_slot(visit, row):
+                found_idx = idx
+                break
+        if found_idx is not None:
             matched += 1
-            used_api_ids.add(str(found.get("id") or ""))
+            used_api_indices.add(found_idx)
         else:
             only_file.append(row)
 
-    only_api = [
-        v
-        for v in api_unalloc
-        if str(v.get("id") or "") not in used_api_ids
-    ]
+    only_api = [v for idx, v in enumerate(api_unalloc) if idx not in used_api_indices]
+
+    # Reclassify "extras": many are Excel cancellations that the API still shows as UNALLOCATED.
+    # Those are status mismatches, not "not in file".
+    used_cancel_for_status: Set[int] = set()
+    status_mismatch_unalloc: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+    true_only_api: List[Dict[str, Any]] = []
+    for visit in only_api:
+        found_cancel_idx: Optional[int] = None
+        for cidx, crow in enumerate(expected_cancel):
+            if cidx in used_cancel_for_status:
+                continue
+            if visit_matches_slot(visit, crow):
+                found_cancel_idx = cidx
+                break
+        if found_cancel_idx is not None:
+            used_cancel_for_status.add(found_cancel_idx)
+            status_mismatch_unalloc.append((visit, expected_cancel[found_cancel_idx]))
+        else:
+            true_only_api.append(visit)
 
     _log(msgs, log_callback, f"  Matched: {matched}")
     if only_file:
         passed = False
         _log(msgs, log_callback, f"FAIL: {len(only_file)} expected unallocated slot(s) missing from API:")
         for r in only_file[:40]:
+            near = []
+            for visit in api_unalloc:
+                if name_match_keys(visit_client_name(visit)) & r["name_keys"]:
+                    near.append(
+                        f"{minutes_to_hhmm(int(visit.get('startMinute') or 0))}-"
+                        f"{minutes_to_hhmm(int(visit.get('endMinute') or 0))}"
+                    )
+            near_txt = f" (API same client windows: {', '.join(near[:5])})" if near else ""
             _log(
                 msgs,
                 log_callback,
                 f"    XLSX row={r['row_num']} {r['client_name']!r} "
-                f"{minutes_to_hhmm(r['start_minute'])}-{minutes_to_hhmm(r['end_minute'])}",
+                f"{minutes_to_hhmm(r['start_minute'])}-{minutes_to_hhmm(r['end_minute'])}"
+                f"{near_txt}",
             )
         if len(only_file) > 40:
             _log(msgs, log_callback, f"    ... and {len(only_file) - 40} more")
-    if only_api:
+    if status_mismatch_unalloc:
         passed = False
-        _log(msgs, log_callback, f"FAIL: {len(only_api)} API unallocated visit(s) not in file:")
-        for v in only_api[:40]:
+        _log(
+            msgs,
+            log_callback,
+            f"FAIL: {len(status_mismatch_unalloc)} visit(s) cancelled in file but still UNALLOCATED in API:",
+        )
+        for visit, crow in status_mismatch_unalloc[:40]:
+            _log(
+                msgs,
+                log_callback,
+                f"    API id={visit.get('id')} {visit_client_name(visit)!r} "
+                f"{minutes_to_hhmm(int(visit.get('startMinute') or 0))}-"
+                f"{minutes_to_hhmm(int(visit.get('endMinute') or 0))} "
+                f"(file row={crow['row_num']} cancel={crow.get('cancellation')!r})",
+            )
+        if len(status_mismatch_unalloc) > 40:
+            _log(msgs, log_callback, f"    ... and {len(status_mismatch_unalloc) - 40} more")
+    if true_only_api:
+        passed = False
+        _log(
+            msgs,
+            log_callback,
+            f"FAIL: {len(true_only_api)} API unallocated visit(s) missing from file "
+            f"(treat as DELETED):",
+        )
+        for v in true_only_api[:40]:
             _log(
                 msgs,
                 log_callback,
                 f"    API id={v.get('id')} {visit_client_name(v)!r} "
                 f"{minutes_to_hhmm(int(v.get('startMinute') or 0))}-"
-                f"{minutes_to_hhmm(int(v.get('endMinute') or 0))}",
+                f"{minutes_to_hhmm(int(v.get('endMinute') or 0))} "
+                f"cancel='DELETED'",
             )
-        if len(only_api) > 40:
-            _log(msgs, log_callback, f"    ... and {len(only_api) - 40} more")
-    if not only_file and not only_api:
+        if len(true_only_api) > 40:
+            _log(msgs, log_callback, f"    ... and {len(true_only_api) - 40} more")
+    if not only_file and not status_mismatch_unalloc and not true_only_api:
         _log(msgs, log_callback, "PASS: Unallocated visits match")
 
     # --- Cancellations ---
     _log(msgs, log_callback, "")
     _log(msgs, log_callback, "--- Cancellations ---")
     api_cancel = fetch_cancellations(client, target)
-    _log(msgs, log_callback, f"  Expected (file): {len(expected_cancel)}")
+    expected_cancel_total = len(expected_cancel) + len(true_only_api)
+    _log(
+        msgs,
+        log_callback,
+        f"  Expected (file): {len(expected_cancel)} + DELETED orphans: {len(true_only_api)} "
+        f"= {expected_cancel_total}",
+    )
     _log(msgs, log_callback, f"  Actual (API): {len(api_cancel)}")
 
-    used_cancel_ids: Set[str] = set()
+    used_cancel_indices: Set[int] = set()
     matched_c = 0
     only_file_c: List[Dict[str, Any]] = []
     type_mismatches: List[str] = []
     for row in expected_cancel:
         found = None
-        for visit in api_cancel:
-            vid = str(visit.get("id") or "")
-            if vid and vid in used_cancel_ids:
+        found_idx: Optional[int] = None
+        for idx, visit in enumerate(api_cancel):
+            if idx in used_cancel_indices:
                 continue
-            vname = visit_client_name(visit)
-            if not (name_match_keys(vname) & row["name_keys"]):
-                continue
-            if int(visit.get("startMinute") or 0) != row["start_minute"]:
-                continue
-            if int(visit.get("endMinute") or 0) != row["end_minute"]:
-                continue
-            found = visit
-            break
-        if found:
+            if visit_matches_slot(visit, row):
+                found = visit
+                found_idx = idx
+                break
+        if found is not None and found_idx is not None:
             matched_c += 1
-            used_cancel_ids.add(str(found.get("id") or ""))
+            used_cancel_indices.add(found_idx)
             api_type = cancel_type_name(found)
             exp_type = (row.get("cancellation") or "").strip()
             if api_type and exp_type and normalize_name_for_match(api_type) != normalize_name_for_match(exp_type):
@@ -1240,12 +1380,68 @@ def run_test_today(
         else:
             only_file_c.append(row)
 
-    only_api_c = [v for v in api_cancel if str(v.get("id") or "") not in used_cancel_ids]
+    # DELETED orphans expected on cancellations endpoint with type DELETED
+    deleted_missing_cancel: List[Dict[str, Any]] = []
+    deleted_type_mismatches: List[str] = []
+    for visit in true_only_api:
+        found_idx: Optional[int] = None
+        found = None
+        for idx, cvisit in enumerate(api_cancel):
+            if idx in used_cancel_indices:
+                continue
+            # Match by id when possible, else name+time
+            vid = str(visit.get("id") or "")
+            cid = str(cvisit.get("id") or "")
+            if vid and cid and vid == cid:
+                found = cvisit
+                found_idx = idx
+                break
+            if visit_matches_slot(cvisit, {
+                "name_keys": name_match_keys(visit_client_name(visit)),
+                "start_minute": int(visit.get("startMinute") or 0),
+                "end_minute": int(visit.get("endMinute") or 0),
+            }):
+                found = cvisit
+                found_idx = idx
+                break
+        if found is not None and found_idx is not None:
+            matched_c += 1
+            used_cancel_indices.add(found_idx)
+            api_type = cancel_type_name(found)
+            if normalize_name_for_match(api_type) != normalize_name_for_match("DELETED"):
+                deleted_type_mismatches.append(
+                    f"client={visit_client_name(visit)!r} "
+                    f"{minutes_to_hhmm(int(visit.get('startMinute') or 0))}-"
+                    f"{minutes_to_hhmm(int(visit.get('endMinute') or 0))} "
+                    f"expected='DELETED' api={api_type!r}"
+                )
+        else:
+            deleted_missing_cancel.append(visit)
+
+    only_api_c = [v for idx, v in enumerate(api_cancel) if idx not in used_cancel_indices]
+
+    # File cancellations missing from cancellations API, but present as API unallocated
+    cancel_as_unalloc: List[Dict[str, Any]] = []
+    truly_missing_cancel: List[Dict[str, Any]] = []
+    status_mismatch_cancel_rows = {id(crow) for _v, crow in status_mismatch_unalloc}
+    for row in only_file_c:
+        if id(row) in status_mismatch_cancel_rows or any(
+            visit_matches_slot(v, row) for v in api_unalloc
+        ):
+            cancel_as_unalloc.append(row)
+        else:
+            truly_missing_cancel.append(row)
+
     _log(msgs, log_callback, f"  Matched: {matched_c}")
-    if only_file_c:
+    if cancel_as_unalloc:
         passed = False
-        _log(msgs, log_callback, f"FAIL: {len(only_file_c)} expected cancellation(s) missing from API:")
-        for r in only_file_c[:40]:
+        _log(
+            msgs,
+            log_callback,
+            f"FAIL: {len(cancel_as_unalloc)} expected cancellation(s) still UNALLOCATED in API "
+            f"(not on cancellations endpoint):",
+        )
+        for r in cancel_as_unalloc[:40]:
             _log(
                 msgs,
                 log_callback,
@@ -1253,6 +1449,49 @@ def run_test_today(
                 f"{minutes_to_hhmm(r['start_minute'])}-{minutes_to_hhmm(r['end_minute'])} "
                 f"cancel={r['cancellation']!r}",
             )
+        if len(cancel_as_unalloc) > 40:
+            _log(msgs, log_callback, f"    ... and {len(cancel_as_unalloc) - 40} more")
+    if truly_missing_cancel:
+        passed = False
+        _log(
+            msgs,
+            log_callback,
+            f"FAIL: {len(truly_missing_cancel)} expected cancellation(s) missing from API:",
+        )
+        for r in truly_missing_cancel[:40]:
+            _log(
+                msgs,
+                log_callback,
+                f"    XLSX row={r['row_num']} {r['client_name']!r} "
+                f"{minutes_to_hhmm(r['start_minute'])}-{minutes_to_hhmm(r['end_minute'])} "
+                f"cancel={r['cancellation']!r}",
+            )
+        if len(truly_missing_cancel) > 40:
+            _log(msgs, log_callback, f"    ... and {len(truly_missing_cancel) - 40} more")
+    if deleted_missing_cancel:
+        passed = False
+        _log(
+            msgs,
+            log_callback,
+            f"FAIL: {len(deleted_missing_cancel)} DELETED orphan(s) still UNALLOCATED "
+            f"(expected cancellation type DELETED):",
+        )
+        for v in deleted_missing_cancel[:40]:
+            _log(
+                msgs,
+                log_callback,
+                f"    API id={v.get('id')} {visit_client_name(v)!r} "
+                f"{minutes_to_hhmm(int(v.get('startMinute') or 0))}-"
+                f"{minutes_to_hhmm(int(v.get('endMinute') or 0))} "
+                f"cancel='DELETED'",
+            )
+        if len(deleted_missing_cancel) > 40:
+            _log(msgs, log_callback, f"    ... and {len(deleted_missing_cancel) - 40} more")
+    if deleted_type_mismatches:
+        passed = False
+        _log(msgs, log_callback, f"FAIL: {len(deleted_type_mismatches)} DELETED type mismatch(es):")
+        for line in deleted_type_mismatches[:40]:
+            _log(msgs, log_callback, f"    {line}")
     if only_api_c:
         passed = False
         _log(msgs, log_callback, f"FAIL: {len(only_api_c)} API cancellation(s) not in file:")
@@ -1270,7 +1509,14 @@ def run_test_today(
         _log(msgs, log_callback, f"FAIL: {len(type_mismatches)} cancellation type name mismatch(es):")
         for line in type_mismatches[:40]:
             _log(msgs, log_callback, f"    {line}")
-    if not only_file_c and not only_api_c and not type_mismatches:
+    if (
+        not cancel_as_unalloc
+        and not truly_missing_cancel
+        and not deleted_missing_cancel
+        and not deleted_type_mismatches
+        and not only_api_c
+        and not type_mismatches
+    ):
         _log(msgs, log_callback, "PASS: Cancellations match")
 
     # --- Available clients: cancellation windows ---

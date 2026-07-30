@@ -18,7 +18,7 @@ from datetime import datetime
 try:
     from tkinter import (
         Tk, ttk, Frame, Label, Button, Entry, Checkbutton, BooleanVar,
-        StringVar, messagebox, scrolledtext, N, S, E, W, HORIZONTAL,
+        StringVar, messagebox, Text, N, S, E, W, HORIZONTAL,
         Canvas, BOTH, RIGHT, Y, ALL, NW,
     )
     from tkinter import filedialog
@@ -68,17 +68,20 @@ STEP_FILES = 3
 STEP_SUMMARY = 4
 STEP_RUN = 5
 STEP_TEST_TODAY = 6
-TOTAL_STEPS = 7
+STEP_PREFERENCE_CHECK = 7
+TOTAL_STEPS = 8
 
 # Top-level wizard modes (chosen on welcome)
 MODE_MIGRATION = "migration"
 MODE_TEST_TODAY = "test_today"
+MODE_PREFERENCE_CHECK = "preference_check"
 
 # Wizard release version (shown in UI and window title on all platforms / frozen builds)
-WIZARD_VERSION = "0.0.11"
+WIZARD_VERSION = "0.0.20"
 
 # User-facing name for MODE_TEST_TODAY (internal id unchanged)
 LABEL_VALIDATE_ROSTER = "Validate today's roster"
+LABEL_PREFERENCE_CHECK = "Preference Check"
 
 RUN_HELP_MIGRATION = (
     "Do not close this window until the migration finishes. Cancel stops between steps. "
@@ -88,6 +91,10 @@ RUN_HELP_MIGRATION = (
 RUN_HELP_VALIDATE = (
     "Do not close this window until the checks finish. Progress appears in the log below; "
     "a log file is saved when done. Review PASS/FAIL lines in the log for details."
+)
+RUN_HELP_PREFERENCE_CHECK = (
+    "Do not close this window until Preference Check finishes. "
+    "PAIR and SUMMARY lines are searchable in the log file."
 )
 
 # Migration option keys (must match checkbox keys and file keys)
@@ -193,13 +200,29 @@ def _mousewheel_units(event):
     return -1 if d > 0 else 1
 
 
-def _default_ui_font():
-    """Readable system font per platform."""
+def _default_ui_font(size=11, weight="normal"):
+    """Readable system font per platform (families Tk resolves reliably)."""
     if sys.platform == "darwin":
-        return ("Helvetica", 11)
-    if sys.platform == "win32":
-        return ("Segoe UI", 10)
-    return ("TkDefaultFont", 10)
+        family = "Helvetica Neue"
+    elif sys.platform == "win32":
+        family = "Segoe UI"
+    else:
+        family = "DejaVu Sans"
+    if weight == "bold":
+        return (family, size, "bold")
+    return (family, size)
+
+
+def _mono_ui_font(size=11, weight="normal"):
+    if sys.platform == "darwin":
+        family = "Menlo"
+    elif sys.platform == "win32":
+        family = "Consolas"
+    else:
+        family = "DejaVu Sans Mono"
+    if weight == "bold":
+        return (family, size, "bold")
+    return (family, size)
 
 
 def validate_location_json_file(file_path, root_key, label="File"):
@@ -245,8 +268,8 @@ class MigrationWizard:
     def __init__(self):
         self.root = Tk()
         self.root.title("AOS System Wizard ({})".format(WIZARD_VERSION))
-        self.root.minsize(720, 560)
-        self.root.geometry("780x640")
+        self.root.minsize(920, 680)
+        self.root.geometry("1040x760")
 
         # Window icon (favicon) – keep reference so it persists, especially on Mac
         # When frozen, logo is bundled via PyInstaller --add-data (in BUNDLE_ROOT); else next to exe/script
@@ -261,7 +284,7 @@ class MigrationWizard:
                 self.root.iconphoto(True, self.icon_photo)
                 # Logo for top of each step (slightly larger)
                 logo_img = Image.open(favicon).convert("RGBA")
-                logo_img.thumbnail((56, 56), Image.Resampling.LANCZOS)
+                logo_img.thumbnail((36, 36), Image.Resampling.LANCZOS)
                 self.logo_photo = ImageTk.PhotoImage(logo_img)
             except Exception:
                 pass
@@ -297,6 +320,13 @@ class MigrationWizard:
         self.test_today_date = StringVar(value=datetime.now().strftime("%Y-%m-%d"))
         self.test_today_base_url = StringVar(value=os.getenv("API_BASE_URL", "http://localhost:3000"))
         self.test_today_token = StringVar(value=os.getenv("API_TOKEN", ""))
+        self.pref_check_first_name = StringVar(value="")
+        self.pref_check_last_name = StringVar(value="")
+        self.pref_check_visit_export = StringVar(value="")
+        self.log_search_var = StringVar(value="")
+        self.log_filter_var = StringVar(value="All")
+        self._log_search_start = "1.0"
+        self._log_lines_cache = []  # full log lines for filter rebuild
 
         self._setup_styles()
         self._build_ui()
@@ -304,35 +334,288 @@ class MigrationWizard:
         self._show_step(STEP_WELCOME)
 
     def _setup_styles(self):
-        """Apply consistent padding and fonts for better readability across platforms."""
+        """Modern light UI: soft canvas, white cards, indigo accent, clear hierarchy."""
         style = ttk.Style()
         try:
-            default_font = _default_ui_font()
+            style.theme_use("clam")
         except Exception:
-            default_font = ("", 10)
-        style.configure("TLabel", padding=(0, 4), font=default_font)
-        style.configure("TButton", padding=(10, 6), font=default_font)
-        style.configure("TCheckbutton", padding=(0, 6), font=default_font)
-        style.configure("TRadiobutton", padding=(0, 4), font=default_font)
-        style.configure("TEntry", padding=4)
+            pass
+
+        # Palette — white canvas so option cards can use soft gray fills
+        bg = "#ffffff"
+        surface = "#f1f5f9"
+        card = "#ffffff"
+        border = "#cbd5e1"
+        accent = "#4f46e5"
+        accent_hover = "#4338ca"
+        accent_soft = "#eef2ff"
+        text = "#0f172a"
+        muted = "#475569"
+        header_bg = "#0f172a"
+        header_fg = "#f8fafc"
+        success = "#059669"
+        danger = "#dc2626"
+
+        body = _default_ui_font(12)
+        body_sm = _default_ui_font(11)
+        title = _default_ui_font(22, "bold")
+        subtitle = _default_ui_font(14, "bold")
+        step_font = _default_ui_font(12, "bold")
+        card_title = _default_ui_font(13, "bold")
+        btn_font = _default_ui_font(12)
+        btn_bold = _default_ui_font(12, "bold")
+
+        try:
+            self.root.configure(bg=bg)
+        except Exception:
+            pass
+
+        style.configure(".", background=bg, foreground=text, font=body)
+        style.configure("TFrame", background=bg)
+        style.configure("TLabel", background=bg, foreground=text, font=body, padding=(0, 2))
+        style.configure("TCheckbutton", background=bg, foreground=text, font=body, padding=(0, 6))
+        style.configure("TRadiobutton", background=bg, foreground=text, font=body, padding=(0, 4))
+        style.configure("TEntry", padding=8, fieldbackground=card, foreground=text)
+        style.configure("TCombobox", padding=6, fieldbackground=card, foreground=text)
+        style.map("TCombobox", fieldbackground=[("readonly", card)])
+
+        # Buttons
+        style.configure(
+            "TButton",
+            padding=(14, 9),
+            font=btn_font,
+            background="#eef2ff",
+            foreground=accent,
+            borderwidth=0,
+            focuscolor=accent,
+        )
+        style.map(
+            "TButton",
+            background=[("active", "#e0e7ff"), ("pressed", "#c7d2fe")],
+            foreground=[("active", accent_hover)],
+        )
+        style.configure(
+            "Accent.TButton",
+            padding=(16, 10),
+            font=btn_bold,
+            background=accent,
+            foreground="#ffffff",
+            borderwidth=0,
+        )
+        style.map(
+            "Accent.TButton",
+            background=[("active", accent_hover), ("pressed", "#3730a3"), ("disabled", "#a5b4fc")],
+            foreground=[("disabled", "#eef2ff")],
+        )
+        style.configure(
+            "Ghost.TButton",
+            padding=(14, 9),
+            font=btn_font,
+            background=bg,
+            foreground=muted,
+            borderwidth=0,
+        )
+        style.map("Ghost.TButton", foreground=[("active", text)], background=[("active", border)])
+
+        # Cards / frames
+        style.configure("TLabelframe", background=card, relief="solid", borderwidth=1)
+        style.configure(
+            "TLabelframe.Label",
+            font=card_title,
+            foreground=accent,
+            background=card,
+        )
+        style.configure("Card.TLabelframe", background=card, relief="solid", borderwidth=1)
+        style.configure(
+            "Card.TLabelframe.Label",
+            font=card_title,
+            foreground=text,
+            background=card,
+        )
+        style.configure("Card.TFrame", background=card)
+        style.configure("Card.TLabel", background=card, foreground=text, font=body)
+        style.configure("Card.TRadiobutton", background=card, foreground=text, font=body)
+        style.map("Card.TRadiobutton", background=[("selected", accent_soft), ("active", accent_soft)])
+        style.configure("ModeCard.TRadiobutton", background=surface, foreground=text, font=body)
+        style.map(
+            "ModeCard.TRadiobutton",
+            background=[("selected", accent_soft), ("active", accent_soft)],
+        )
+        style.configure("CardTitle.TLabel", background=card, foreground=text, font=card_title)
+        style.configure("CardMuted.TLabel", background=card, foreground=muted, font=body_sm)
+        style.configure("Badge.TLabel", background=accent_soft, foreground=accent, font=_default_ui_font(10, "bold"), padding=(8, 3))
+        style.configure("Muted.TLabel", foreground=muted, background=bg, font=body_sm)
+        style.configure("Title.TLabel", font=title, foreground=text, background=bg)
+        style.configure("Subtitle.TLabel", font=subtitle, foreground=text, background=bg)
+        style.configure("Lead.TLabel", font=body, foreground=muted, background=bg)
+        style.configure("Step.TLabel", font=step_font, foreground=header_fg, background=header_bg)
+        style.configure("HeaderBar.TFrame", background=header_bg)
+        style.configure("HeaderBar.TLabel", background=header_bg, foreground="#94a3b8", font=body_sm)
+        style.configure("HeaderBrand.TLabel", background=header_bg, foreground=header_fg, font=_default_ui_font(14, "bold"))
+        style.configure("VersionPill.TLabel", background="#1e293b", foreground="#cbd5e1", font=_default_ui_font(10), padding=(10, 4))
+        style.configure("Footer.TFrame", background="#ffffff")
+        style.configure("Footer.TLabel", background="#ffffff", foreground=muted, font=body_sm)
+        style.configure("Toolbar.TFrame", background=card)
+        style.configure("Toolbar.TLabel", background=card, foreground=muted, font=body_sm)
+        style.configure("Link.TLabel", foreground=accent, background=bg, font=body_sm, cursor="hand2")
+        style.configure("CardLink.TLabel", foreground=accent, background=card, font=body_sm, cursor="hand2")
+        style.configure("Horizontal.TProgressbar", troughcolor="#e2e8f0", background=accent, borderwidth=0, thickness=4)
+        style.configure("TSeparator", background=border)
+        self._style_modern_scrollbars(style, trough=surface, thumb="#c0c8d4")
+
+        self._ui_colors = {
+            "bg": bg,
+            "surface": surface,
+            "card": card,
+            "border": border,
+            "accent": accent,
+            "accent_soft": accent_soft,
+            "muted": muted,
+            "text": text,
+            "header_bg": header_bg,
+            "fail": "#fca5a5",
+            "pass": "#86efac",
+            "pair": "#93c5fd",
+            "only": "#c4b5fd",
+            "must": "#7dd3fc",
+            "summary": "#fdba74",
+            "warn": "#fcd34d",
+            "search_bg": "#fde68a",
+            "success": success,
+            "danger": danger,
+            "entry_bg": card,
+            "entry_border": border,
+            "entry_focus": accent,
+        }
+        self._mode_cards = []
+
+    def _style_modern_scrollbars(self, style, trough="#f1f5f9", thumb="#c0c8d4"):
+        """Thin arrowless scrollbars (clam layout) used app-wide."""
+        style.layout(
+            "Modern.Vertical.TScrollbar",
+            [
+                (
+                    "Vertical.Scrollbar.trough",
+                    {
+                        "sticky": "ns",
+                        "children": [
+                            ("Vertical.Scrollbar.thumb", {"expand": "1", "sticky": "nswe"}),
+                        ],
+                    },
+                )
+            ],
+        )
+        style.layout(
+            "Modern.Horizontal.TScrollbar",
+            [
+                (
+                    "Horizontal.Scrollbar.trough",
+                    {
+                        "sticky": "ew",
+                        "children": [
+                            ("Horizontal.Scrollbar.thumb", {"expand": "1", "sticky": "nswe"}),
+                        ],
+                    },
+                )
+            ],
+        )
+        for name in (
+            "Modern.Vertical.TScrollbar",
+            "Modern.Horizontal.TScrollbar",
+            "Vertical.TScrollbar",
+            "Horizontal.TScrollbar",
+            "TScrollbar",
+        ):
+            try:
+                style.configure(
+                    name,
+                    background=thumb,
+                    troughcolor=trough,
+                    bordercolor=trough,
+                    lightcolor=thumb,
+                    darkcolor=thumb,
+                    arrowcolor=trough,
+                    relief="flat",
+                    borderwidth=0,
+                    width=10,
+                    arrowsize=0,
+                )
+                style.map(
+                    name,
+                    background=[
+                        ("pressed", "#64748b"),
+                        ("active", "#94a3b8"),
+                        ("!disabled", thumb),
+                    ],
+                )
+            except Exception:
+                pass
+        try:
+            style.layout("Vertical.TScrollbar", style.layout("Modern.Vertical.TScrollbar"))
+            style.layout("Horizontal.TScrollbar", style.layout("Modern.Horizontal.TScrollbar"))
+        except Exception:
+            pass
+
+    def _scrollbar(self, parent, orient="vertical", command=None):
+        style = (
+            "Modern.Vertical.TScrollbar"
+            if orient == "vertical"
+            else "Modern.Horizontal.TScrollbar"
+        )
+        return ttk.Scrollbar(parent, orient=orient, command=command, style=style)
+
+    def _make_scrolled_text(self, parent, horizontal=False, **text_kwargs):
+        """Text widget with modern ttk scrollbars (replaces scrolledtext)."""
+        wrap = ttk.Frame(parent)
+        wrap.columnconfigure(0, weight=1)
+        wrap.rowconfigure(0, weight=1)
+        text = Text(wrap, **text_kwargs)
+        vsb = self._scrollbar(wrap, orient="vertical", command=text.yview)
+        text.configure(yscrollcommand=vsb.set)
+        text.grid(row=0, column=0, sticky=(N, S, E, W))
+        vsb.grid(row=0, column=1, sticky=(N, S), padx=(2, 0))
+        hsb = None
+        if horizontal:
+            hsb = self._scrollbar(wrap, orient="horizontal", command=text.xview)
+            text.configure(xscrollcommand=hsb.set)
+            hsb.grid(row=1, column=0, sticky=(E, W), pady=(2, 0))
+        return wrap, text, vsb, hsb
 
     def _build_ui(self):
-        main = ttk.Frame(self.root, padding=16)
+        main = ttk.Frame(self.root, padding=0)
         main.grid(row=0, column=0, sticky=(N, S, E, W))
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
         main.columnconfigure(0, weight=1)
         main.rowconfigure(1, weight=1)
 
-        # Progress + version (constant row visible on every step)
-        self.step_label = ttk.Label(main, text="Step 1 of 3 – Welcome", font=("", 10, "bold"))
-        self.step_label.grid(row=0, column=0, sticky=W, pady=(0, 8))
-        self.version_label = ttk.Label(main, text="Version {}".format(WIZARD_VERSION), font=("", 9))
-        self.version_label.grid(row=0, column=1, sticky=E, pady=(0, 8))
+        # Header bar — brand + current step + version
+        header = ttk.Frame(main, style="HeaderBar.TFrame", padding=(20, 14))
+        header.grid(row=0, column=0, sticky=(E, W))
+        header.columnconfigure(1, weight=1)
+        brand = ttk.Frame(header, style="HeaderBar.TFrame")
+        brand.grid(row=0, column=0, sticky=W)
+        if self.logo_photo:
+            logo_lbl = ttk.Label(brand, image=self.logo_photo, style="HeaderBar.TLabel")
+            logo_lbl.pack(side="left", padx=(0, 12))
+            logo_lbl.image = self.logo_photo
+        ttk.Label(brand, text="AOS System Wizard", style="HeaderBrand.TLabel").pack(side="left")
+        self.step_label = ttk.Label(
+            header, text="Step 1 of 6 – Welcome", style="Step.TLabel"
+        )
+        self.step_label.grid(row=0, column=1, sticky=W, padx=(24, 12))
+        self.version_label = ttk.Label(
+            header, text="v{}".format(WIZARD_VERSION), style="VersionPill.TLabel"
+        )
+        self.version_label.grid(row=0, column=2, sticky=E)
 
         # Content area
-        self.content = ttk.Frame(main)
-        self.content.grid(row=1, column=0, columnspan=2, sticky=(N, S, E, W))
+        content_wrap = ttk.Frame(main, padding=(28, 22, 28, 12))
+        content_wrap.grid(row=1, column=0, sticky=(N, S, E, W))
+        content_wrap.columnconfigure(0, weight=1)
+        content_wrap.rowconfigure(0, weight=1)
+        self.content = ttk.Frame(content_wrap)
+        self.content.grid(row=0, column=0, sticky=(N, S, E, W))
         self.content.columnconfigure(0, weight=1)
         self.content.rowconfigure(0, weight=1)
 
@@ -349,34 +632,41 @@ class MigrationWizard:
         self._build_step_summary(self.frames[STEP_SUMMARY])
         self._build_step_run(self.frames[STEP_RUN])
         self._build_step_test_today(self.frames[STEP_TEST_TODAY])
+        self._build_step_preference_check(self.frames[STEP_PREFERENCE_CHECK])
 
-        # Buttons
-        btn_frame = ttk.Frame(main)
-        btn_frame.grid(row=2, column=0, columnspan=2, sticky=E, pady=(12, 0))
-        self.btn_cancel = ttk.Button(btn_frame, text="Cancel", command=self._on_cancel)
+        # Footer actions
+        footer_sep = ttk.Separator(main, orient="horizontal")
+        footer_sep.grid(row=2, column=0, sticky=(E, W))
+        btn_frame = ttk.Frame(main, style="Footer.TFrame", padding=(20, 14))
+        btn_frame.grid(row=3, column=0, sticky=(E, W))
+        btn_frame.columnconfigure(0, weight=1)
+        actions = ttk.Frame(btn_frame, style="Footer.TFrame")
+        actions.grid(row=0, column=1, sticky=E)
+        # Pack right-to-left so Continue is the rightmost primary action
+        self.btn_continue = ttk.Button(actions, text="Continue", command=self._on_continue, style="Accent.TButton")
+        self.btn_continue.pack(side="right", padx=(8, 0))
+        self.btn_cancel = ttk.Button(actions, text="Cancel", command=self._on_cancel, style="Ghost.TButton")
         self.btn_cancel.pack(side="right", padx=4)
-        self.btn_continue_next = ttk.Button(btn_frame, text="Continue from next", command=self._on_continue_from_next)
+        self.btn_continue_next = ttk.Button(actions, text="Continue from next", command=self._on_continue_from_next)
         self.btn_continue_next.pack(side="right", padx=4)
         self.btn_continue_next.pack_forget()
-        self.btn_retry = ttk.Button(btn_frame, text="Retry", command=self._on_retry_migration)
+        self.btn_retry = ttk.Button(actions, text="Retry", command=self._on_retry_migration)
         self.btn_retry.pack(side="right", padx=4)
         self.btn_retry.pack_forget()
-        self.btn_test_connection = ttk.Button(btn_frame, text="Test connection", command=self._on_test_connection)
+        self.btn_test_connection = ttk.Button(actions, text="Test connection", command=self._on_test_connection)
         self.btn_test_connection.pack(side="right", padx=4)
         self.btn_test_connection.pack_forget()
-        self.btn_run_again = ttk.Button(btn_frame, text="Run again", command=self._on_run_again)
+        self.btn_run_again = ttk.Button(actions, text="Run again", command=self._on_run_again)
         self.btn_run_again.pack(side="right", padx=4)
         self.btn_run_again.pack_forget()
-        self.btn_check_migration = ttk.Button(btn_frame, text="Check migration", command=self._on_check_migration)
+        self.btn_check_migration = ttk.Button(actions, text="Check migration", command=self._on_check_migration)
         self.btn_check_migration.pack(side="right", padx=4)
         self.btn_check_migration.pack_forget()
-        self.btn_check_files = ttk.Button(btn_frame, text="Check files", command=self._on_check_files)
+        self.btn_check_files = ttk.Button(actions, text="Check files", command=self._on_check_files)
         self.btn_check_files.pack(side="right", padx=4)
         self.btn_check_files.pack_forget()
-        self.btn_back = ttk.Button(btn_frame, text="Back", command=self._on_back)
+        self.btn_back = ttk.Button(actions, text="Back", command=self._on_back, style="Ghost.TButton")
         self.btn_back.pack(side="right", padx=4)
-        self.btn_continue = ttk.Button(btn_frame, text="Continue", command=self._on_continue)
-        self.btn_continue.pack(side="right", padx=4)
         # Run state: cancel flag, order snapshot, failed index for retry/continue
         self._run_cancelled = False
         self._run_order = []
@@ -386,13 +676,27 @@ class MigrationWizard:
         self._connection_lost_context = None
 
     def _add_step_header(self, parent, start_row=0):
-        """Add logo at top of step. Returns next row index. Keeps logo reference on parent."""
-        if self.logo_photo:
-            logo_lbl = ttk.Label(parent, image=self.logo_photo)
-            logo_lbl.grid(row=start_row, column=0, pady=(0, 10))
-            logo_lbl.image = self.logo_photo
-            return start_row + 1
+        """Reserved for step-local chrome; brand logo lives in the app header."""
         return start_row
+
+    def _styled_entry(self, parent, textvariable, width=44, show=None):
+        """tk Entry with soft border and focus ring matching the theme."""
+        colors = self._ui_colors
+        e = Entry(
+            parent,
+            textvariable=textvariable,
+            width=width,
+            show=show,
+            font=_default_ui_font(12),
+            background=colors.get("entry_bg", "#ffffff"),
+            foreground=colors.get("text", "#0f172a"),
+            insertbackground=colors.get("accent", "#4f46e5"),
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground=colors.get("entry_border", "#e2e8f0"),
+            highlightcolor=colors.get("entry_focus", "#4f46e5"),
+        )
+        return e
 
     def _register_wrap(self, label, narrow=False):
         """Track a label so wraplength updates when the window is resized."""
@@ -447,8 +751,8 @@ class MigrationWizard:
         parent.columnconfigure(0, weight=1)
         parent.rowconfigure(0, weight=1)
 
-        canvas = Canvas(parent, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        canvas = Canvas(parent, highlightthickness=0, background=self._ui_colors.get("bg", "#ffffff"), bd=0)
+        scrollbar = self._scrollbar(parent, orient="vertical", command=canvas.yview)
         scroll_frame = ttk.Frame(canvas)
         scroll_frame.bind(
             "<Configure>",
@@ -515,118 +819,254 @@ class MigrationWizard:
         body = self._create_scrollable_area(parent, "welcome")
         body.columnconfigure(0, weight=1)
         row = self._add_step_header(body, 0)
-        ttk.Label(body, text="AOS System Wizard", font=("", 16, "bold")).grid(
-            row=row, column=0, sticky=W, pady=(0, 12)
+        ttk.Label(body, text="Welcome", style="Title.TLabel").grid(
+            row=row, column=0, sticky=W, pady=(0, 4)
         )
         row += 1
-        hint = (
-            "Choose what you want to do, then continue.\n\n"
-            "• Migration – import caregivers, clients, availability, geocode, distances, and related data "
-            "into the AOS database from CSV/Excel exports.\n\n"
-            "• Validate today's roster – compare Excel exports to the live app API for a selected date "
-            "(unallocated visits, cancellations, caregiver availability). No database connection required. "
-            "This does not change data (unlike \"Update today visits\" in Migration)."
-        )
-        self._wrap_label(body, hint, justify="left", padding=(0, 8)).grid(
-            row=row, column=0, sticky=W, pady=(0, 12)
-        )
+        self._wrap_label(
+            body,
+            "Choose a mode below, then continue. Migration writes to the database; "
+            "Validate and Preference Check are read-only tools.",
+            style="Lead.TLabel",
+            padding=(0, 4),
+        ).grid(row=row, column=0, sticky=W, pady=(0, 14))
         row += 1
-        ttk.Label(body, text="What do you want to do?", font=("", 10, "bold")).grid(
-            row=row, column=0, sticky=W, pady=(4, 4)
+        ttk.Label(body, text="What do you want to do?", style="Subtitle.TLabel").grid(
+            row=row, column=0, sticky=W, pady=(2, 10)
         )
         row += 1
-        mode_frame = ttk.Frame(body)
-        mode_frame.grid(row=row, column=0, sticky=W, pady=(0, 12))
-        ttk.Radiobutton(
-            mode_frame,
-            text="Migration",
-            variable=self.wizard_mode,
-            value=MODE_MIGRATION,
-        ).pack(anchor=W, pady=2)
-        ttk.Radiobutton(
-            mode_frame,
-            text=LABEL_VALIDATE_ROSTER,
-            variable=self.wizard_mode,
-            value=MODE_TEST_TODAY,
-        ).pack(anchor=W, pady=2)
-        row += 1
-        ttk.Label(body, text="More information:", font=("", 10, "bold")).grid(
-            row=row, column=0, sticky=W, pady=(8, 2)
+
+        modes = [
+            (
+                MODE_MIGRATION,
+                "Migration",
+                "Write",
+                "Import caregivers, clients, availability, geocode, distances, and related data "
+                "into the AOS database from CSV/Excel exports.",
+            ),
+            (
+                MODE_TEST_TODAY,
+                LABEL_VALIDATE_ROSTER,
+                "Read-only",
+                "Compare Client Hours + Caregiver Availability Excel to the live API for one date. "
+                "Report PASS/FAIL only — nothing is written.",
+            ),
+            (
+                MODE_PREFERENCE_CHECK,
+                LABEL_PREFERENCE_CHECK,
+                "Offline",
+                "Enter a caregiver name and VisitExport CSV to see Must / Only clients and why. "
+                "Same weight logic as feasible-pairs migration. No DB or API.",
+            ),
+        ]
+        self._mode_cards = []
+        for value, title, badge, desc in modes:
+            row = self._add_mode_card(body, row, value, title, badge, desc)
+
+        ttk.Label(body, text="More information", style="Subtitle.TLabel").grid(
+            row=row, column=0, sticky=W, pady=(14, 4)
         )
         row += 1
-        link = ttk.Label(body, text=AOS_URL, foreground="blue", cursor="hand2")
+        link = ttk.Label(body, text=AOS_URL, style="Link.TLabel", cursor="hand2")
         link.grid(row=row, column=0, sticky=W, pady=(0, 8))
         link.bind("<Button-1>", lambda e: webbrowser.open(AOS_URL))
+        self.wizard_mode.trace_add("write", lambda *_: self._refresh_mode_cards())
+        self._refresh_mode_cards()
         _bind_mousewheel_recursive(
             body,
             self._welcome_on_mousewheel,
             self._welcome_on_mousewheel_linux,
         )
 
+    def _add_mode_card(self, parent, row, value, title, badge, desc):
+        """Selectable option card — soft gray fill on white page, accent ring when selected."""
+        colors = self._ui_colors
+        surface = colors.get("surface", "#f1f5f9")
+        # highlight* draws a reliable border on macOS (unlike nested ttk Labelframes)
+        shell = Frame(
+            parent,
+            bg=surface,
+            highlightthickness=2,
+            highlightbackground=colors["border"],
+            highlightcolor=colors["accent"],
+            bd=0,
+            cursor="hand2",
+        )
+        shell.grid(row=row, column=0, sticky=(E, W), pady=(0, 8))
+        shell.columnconfigure(1, weight=1)
+
+        radio = ttk.Radiobutton(
+            shell,
+            text="",
+            variable=self.wizard_mode,
+            value=value,
+            style="ModeCard.TRadiobutton",
+            command=self._refresh_mode_cards,
+            takefocus=0,
+        )
+        radio.grid(row=0, column=0, rowspan=2, sticky="n", padx=(14, 10), pady=(16, 0))
+
+        title_lbl = Label(
+            shell,
+            text=title,
+            bg=surface,
+            fg=colors["text"],
+            font=_default_ui_font(14, "bold"),
+            anchor="w",
+            cursor="hand2",
+        )
+        title_lbl.grid(row=0, column=1, sticky=W, pady=(14, 0))
+
+        badge_lbl = Label(
+            shell,
+            text=badge,
+            bg="#e0e7ff",
+            fg=colors["accent"],
+            font=_default_ui_font(10, "bold"),
+            padx=9,
+            pady=2,
+            cursor="hand2",
+        )
+        badge_lbl.grid(row=0, column=2, sticky=E, padx=(8, 14), pady=(14, 0))
+
+        desc_lbl = Label(
+            shell,
+            text=desc,
+            bg=surface,
+            fg=colors["muted"],
+            font=_default_ui_font(12),
+            wraplength=700,
+            justify="left",
+            anchor="w",
+            cursor="hand2",
+        )
+        desc_lbl.grid(row=1, column=1, columnspan=2, sticky=(E, W), padx=(0, 14), pady=(6, 14))
+
+        def _select(_event=None, v=value):
+            self.wizard_mode.set(v)
+            self._refresh_mode_cards()
+
+        widgets = [shell, title_lbl, badge_lbl, desc_lbl]
+        for w in widgets:
+            w.bind("<Button-1>", _select)
+        self._mode_cards.append(
+            {
+                "value": value,
+                "shell": shell,
+                "radio": radio,
+                "labels": (title_lbl, badge_lbl, desc_lbl),
+            }
+        )
+        return row + 1
+
+    def _refresh_mode_cards(self):
+        colors = self._ui_colors
+        selected = self.wizard_mode.get()
+        surface = colors.get("surface", "#f1f5f9")
+        soft = colors.get("accent_soft", "#eef2ff")
+        for card in getattr(self, "_mode_cards", []):
+            is_on = card["value"] == selected
+            fill = soft if is_on else surface
+            border = colors["accent"] if is_on else colors["border"]
+            try:
+                card["shell"].configure(bg=fill, highlightbackground=border, highlightthickness=2)
+                title_lbl, badge_lbl, desc_lbl = card["labels"]
+                title_lbl.configure(bg=fill)
+                desc_lbl.configure(bg=fill)
+                badge_lbl.configure(bg="#c7d2fe" if is_on else "#e0e7ff")
+            except Exception:
+                pass
+
+    def _build_form_card(self, parent, title, row):
+        card = ttk.Labelframe(parent, text=title, style="Card.TLabelframe", padding=(16, 14))
+        card.grid(row=row, column=0, columnspan=3, sticky=(E, W), pady=(0, 14))
+        card.columnconfigure(1, weight=1)
+        return card
+
+    def _add_form_fields(self, card, fields, start_row=0):
+        row = start_row
+        for label, var, kind, hint in fields:
+            ttk.Label(card, text=label, style="Card.TLabel").grid(
+                row=row, column=0, sticky=W, padx=(0, 12), pady=(4, 0)
+            )
+            show = "*" if kind == "secret" else None
+            e = self._styled_entry(card, var, width=44, show=show)
+            e.grid(row=row, column=1, sticky=(E, W), pady=(4, 0), ipady=4)
+            if kind == "file":
+                ttk.Button(
+                    card,
+                    text="Browse…",
+                    command=lambda v=var, p=card: self._browse_file(v, p),
+                ).grid(row=row, column=2, padx=(8, 0), pady=(4, 0))
+            row += 1
+            ttk.Label(card, text=hint, style="CardMuted.TLabel", wraplength=560, justify="left").grid(
+                row=row, column=1, columnspan=2, sticky=W, pady=(2, 10)
+            )
+            row += 1
+        return row
+
     def _build_step_test_today(self, parent):
         body = self._create_scrollable_area(parent, "validate")
-        body.columnconfigure(1, weight=1)
+        body.columnconfigure(0, weight=1)
         row = self._add_step_header(body, 0)
-        ttk.Label(body, text=LABEL_VALIDATE_ROSTER, font=("", 13, "bold")).grid(
-            row=row, column=0, columnspan=3, sticky=W, pady=(0, 6)
+        ttk.Label(body, text=LABEL_VALIDATE_ROSTER, style="Title.TLabel").grid(
+            row=row, column=0, sticky=W, pady=(0, 4)
         )
         row += 1
         self._wrap_label(
             body,
             "Compare your Excel exports to the live app for one date. Checks unallocated visits, "
-            "cancellations, and caregiver availability windows. Nothing is written to the database.",
+            "cancellations, and caregiver availability. Nothing is written to the database.",
+            style="Lead.TLabel",
             padding=(0, 4),
-        ).grid(row=row, column=0, columnspan=3, sticky=W, pady=(0, 12))
+        ).grid(row=row, column=0, sticky=W, pady=(0, 14))
         row += 1
 
-        fields = [
-            (
-                "Client Hours with Service Type (XLSX):",
-                self.test_today_client_hours,
-                "file",
-                "Same Client Hours export used for migration / Update today visits.",
-            ),
-            (
-                "Caregivers Availability (XLSX):",
-                self.test_today_caregivers_xlsx,
-                "file",
-                "Caregiver availability workbook (e.g. userAvailabilities.xlsx).",
-            ),
-            (
-                "Date to check (YYYY-MM-DD):",
-                self.test_today_date,
-                "text",
-                "Defaults to today; any date in YYYY-MM-DD format is allowed.",
-            ),
-            (
-                "App API base URL:",
-                self.test_today_base_url,
-                "text",
-                "Root URL of the app API, e.g. http://localhost:3000 (no trailing path).",
-            ),
-            (
-                "API token:",
-                self.test_today_token,
-                "secret",
-                "Auth token from the panel (JWT). A \"Bearer \" prefix is optional.",
-            ),
-        ]
-        for label, var, kind, hint in fields:
-            ttk.Label(body, text=label).grid(row=row, column=0, sticky=W, padx=(0, 8), pady=(6, 2))
-            show = "*" if kind == "secret" else None
-            e = Entry(body, textvariable=var, width=42, show=show)
-            e.grid(row=row, column=1, sticky=(E, W), pady=(6, 2))
-            if kind == "file":
-                ttk.Button(
-                    body,
-                    text="Browse…",
-                    command=lambda v=var, p=body: self._browse_file(v, p),
-                ).grid(row=row, column=2, padx=4, pady=(6, 2))
-            row += 1
-            self._wrap_label(body, hint, padding=(0, 0, 0, 8)).grid(
-                row=row, column=1, columnspan=2, sticky=W, padx=(0, 8)
-            )
-            row += 1
+        files_card = self._build_form_card(body, "Excel exports", row)
+        row += 1
+        self._add_form_fields(
+            files_card,
+            [
+                (
+                    "Client Hours (XLSX)",
+                    self.test_today_client_hours,
+                    "file",
+                    "Same Client Hours export used for migration / Update today visits.",
+                ),
+                (
+                    "Caregivers Availability (XLSX)",
+                    self.test_today_caregivers_xlsx,
+                    "file",
+                    "Caregiver availability workbook (Availability Export).",
+                ),
+            ],
+        )
+
+        api_card = self._build_form_card(body, "Date & API", row)
+        row += 1
+        self._add_form_fields(
+            api_card,
+            [
+                (
+                    "Date (YYYY-MM-DD)",
+                    self.test_today_date,
+                    "text",
+                    "Defaults to today; any date in YYYY-MM-DD format is allowed.",
+                ),
+                (
+                    "App API base URL",
+                    self.test_today_base_url,
+                    "text",
+                    "Root URL of the app API, e.g. http://localhost:3000 (no trailing path).",
+                ),
+                (
+                    "API token",
+                    self.test_today_token,
+                    "secret",
+                    "Auth token from the panel (JWT). A \"Bearer \" prefix is optional.",
+                ),
+            ],
+        )
 
         _bind_mousewheel_recursive(
             body,
@@ -634,20 +1074,93 @@ class MigrationWizard:
             self._validate_on_mousewheel_linux,
         )
 
+    def _build_step_preference_check(self, parent):
+        body = self._create_scrollable_area(parent, "prefcheck")
+        body.columnconfigure(0, weight=1)
+        row = self._add_step_header(body, 0)
+        ttk.Label(body, text=LABEL_PREFERENCE_CHECK, style="Title.TLabel").grid(
+            row=row, column=0, sticky=W, pady=(0, 4)
+        )
+        row += 1
+        self._wrap_label(
+            body,
+            "See which clients would be Must or Only for a caregiver, and why — using the same "
+            "weight rules as feasible-pairs migration. Offline only (no database, no API).",
+            style="Lead.TLabel",
+            padding=(0, 4),
+        ).grid(row=row, column=0, sticky=W, pady=(0, 14))
+        row += 1
+
+        carer_card = self._build_form_card(body, "Caregiver", row)
+        row += 1
+        self._add_form_fields(
+            carer_card,
+            [
+                (
+                    "First name",
+                    self.pref_check_first_name,
+                    "text",
+                    "Given name as in VisitExport Actual Employee Name.",
+                ),
+                (
+                    "Last name",
+                    self.pref_check_last_name,
+                    "text",
+                    "Family name as in VisitExport Actual Employee Name.",
+                ),
+            ],
+        )
+
+        file_card = self._build_form_card(body, "VisitExport", row)
+        row += 1
+        self._add_form_fields(
+            file_card,
+            [
+                (
+                    "VisitExport CSV",
+                    self.pref_check_visit_export,
+                    "file",
+                    "Same VisitExport CSV used for feasible-pairs / FVisit history migration.",
+                ),
+            ],
+        )
+
+        tip = ttk.Labelframe(body, text="How to read results", style="Card.TLabelframe", padding=(14, 10))
+        tip.grid(row=row, column=0, sticky=(E, W), pady=(0, 8))
+        ttk.Label(
+            tip,
+            text=(
+                "Log lines start with PAIR / SUMMARY so you can search them. "
+                "ONLY = weight ≥ 0.9 and long client duration (≥ 300 min). "
+                "MUST = weight ≥ 0.9 and shorter duration. Each PAIR line includes the reason."
+            ),
+            style="CardMuted.TLabel",
+            wraplength=720,
+            justify="left",
+        ).grid(row=0, column=0, sticky=W)
+
+        _bind_mousewheel_recursive(
+            body,
+            self._prefcheck_on_mousewheel,
+            self._prefcheck_on_mousewheel_linux,
+        )
+
     def _build_step_db(self, parent):
         body = self._create_scrollable_area(parent, "db")
+        body.columnconfigure(0, weight=1)
         body.columnconfigure(1, weight=1)
         row = self._add_step_header(body, 0)
-        ttk.Label(body, text="Database connection (PostgreSQL)", font=("", 13, "bold")).grid(
-            row=row, column=0, columnspan=2, sticky=W, pady=(0, 6)
+        ttk.Label(body, text="Database connection", style="Title.TLabel").grid(
+            row=row, column=0, columnspan=2, sticky=W, pady=(0, 4)
         )
         row += 1
         self._wrap_label(
             body,
             "Enter the PostgreSQL connection details for the AOS database. "
             "These settings are used for every migration step.",
+            style="Lead.TLabel",
             padding=(0, 4),
-        ).grid(row=row, column=0, columnspan=2, sticky=W, pady=(0, 14))
+        ).grid(row=row, column=0, columnspan=2, sticky=W, pady=(0, 16))
         row += 1
         hints = {
             "host": "Usually localhost or 127.0.0.1 if the database is on this computer.",
@@ -656,6 +1169,9 @@ class MigrationWizard:
             "user": "PostgreSQL username with write access to the database.",
             "password": "Password for the user above.",
         }
+        db_card = self._build_form_card(body, "PostgreSQL", row)
+        row += 1
+        card_row = 0
         for label, key in [
             ("Host", "host"),
             ("Port", "port"),
@@ -663,21 +1179,21 @@ class MigrationWizard:
             ("User", "user"),
             ("Password", "password"),
         ]:
-            ttk.Label(body, text=label + ":").grid(
-                row=row, column=0, sticky=W, padx=(0, 12), pady=(6, 2)
+            ttk.Label(db_card, text=label, style="Card.TLabel").grid(
+                row=card_row, column=0, sticky=W, padx=(0, 12), pady=(4, 0)
             )
-            w = Entry(
-                body,
-                textvariable=self.db_config[key],
+            w = self._styled_entry(
+                db_card,
+                self.db_config[key],
                 width=38,
                 show="*" if key == "password" else None,
             )
-            w.grid(row=row, column=1, sticky=(E, W), pady=(6, 2), padx=(0, 8))
-            row += 1
-            self._wrap_label(body, hints[key], padding=(0, 0, 0, 8)).grid(
-                row=row, column=1, sticky=W, padx=(0, 8)
+            w.grid(row=card_row, column=1, sticky=(E, W), pady=(4, 0), ipady=4)
+            card_row += 1
+            ttk.Label(db_card, text=hints[key], style="CardMuted.TLabel", wraplength=560, justify="left").grid(
+                row=card_row, column=1, sticky=W, pady=(2, 10)
             )
-            row += 1
+            card_row += 1
         _bind_mousewheel_recursive(
             body,
             self._db_on_mousewheel,
@@ -687,8 +1203,8 @@ class MigrationWizard:
     def _build_step_checkboxes(self, parent):
         parent.columnconfigure(0, weight=1)
         row = self._add_step_header(parent, 0)
-        ttk.Label(parent, text="Select data to migrate", font=("", 13, "bold")).grid(
-            row=row, column=0, sticky=W, pady=(0, 6)
+        ttk.Label(parent, text="Select data to migrate", style="Title.TLabel").grid(
+            row=row, column=0, sticky=W, pady=(0, 4)
         )
         row += 1
         intro = (
@@ -697,8 +1213,8 @@ class MigrationWizard:
             "(the wizard runs steps in the correct order).\n\n"
             "Scroll the list below for more options (Caregivers, Clients, Geocode, Distances, etc.)."
         )
-        self._wrap_label(parent, intro, padding=(0, 6)).grid(
-            row=row, column=0, sticky=W, pady=(0, 8)
+        self._wrap_label(parent, intro, style="Lead.TLabel", padding=(0, 6)).grid(
+            row=row, column=0, sticky=W, pady=(0, 10)
         )
         row += 1
 
@@ -733,8 +1249,8 @@ class MigrationWizard:
         row_for_scroll = row
 
         # Scrollable area: canvas + scrollbar + inner frame
-        canvas = Canvas(parent, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        canvas = Canvas(parent, highlightthickness=0, background=self._ui_colors.get("bg", "#ffffff"), bd=0)
+        scrollbar = self._scrollbar(parent, orient="vertical", command=canvas.yview)
 
         scroll_frame = ttk.Frame(canvas)
         scroll_frame.bind(
@@ -900,19 +1416,20 @@ class MigrationWizard:
         parent.columnconfigure(0, weight=1)
         parent.rowconfigure(2, weight=1)
         row = self._add_step_header(parent, 0)
-        ttk.Label(parent, text="Select files for each migration", font=("", 13, "bold")).grid(row=row, column=0, columnspan=3, sticky=W, pady=(0, 6))
+        ttk.Label(parent, text="Select files", style="Title.TLabel").grid(row=row, column=0, columnspan=3, sticky=W, pady=(0, 4))
         row += 1
         self._wrap_label(
             parent,
             "For each option you ticked, choose the matching file (or folder). "
             "Calculated Geocode and Calculate distances use their own settings and do not need a file here.",
+            style="Lead.TLabel",
             padding=(0, 4),
-        ).grid(row=row, column=0, columnspan=3, sticky=W, pady=(0, 12))
+        ).grid(row=row, column=0, columnspan=3, sticky=W, pady=(0, 14))
         row += 1
         row_for_scroll = row
         # Scrollable area so file list is scrollable when many options are selected
-        canvas = Canvas(parent, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        canvas = Canvas(parent, highlightthickness=0, background=self._ui_colors.get("bg", "#ffffff"), bd=0)
+        scrollbar = self._scrollbar(parent, orient="vertical", command=canvas.yview)
         scroll_frame = ttk.Frame(canvas)
         scroll_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox(ALL)))
         canvas_window = canvas.create_window((0, 0), window=scroll_frame, anchor=NW)
@@ -976,15 +1493,15 @@ class MigrationWizard:
             OPT_GEOCODE_ALL_USERS in selected
         ):
             ttk.Label(parent, text="Irish cities file (IE.txt) for Calculated Geocode:").grid(row=row, column=0, sticky=W, padx=(0, 8), pady=4)
-            e = Entry(parent, textvariable=self.geocode_ie_txt_path, width=40)
-            e.grid(row=row, column=1, sticky=(E, W), pady=4)
+            e = self._styled_entry(parent, self.geocode_ie_txt_path, width=40)
+            e.grid(row=row, column=1, sticky=(E, W), pady=4, ipady=3)
             b = ttk.Button(parent, text="Browse…", command=lambda: self._browse_file(self.geocode_ie_txt_path, parent))
             b.grid(row=row, column=2, padx=4, pady=4)
             self.file_rows.extend([e, b])
             row += 1
             ttk.Label(parent, text="Google Maps API key (optional if in .env):").grid(row=row, column=0, sticky=W, padx=(0, 8), pady=4)
-            e2 = Entry(parent, textvariable=self.geocode_api_key, width=40, show="*")
-            e2.grid(row=row, column=1, sticky=(E, W), pady=4)
+            e2 = self._styled_entry(parent, self.geocode_api_key, width=40, show="*")
+            e2.grid(row=row, column=1, sticky=(E, W), pady=4, ipady=3)
             self.file_rows.append(e2)
             row += 1
         for key in FILE_OPTIONS:
@@ -1009,8 +1526,8 @@ class MigrationWizard:
             var = StringVar(value=(existing or "").strip())
             self.file_paths[key] = var  # keep ref
             ttk.Label(parent, text=label).grid(row=row, column=0, sticky=W, padx=(0, 8), pady=4)
-            e = Entry(parent, textvariable=var, width=40)
-            e.grid(row=row, column=1, sticky=(E, W), pady=4)
+            e = self._styled_entry(parent, var, width=40)
+            e.grid(row=row, column=1, sticky=(E, W), pady=4, ipady=3)
             if OPT_FILE_TYPE.get(key) == "folder":
                 cmd = lambda v=var, p=parent: self._browse_folder(v, p)
             else:
@@ -1024,8 +1541,8 @@ class MigrationWizard:
                 ttk.Label(parent, text="Visit date (YYYY-MM-DD):").grid(
                     row=row, column=0, sticky=W, padx=(0, 8), pady=4
                 )
-                date_entry = Entry(parent, textvariable=self.update_today_visits_date, width=40)
-                date_entry.grid(row=row, column=1, sticky=(E, W), pady=4)
+                date_entry = self._styled_entry(parent, self.update_today_visits_date, width=40)
+                date_entry.grid(row=row, column=1, sticky=(E, W), pady=4, ipady=3)
                 self.file_rows.append(date_entry)
                 row += 1
         # Ensure scroll region updates after content is built; re-bind wheel for new rows (Windows)
@@ -1058,21 +1575,36 @@ class MigrationWizard:
         body = self._create_scrollable_area(parent, "summary")
         body.columnconfigure(0, weight=1)
         row = self._add_step_header(body, 0)
-        ttk.Label(body, text="Review and confirm", font=("", 13, "bold")).grid(
-            row=row, column=0, sticky=W, pady=(0, 6)
+        ttk.Label(body, text="Review and confirm", style="Title.TLabel").grid(
+            row=row, column=0, sticky=W, pady=(0, 4)
         )
         row += 1
         self._wrap_label(
             body,
             "Review the summary. \"Start migration\" runs each step in order and writes a log file. "
             "You must accept the privacy policy to continue.",
+            style="Lead.TLabel",
             padding=(0, 4),
-        ).grid(row=row, column=0, sticky=W, pady=(0, 10))
+        ).grid(row=row, column=0, sticky=W, pady=(0, 12))
         row += 1
-        self.summary_text = scrolledtext.ScrolledText(
-            body, height=12, width=72, wrap="word", state="disabled"
+        colors = self._ui_colors
+        summary_wrap, self.summary_text, _, _ = self._make_scrolled_text(
+            body,
+            horizontal=False,
+            height=12,
+            width=72,
+            wrap="word",
+            state="disabled",
+            font=_default_ui_font(12),
+            background=colors.get("card", "#ffffff"),
+            foreground=colors.get("text", "#0f172a"),
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground=colors.get("border", "#e2e8f0"),
+            padx=12,
+            pady=10,
         )
-        self.summary_text.grid(row=row, column=0, sticky=(N, S, E, W), pady=(4, 8))
+        summary_wrap.grid(row=row, column=0, sticky=(N, S, E, W), pady=(4, 10))
         body.rowconfigure(row, weight=1)
         row += 1
         cb = ttk.Checkbutton(
@@ -1082,7 +1614,7 @@ class MigrationWizard:
         )
         cb.grid(row=row, column=0, sticky=W, pady=(4, 4))
         row += 1
-        link = ttk.Label(body, text=PRIVACY_URL, foreground="blue", cursor="hand2")
+        link = ttk.Label(body, text=PRIVACY_URL, style="Link.TLabel", cursor="hand2")
         link.grid(row=row, column=0, sticky=W, pady=(0, 4))
         link.bind("<Button-1>", lambda e: webbrowser.open(PRIVACY_URL))
         _bind_mousewheel_recursive(
@@ -1117,25 +1649,76 @@ class MigrationWizard:
 
     def _build_step_run(self, parent):
         parent.columnconfigure(0, weight=1)
-        parent.rowconfigure(2, weight=1)
         row = self._add_step_header(parent, 0)
         self.run_title_label = ttk.Label(
-            parent, text="Migration in progress", font=("", 13, "bold")
+            parent, text="Migration in progress", style="Title.TLabel"
         )
-        self.run_title_label.grid(row=row, column=0, sticky=W, pady=(0, 6))
+        self.run_title_label.grid(row=row, column=0, sticky=W, pady=(0, 4))
         row += 1
         self.run_help_label = self._wrap_label(
             parent,
             RUN_HELP_MIGRATION,
+            style="Lead.TLabel",
             padding=(0, 4),
         )
-        self.run_help_label.grid(row=row, column=0, sticky=W, pady=(0, 10))
+        self.run_help_label.grid(row=row, column=0, sticky=W, pady=(0, 12))
         row += 1
-        self.run_log = scrolledtext.ScrolledText(
-            parent, height=16, width=72, wrap="word", state="disabled"
+
+        log_card = ttk.Frame(parent, style="Card.TFrame", padding=(12, 10))
+        log_card.grid(row=row, column=0, sticky=(E, W), pady=(0, 8))
+        log_card.columnconfigure(1, weight=1)
+        toolbar = ttk.Frame(log_card, style="Toolbar.TFrame")
+        toolbar.grid(row=0, column=0, columnspan=8, sticky=(E, W), pady=(0, 2))
+        toolbar.columnconfigure(1, weight=1)
+        ttk.Label(toolbar, text="Search", style="Toolbar.TLabel").grid(row=0, column=0, sticky=W, padx=(0, 6))
+        self.log_search_entry = self._styled_entry(toolbar, self.log_search_var, width=28)
+        self.log_search_entry.grid(row=0, column=1, sticky=(E, W), padx=(0, 6), ipady=2)
+        self.log_search_entry.bind("<Return>", lambda e: self._log_find_next())
+        ttk.Button(toolbar, text="Find", command=self._log_find_next).grid(row=0, column=2, padx=2)
+        ttk.Button(toolbar, text="Clear", command=self._log_clear_search, style="Ghost.TButton").grid(row=0, column=3, padx=2)
+        ttk.Label(toolbar, text="Filter", style="Toolbar.TLabel").grid(row=0, column=4, sticky=W, padx=(12, 6))
+        self.log_filter = ttk.Combobox(
+            toolbar,
+            textvariable=self.log_filter_var,
+            values=["All", "FAIL", "PASS", "PAIR", "SUMMARY", "DELETED", "MUST/ONLY"],
+            state="readonly",
+            width=12,
         )
-        self.run_log.grid(row=row, column=0, sticky=(N, S, E, W), pady=(4, 8))
+        self.log_filter.grid(row=0, column=5, padx=(0, 6))
+        self.log_filter.bind("<<ComboboxSelected>>", lambda e: self._log_apply_filter())
+        ttk.Button(toolbar, text="Copy", command=self._log_copy_visible).grid(row=0, column=6, padx=2)
+        ttk.Button(toolbar, text="Open log", command=self._log_open_file).grid(row=0, column=7, padx=2)
         row += 1
+
+        colors = self._ui_colors
+        mono = _mono_ui_font(11)
+        log_wrap, self.run_log, _, _ = self._make_scrolled_text(
+            parent,
+            horizontal=True,
+            height=18,
+            width=88,
+            wrap="none",
+            state="disabled",
+            font=mono,
+            background="#0b1220",
+            foreground="#e2e8f0",
+            insertbackground="#e2e8f0",
+            selectbackground="#334155",
+            borderwidth=0,
+            highlightthickness=1,
+            highlightbackground=colors.get("border", "#e2e8f0"),
+            padx=12,
+            pady=12,
+        )
+        log_wrap.grid(row=row, column=0, sticky=(N, S, E, W), pady=(0, 2))
+        parent.rowconfigure(row, weight=1)
+        self._configure_run_log_tags()
+        row += 1
+
+        self.log_status_label = ttk.Label(parent, text="", style="Muted.TLabel")
+        self.log_status_label.grid(row=row, column=0, sticky=W, pady=(6, 4))
+        row += 1
+
         self._connection_lost_frame = ttk.Frame(parent)
         self._connection_lost_frame.grid(row=row, column=0, sticky=(E, W), pady=(4, 4))
         self._connection_lost_frame.columnconfigure(0, weight=1)
@@ -1143,21 +1726,23 @@ class MigrationWizard:
             self._connection_lost_frame,
             text="",
             wraplength=560,
-            foreground="darkred",
-            font=("", 10, "bold"),
+            foreground=colors.get("danger", "#dc2626"),
+            font=_default_ui_font(11, "bold"),
         )
         self._register_wrap(self._connection_lost_label)
         self._connection_lost_label.grid(row=0, column=0, sticky=W)
         self._connection_lost_frame.grid_remove()
         row += 1
         self.run_progress = ttk.Progressbar(parent, mode="indeterminate")
-        self.run_progress.grid(row=row, column=0, sticky=(E, W), pady=(0, 4))
+        self.run_progress.grid(row=row, column=0, sticky=(E, W), pady=(4, 4))
 
     def _show_step(self, step: int):
         self.current_step = step
         for i, f in enumerate(self.frames):
             f.grid_remove() if i != step else f.grid()
-        is_test = self.wizard_mode.get() == MODE_TEST_TODAY
+        mode = self.wizard_mode.get()
+        is_test = mode == MODE_TEST_TODAY
+        is_pref = mode == MODE_PREFERENCE_CHECK
         if is_test:
             titles = {
                 STEP_WELCOME: "Step 1 of 3 – Welcome",
@@ -1165,6 +1750,13 @@ class MigrationWizard:
                 STEP_RUN: "Step 3 of 3 – Running validation",
             }
             self.step_label.config(text=titles.get(step, LABEL_VALIDATE_ROSTER))
+        elif is_pref:
+            titles = {
+                STEP_WELCOME: "Step 1 of 3 – Welcome",
+                STEP_PREFERENCE_CHECK: "Step 2 of 3 – Caregiver & VisitExport",
+                STEP_RUN: "Step 3 of 3 – Running Preference Check",
+            }
+            self.step_label.config(text=titles.get(step, LABEL_PREFERENCE_CHECK))
         else:
             titles = [
                 "Step 1 of 6 – Welcome",
@@ -1188,6 +1780,7 @@ class MigrationWizard:
             STEP_WELCOME: "welcome",
             STEP_DB: "db",
             STEP_TEST_TODAY: "validate",
+            STEP_PREFERENCE_CHECK: "prefcheck",
             STEP_SUMMARY: "summary",
             STEP_CHECKBOXES: "checkbox",
             STEP_FILES: "files",
@@ -1196,7 +1789,7 @@ class MigrationWizard:
             self._bind_step_scroll(scroll_prefixes[step])
 
         # Show/hide Check files button for file selection step
-        if step == STEP_FILES and not is_test:
+        if step == STEP_FILES and not is_test and not is_pref:
             self._refresh_file_step()
             self.btn_check_files.pack(side="right", padx=4)
         else:
@@ -1214,6 +1807,9 @@ class MigrationWizard:
             if is_test:
                 self.run_title_label.config(text="%s in progress" % LABEL_VALIDATE_ROSTER)
                 self.run_help_label.config(text=RUN_HELP_VALIDATE)
+            elif is_pref:
+                self.run_title_label.config(text="%s in progress" % LABEL_PREFERENCE_CHECK)
+                self.run_help_label.config(text=RUN_HELP_PREFERENCE_CHECK)
             else:
                 self.run_title_label.config(text="Migration in progress")
                 self.run_help_label.config(text=RUN_HELP_MIGRATION)
@@ -1224,6 +1820,8 @@ class MigrationWizard:
                 self.btn_continue.config(text="Start migration")
             elif step == STEP_TEST_TODAY:
                 self.btn_continue.config(text="Start validation")
+            elif step == STEP_PREFERENCE_CHECK:
+                self.btn_continue.config(text="Start Preference Check")
             else:
                 self.btn_continue.config(text="Continue")
 
@@ -1297,9 +1895,7 @@ class MigrationWizard:
         self.btn_run_again.pack_forget()
         self.btn_check_migration.pack_forget()
         self.btn_back.config(state="disabled")
-        self.run_log.config(state="normal")
-        self.run_log.delete("1.0", "end")
-        self.run_log.config(state="disabled")
+        self._log_clear_widget()
         log_path = PROJECT_ROOT / ("test_today_%s.log" % datetime.now().strftime("%Y%m%d_%H%M%S"))
         self._run_log_path = log_path
         self._append_log("Log file: %s\n" % log_path)
@@ -1366,17 +1962,94 @@ class MigrationWizard:
                 % log_path,
             )
 
+    def _run_preference_check(self):
+        """Start Preference Check in a background thread."""
+        self._run_cancelled = False
+        self._run_in_progress = True
+        self._hide_retry_continue_buttons()
+        self.btn_run_again.pack_forget()
+        self.btn_check_migration.pack_forget()
+        self.btn_back.config(state="disabled")
+        self._log_clear_widget()
+        log_path = PROJECT_ROOT / (
+            "preference_check_%s.log" % datetime.now().strftime("%Y%m%d_%H%M%S")
+        )
+        self._run_log_path = log_path
+        self._append_log("Log file: %s\n" % log_path)
+        self.run_progress.start()
+        thread = threading.Thread(
+            target=self._do_run_preference_check, args=(log_path,), daemon=True
+        )
+        thread.start()
+
+    def _do_run_preference_check(self, log_path: Path):
+        all_msgs: list = []
+        ok = False
+        try:
+            if str(BUNDLE_ROOT) not in sys.path:
+                sys.path.insert(0, str(BUNDLE_ROOT))
+            from feasible_pairs_migration.preference_check import run_preference_check
+
+            def _log_line(msg):
+                all_msgs.append(msg)
+                self.root.after(0, lambda m=msg: self._append_log(m + "\n"))
+
+            ok, msgs = run_preference_check(
+                visit_export_path=self.pref_check_visit_export.get().strip(),
+                first_name=self.pref_check_first_name.get().strip(),
+                last_name=self.pref_check_last_name.get().strip(),
+                log_callback=_log_line,
+            )
+            if msgs and not all_msgs:
+                all_msgs = list(msgs)
+        except Exception as e:
+            err = "%s error: %s" % (LABEL_PREFERENCE_CHECK, e)
+            all_msgs.append(err)
+            self.root.after(0, lambda m=err: self._append_log(m + "\n"))
+            logging.exception("%s failed", LABEL_PREFERENCE_CHECK)
+            ok = False
+        finally:
+            try:
+                log_path.write_text("\n".join(all_msgs) + "\n", encoding="utf-8")
+            except OSError:
+                pass
+            self.run_progress.stop()
+            self.root.after(0, lambda: self._preference_check_finished(log_path, ok))
+
+    def _preference_check_finished(self, log_path: Path, ok: bool):
+        self._run_in_progress = False
+        self._append_log("\nDetailed log saved to: %s\n" % log_path)
+        self.btn_cancel.config(state="normal")
+        self.btn_cancel.config(text="Close")
+        self.btn_back.config(state="normal")
+        self.btn_run_again.pack(side="right", padx=4)
+        if ok:
+            self._append_log("\nDone successfully.\n")
+            messagebox.showinfo(
+                LABEL_PREFERENCE_CHECK,
+                "Preference Check finished.\n\nSearch PAIR / SUMMARY lines in the log.\n\nLog saved to:\n%s"
+                % log_path,
+            )
+        else:
+            self._append_log("\nFinished with errors.\n")
+            messagebox.showwarning(
+                LABEL_PREFERENCE_CHECK,
+                "Preference Check failed. Review the log on this screen.\n\nLog file:\n%s"
+                % log_path,
+            )
+
     def _on_run_again(self):
-        """Re-run the full migration / Validate today's roster (same options and files)."""
+        """Re-run the full migration / Validate today's roster / Preference Check."""
         self.btn_run_again.pack_forget()
         self.btn_check_migration.pack_forget()
         self.btn_cancel.config(text="Cancel")
         self.btn_back.config(state="disabled")
-        self.run_log.config(state="normal")
-        self.run_log.delete("1.0", "end")
-        self.run_log.config(state="disabled")
-        if self.wizard_mode.get() == MODE_TEST_TODAY:
+        self._log_clear_widget()
+        mode = self.wizard_mode.get()
+        if mode == MODE_TEST_TODAY:
             self._run_test_today()
+        elif mode == MODE_PREFERENCE_CHECK:
+            self._run_preference_check()
         else:
             self._run_migrations(start_from=0)
 
@@ -1444,11 +2117,16 @@ class MigrationWizard:
             self.test_today_date.set(datetime.now().strftime("%Y-%m-%d"))
             self.test_today_base_url.set(os.getenv("API_BASE_URL", "http://localhost:3000"))
             self.test_today_token.set(os.getenv("API_TOKEN", ""))
+        elif step == STEP_PREFERENCE_CHECK:
+            self.pref_check_first_name.set("")
+            self.pref_check_last_name.set("")
+            self.pref_check_visit_export.set("")
 
     def _on_back(self):
         if self.current_step <= 0:
             return
-        if self.wizard_mode.get() == MODE_TEST_TODAY:
+        mode = self.wizard_mode.get()
+        if mode == MODE_TEST_TODAY:
             if self.current_step == STEP_TEST_TODAY:
                 self._clear_step_inputs(STEP_TEST_TODAY)
                 self._show_step(STEP_WELCOME)
@@ -1459,14 +2137,28 @@ class MigrationWizard:
                 self._hide_retry_continue_buttons()
                 self._show_step(STEP_TEST_TODAY)
             return
+        if mode == MODE_PREFERENCE_CHECK:
+            if self.current_step == STEP_PREFERENCE_CHECK:
+                self._clear_step_inputs(STEP_PREFERENCE_CHECK)
+                self._show_step(STEP_WELCOME)
+            elif self.current_step == STEP_RUN:
+                self.btn_run_again.pack_forget()
+                self.btn_check_migration.pack_forget()
+                self.btn_cancel.config(text="Cancel")
+                self._hide_retry_continue_buttons()
+                self._show_step(STEP_PREFERENCE_CHECK)
+            return
         prev_step = self.current_step - 1
         self._clear_step_inputs(prev_step)
         self._show_step(prev_step)
 
     def _on_continue(self):
         if self.current_step == STEP_WELCOME:
-            if self.wizard_mode.get() == MODE_TEST_TODAY:
+            mode = self.wizard_mode.get()
+            if mode == MODE_TEST_TODAY:
                 self._show_step(STEP_TEST_TODAY)
+            elif mode == MODE_PREFERENCE_CHECK:
+                self._show_step(STEP_PREFERENCE_CHECK)
             else:
                 self._show_step(STEP_DB)
             return
@@ -1475,6 +2167,12 @@ class MigrationWizard:
                 return
             self._show_step(STEP_RUN)
             self._run_test_today()
+            return
+        if self.current_step == STEP_PREFERENCE_CHECK:
+            if not self._validate_preference_check():
+                return
+            self._show_step(STEP_RUN)
+            self._run_preference_check()
             return
         if self.current_step == STEP_DB:
             if not self._validate_db():
@@ -1494,6 +2192,31 @@ class MigrationWizard:
                 return
             self._show_step(STEP_RUN)
             self._run_migrations()
+
+    def _validate_preference_check(self):
+        first = self.pref_check_first_name.get().strip()
+        last = self.pref_check_last_name.get().strip()
+        path = self.pref_check_visit_export.get().strip()
+        title = LABEL_PREFERENCE_CHECK
+        if not first:
+            messagebox.showwarning(title, "Please enter the caregiver first name.")
+            return False
+        if not last:
+            messagebox.showwarning(title, "Please enter the caregiver last name.")
+            return False
+        if not path:
+            messagebox.showwarning(title, "Please select the VisitExport CSV file.")
+            return False
+        if not Path(path).exists():
+            messagebox.showwarning(title, "VisitExport file does not exist:\n%s" % path)
+            return False
+        if not path.lower().endswith(".csv"):
+            messagebox.showwarning(
+                title,
+                "VisitExport should be a CSV file (same format as feasible-pairs migration).",
+            )
+            return False
+        return True
 
     def _validate_test_today(self):
         client_hours = self.test_today_client_hours.get().strip()
@@ -1634,6 +2357,7 @@ class MigrationWizard:
             self._run_log_path = log_path
             self._append_log("\n--- Resuming from step %d: %s ---\n" % (start_from + 1, order[start_from][0]))
         else:
+            self._log_clear_widget()
             log_path = PROJECT_ROOT / ("migration_wizard_%s.log" % datetime.now().strftime("%Y%m%d_%H%M%S"))
             self._run_log_path = log_path
             self._append_log("Log file: %s\n" % log_path)
@@ -1643,11 +2367,183 @@ class MigrationWizard:
         thread.start()
 
     def _append_log(self, msg: str):
+        if msg:
+            self._log_lines_cache.append(msg)
+        filt = (self.log_filter_var.get() or "All").strip()
+        if filt != "All" and not self._log_line_matches_filter(msg, filt):
+            self.root.update_idletasks()
+            return
         self.run_log.config(state="normal")
+        start = self.run_log.index("end-1c")
         self.run_log.insert("end", msg)
+        end = self.run_log.index("end-1c")
+        for tag in self._log_line_tags(msg):
+            self.run_log.tag_add(tag, start, end)
         self.run_log.see("end")
         self.run_log.config(state="disabled")
         self.root.update_idletasks()
+
+    def _configure_run_log_tags(self):
+        colors = getattr(self, "_ui_colors", {})
+        mono_bold = _mono_ui_font(11, "bold")
+        self.run_log.tag_configure("fail", foreground=colors.get("fail", "#fca5a5"))
+        self.run_log.tag_configure("pass", foreground=colors.get("pass", "#86efac"))
+        self.run_log.tag_configure("pair", foreground=colors.get("pair", "#93c5fd"))
+        self.run_log.tag_configure("only", foreground=colors.get("only", "#c4b5fd"))
+        self.run_log.tag_configure("must", foreground=colors.get("must", "#7dd3fc"))
+        self.run_log.tag_configure("summary", foreground=colors.get("summary", "#fdba74"), font=mono_bold)
+        self.run_log.tag_configure("warn", foreground=colors.get("warn", "#fcd34d"))
+        self.run_log.tag_configure("pref", foreground="#5eead4")
+        self.run_log.tag_configure("section", foreground="#94a3b8")
+        self.run_log.tag_configure(
+            "search_hit",
+            background=colors.get("search_bg", "#fde68a"),
+            foreground="#111827",
+        )
+
+    def _log_line_tags(self, line: str):
+        upper = (line or "").upper()
+        tags = []
+        if line.startswith("---") or line.startswith("==="):
+            tags.append("section")
+        if "FAIL" in upper:
+            tags.append("fail")
+        elif "PASS" in upper or "DONE SUCCESSFULLY" in upper:
+            tags.append("pass")
+        if upper.startswith("PAIR ") or "\nPAIR " in upper:
+            tags.append("pair")
+        if "CATEGORY=ONLY" in upper:
+            tags.append("only")
+        if "CATEGORY=MUST" in upper:
+            tags.append("must")
+        if upper.startswith("SUMMARY ") or "\nSUMMARY " in upper or " SUMMARY " in upper:
+            tags.append("summary")
+        if "WARN" in upper or "DELETED" in upper:
+            tags.append("warn")
+        if upper.startswith("PREF_CHECK") or "PREFERENCE CHECK" in upper:
+            tags.append("pref")
+        return tags
+
+    def _log_line_matches_filter(self, line: str, filt: str) -> bool:
+        if not line:
+            return True
+        u = line.upper()
+        if filt == "FAIL":
+            return "FAIL" in u
+        if filt == "PASS":
+            return "PASS" in u
+        if filt == "PAIR":
+            return u.lstrip().startswith("PAIR ") or "\nPAIR " in u
+        if filt == "SUMMARY":
+            return "SUMMARY" in u
+        if filt == "DELETED":
+            return "DELETED" in u
+        if filt == "MUST/ONLY":
+            return "CATEGORY=MUST" in u or "CATEGORY=ONLY" in u
+        return True
+
+    def _log_clear_widget(self):
+        self.run_log.config(state="normal")
+        self.run_log.delete("1.0", "end")
+        self.run_log.config(state="disabled")
+        self._log_lines_cache = []
+        self._log_search_start = "1.0"
+        self.log_filter_var.set("All")
+        if hasattr(self, "log_status_label"):
+            self.log_status_label.config(text="")
+
+    def _log_apply_filter(self):
+        filt = (self.log_filter_var.get() or "All").strip()
+        self.run_log.config(state="normal")
+        self.run_log.delete("1.0", "end")
+        shown = 0
+        for chunk in self._log_lines_cache:
+            if filt == "All" or self._log_line_matches_filter(chunk, filt):
+                start = self.run_log.index("end-1c")
+                self.run_log.insert("end", chunk)
+                end = self.run_log.index("end-1c")
+                for tag in self._log_line_tags(chunk):
+                    self.run_log.tag_add(tag, start, end)
+                shown += chunk.count("\n") or (1 if chunk.strip() else 0)
+        self.run_log.config(state="disabled")
+        total = sum(c.count("\n") or (1 if c.strip() else 0) for c in self._log_lines_cache)
+        if hasattr(self, "log_status_label"):
+            if filt == "All":
+                self.log_status_label.config(text="%d log lines" % total)
+            else:
+                self.log_status_label.config(
+                    text="Showing %d / %d lines (filter: %s)" % (shown, total, filt)
+                )
+        self._log_clear_search(keep_query=True)
+
+    def _log_find_next(self):
+        query = self.log_search_var.get().strip()
+        if not query:
+            if hasattr(self, "log_status_label"):
+                self.log_status_label.config(text="Enter a search term (e.g. FAIL, PAIR, DELETED).")
+            return
+        self.run_log.tag_remove("search_hit", "1.0", "end")
+        self.run_log.config(state="normal")
+        pos = self.run_log.search(query, self._log_search_start, stopindex="end", nocase=True)
+        if not pos:
+            pos = self.run_log.search(query, "1.0", stopindex="end", nocase=True)
+            if not pos:
+                self.run_log.config(state="disabled")
+                if hasattr(self, "log_status_label"):
+                    self.log_status_label.config(text="No matches for %r" % query)
+                return
+        end = "%s+%dc" % (pos, len(query))
+        self.run_log.tag_add("search_hit", pos, end)
+        self.run_log.see(pos)
+        self._log_search_start = end
+        count = 0
+        idx = "1.0"
+        while True:
+            idx = self.run_log.search(query, idx, stopindex="end", nocase=True)
+            if not idx:
+                break
+            count += 1
+            idx = "%s+%dc" % (idx, len(query))
+        self.run_log.config(state="disabled")
+        if hasattr(self, "log_status_label"):
+            self.log_status_label.config(
+                text="%d match(es) for %r — press Find for next" % (count, query)
+            )
+
+    def _log_clear_search(self, keep_query=False):
+        self.run_log.tag_remove("search_hit", "1.0", "end")
+        self._log_search_start = "1.0"
+        if not keep_query:
+            self.log_search_var.set("")
+            if hasattr(self, "log_status_label"):
+                self.log_status_label.config(text="")
+
+    def _log_copy_visible(self):
+        text = self.run_log.get("1.0", "end-1c")
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        if hasattr(self, "log_status_label"):
+            self.log_status_label.config(
+                text="Copied visible log to clipboard (%d chars)" % len(text)
+            )
+
+    def _log_open_file(self):
+        path = self._run_log_path
+        if not path or not Path(path).exists():
+            messagebox.showinfo("Open log", "No log file yet for this run.")
+            return
+        path = str(path)
+        try:
+            if sys.platform == "darwin":
+                os.system("open %r" % path)
+            elif sys.platform.startswith("win"):
+                os.startfile(path)  # type: ignore[attr-defined]
+            else:
+                os.system("xdg-open %r" % path)
+        except Exception as e:
+            messagebox.showwarning(
+                "Open log", "Could not open log file:\n%s\n\n%s" % (path, e)
+            )
 
     def _do_run(self, log_path: Path, order: list, start_from: int = 0):
         import io
