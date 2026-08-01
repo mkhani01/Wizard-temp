@@ -415,6 +415,88 @@ def calculate_pair_statuses(frequencies, pair_last_visit, customer_totals, datas
     return statuses
 
 
+def calculate_pair_weights_by_day(
+    frequencies_by_day, pair_last_visit_by_day, customer_totals_by_day, dataset_end,
+):
+    """
+    Normalized weights (0-1) per (caregiver, client, day_of_week).
+    day_of_week is Monday=0 … Sunday=6. Normalize per (client, day).
+    """
+    if not dataset_end:
+        return {}
+
+    status_factors = {
+        'Current Primary': 1.0,
+        'Support / Relief': 0.5,
+        'Former / Relief': 0.2,
+    }
+    occurrences_per_weekday = float(ROSTER_WEEKS)
+    raw_weights = {}
+    max_raw_by_client_day = defaultdict(float)
+
+    for pair_key, total_pair_day_visits in frequencies_by_day.items():
+        _, client_id, day_of_week = pair_key
+        client_day_key = (client_id, day_of_week)
+        total_cust_day_visits = customer_totals_by_day.get(client_day_key, 0)
+        if total_cust_day_visits <= 0:
+            raw_weights[pair_key] = 0.0
+            continue
+
+        last_visit = pair_last_visit_by_day.get(pair_key)
+        days_since_last_visit = 999
+        if last_visit:
+            days_since_last_visit = max((dataset_end - last_visit).days, 0)
+
+        overall_pct = round((total_pair_day_visits / total_cust_day_visits) * 100, 1)
+        carer_status = identify_carer_status(overall_pct, days_since_last_visit)
+
+        consistency = overall_pct / 100.0
+        visits_per_occurrence = total_cust_day_visits / occurrences_per_weekday
+        freq_factor = 1 + math.log1p(visits_per_occurrence)
+        recency_decay = math.exp(-days_since_last_visit / 21.0)
+        status_factor = status_factors.get(carer_status, 0.3)
+
+        raw_weight = consistency * freq_factor * recency_decay * status_factor
+        raw_weights[pair_key] = raw_weight
+
+        if raw_weight > max_raw_by_client_day[client_day_key]:
+            max_raw_by_client_day[client_day_key] = raw_weight
+
+    weights = {}
+    for pair_key, raw_weight in raw_weights.items():
+        _, client_id, day_of_week = pair_key
+        client_day_key = (client_id, day_of_week)
+        client_max = max_raw_by_client_day.get(client_day_key, 0.0)
+        weights[pair_key] = round(0.0 if client_max <= 0 else raw_weight / client_max, 4)
+    return weights
+
+
+def calculate_pair_statuses_by_day(
+    frequencies_by_day, pair_last_visit_by_day, customer_totals_by_day, dataset_end,
+):
+    """Return carer status per (caregiver_id, client_id, day_of_week) pair."""
+    statuses = {}
+    if not dataset_end:
+        return statuses
+
+    for pair_key, total_pair_day_visits in frequencies_by_day.items():
+        _, client_id, day_of_week = pair_key
+        client_day_key = (client_id, day_of_week)
+        total_cust_day_visits = customer_totals_by_day.get(client_day_key, 0)
+        if total_cust_day_visits <= 0:
+            continue
+
+        last_visit = pair_last_visit_by_day.get(pair_key)
+        days_since_last_visit = 999
+        if last_visit:
+            days_since_last_visit = max((dataset_end - last_visit).days, 0)
+
+        overall_pct = round((total_pair_day_visits / total_cust_day_visits) * 100, 1)
+        statuses[pair_key] = identify_carer_status(overall_pct, days_since_last_visit)
+
+    return statuses
+
+
 def find_roster_cutoff_date(csv_path):
     """
     Scan CSV for the latest valid visit date, then return cutoff for the last ROSTER_WEEKS.
@@ -443,17 +525,24 @@ def extract_visit_frequencies_from_csv(csv_path, users_lookup, clients_lookup):
     2. Limit to the last 16 weeks of data in the file
     3. Parse "Actual Employee Name" for caregiver
     4. Parse "Service Location Name" for client
-    5. Count (caregiver, client) pairs and compute normalized weight
+    5. Count overall (caregiver, client) and per-day (caregiver, client, day_of_week)
+       pairs; day_of_week is Monday=0 … Sunday=6
 
     Returns:
-      - frequencies: (caregiver_id, client_id) -> frequency
-      - weights: (caregiver_id, client_id) -> weight (0..1, rounded to 4 decimals)
-      - statuses: (caregiver_id, client_id) -> carer status string
+      - frequencies: (caregiver_id, client_id) -> frequency (overall, for profile prefs)
+      - weights: (caregiver_id, client_id) -> weight (overall)
+      - statuses: (caregiver_id, client_id) -> carer status string (overall)
       - stats
+      - frequencies_by_day: (caregiver_id, client_id, day_of_week) -> frequency
+      - weights_by_day: (caregiver_id, client_id, day_of_week) -> weight
     """
     frequencies = defaultdict(int)
     pair_last_visit = {}
     customer_totals = defaultdict(int)
+
+    frequencies_by_day = defaultdict(int)
+    pair_last_visit_by_day = {}
+    customer_totals_by_day = defaultdict(int)
     dataset_end = None
 
     stats = {
@@ -461,6 +550,7 @@ def extract_visit_frequencies_from_csv(csv_path, users_lookup, clients_lookup):
         'personal_care_rows': 0,
         'valid_rows': 0,
         'matched_pairs': 0,
+        'matched_day_pairs': 0,
         'unmatched_caregivers': set(),
         'unmatched_clients': set(),
         'skipped_non_personal_care': 0,
@@ -469,10 +559,11 @@ def extract_visit_frequencies_from_csv(csv_path, users_lookup, clients_lookup):
         'skipped_missing_carer': 0,
     }
 
+    empty = ({}, {}, {}, stats, {}, {})
     cutoff_date = find_roster_cutoff_date(csv_path)
     if cutoff_date is None:
         logger.warning("No valid visit dates found in CSV; nothing to process.")
-        return {}, {}, {}, stats
+        return empty
 
     logger.info("Reading CSV: %s", csv_path)
     logger.info(
@@ -557,6 +648,18 @@ def extract_visit_frequencies_from_csv(csv_path, users_lookup, clients_lookup):
                 customer_totals[client_id] += 1
                 if pair_key not in pair_last_visit or visit_start > pair_last_visit[pair_key]:
                     pair_last_visit[pair_key] = visit_start
+
+                day_of_week = visit_start.weekday()  # Monday=0 … Sunday=6
+                day_pair_key = (caregiver_id, client_id, day_of_week)
+                day_client_key = (client_id, day_of_week)
+                frequencies_by_day[day_pair_key] += 1
+                customer_totals_by_day[day_client_key] += 1
+                if (
+                    day_pair_key not in pair_last_visit_by_day
+                    or visit_start > pair_last_visit_by_day[day_pair_key]
+                ):
+                    pair_last_visit_by_day[day_pair_key] = visit_start
+
                 if dataset_end is None or visit_start > dataset_end:
                     dataset_end = visit_start
                 stats['valid_rows'] += 1
@@ -572,10 +675,15 @@ def extract_visit_frequencies_from_csv(csv_path, users_lookup, clients_lookup):
     
     # Calculate total matched pairs (sum of all frequencies)
     stats['matched_pairs'] = len(frequencies)
+    stats['matched_day_pairs'] = len(frequencies_by_day)
     stats['total_visits'] = sum(frequencies.values())
     weights = calculate_pair_weights(frequencies, pair_last_visit, customer_totals, dataset_end)
     statuses = calculate_pair_statuses(frequencies, pair_last_visit, customer_totals, dataset_end)
+    weights_by_day = calculate_pair_weights_by_day(
+        frequencies_by_day, pair_last_visit_by_day, customer_totals_by_day, dataset_end,
+    )
     stats['weighted_pairs'] = len(weights)
+    stats['weighted_day_pairs'] = len(weights_by_day)
     stats['current_primary_pairs'] = sum(1 for s in statuses.values() if s == "Current Primary")
     
     logger.info(f"\nProcessing complete!")
@@ -587,7 +695,9 @@ def extract_visit_frequencies_from_csv(csv_path, users_lookup, clients_lookup):
     logger.info(f"  Personal Care rows: {stats['personal_care_rows']}")
     logger.info(f"  Valid visit records: {stats['valid_rows']}")
     logger.info(f"  Unique caregiver-client pairs: {stats['matched_pairs']}")
+    logger.info(f"  Unique caregiver-client-day rows: {stats['matched_day_pairs']}")
     logger.info(f"  Pairs with calculated weight: {stats['weighted_pairs']}")
+    logger.info(f"  Day pairs with calculated weight: {stats['weighted_day_pairs']}")
     logger.info(f"  Total visits recorded: {stats['total_visits']}")
     logger.info(f"  Unique unmatched caregivers: {len(stats['unmatched_caregivers'])}")
     logger.info(f"  Unique unmatched clients: {len(stats['unmatched_clients'])}")
@@ -602,7 +712,7 @@ def extract_visit_frequencies_from_csv(csv_path, users_lookup, clients_lookup):
         for name in list(stats['unmatched_clients'])[:10]:
             logger.info(f"  - {name}")
     
-    return frequencies, weights, statuses, stats
+    return frequencies, weights, statuses, stats, frequencies_by_day, weights_by_day
 
 
 def truncate_feasible_pairs(connection):
@@ -621,31 +731,31 @@ def truncate_feasible_pairs(connection):
         cursor.close()
 
 
-def seed_feasible_pairs(connection, frequencies, weights):
+def seed_feasible_pairs(connection, frequencies_by_day, weights_by_day):
     """
-    Insert feasible pairs after table truncate.
-    Each row includes frequency and normalized weight.
+    Insert per-day feasible pairs after table truncate.
+    Each row includes frequency, normalized weight, and day_of_week (Mon=0…Sun=6).
     """
-    if not frequencies:
+    if not frequencies_by_day:
         logger.warning("No frequency data to insert.")
         return False
 
     cursor = connection.cursor()
     try:
         pairs_data = [
-            (cgid, cid, freq, float(weights.get((cgid, cid), 0.0)))
-            for (cgid, cid), freq in frequencies.items()
+            (cgid, cid, freq, float(weights_by_day.get((cgid, cid, dow), 0.0)), dow)
+            for (cgid, cid, dow), freq in frequencies_by_day.items()
         ]
         logger.info("\nSeeding feasible pairs to database (fresh insert after truncate)...")
-        logger.info(f"  Pairs to insert: {len(pairs_data)}")
+        logger.info(f"  Day pairs to insert: {len(pairs_data)}")
 
         insert_query = """
-            INSERT INTO feasible_pairs (cgid, client_id, frequency, weight)
+            INSERT INTO feasible_pairs (cgid, client_id, frequency, weight, day_of_week)
             VALUES %s
         """
-        execute_values(cursor, insert_query, pairs_data, template="(%s, %s, %s, %s)")
+        execute_values(cursor, insert_query, pairs_data, template="(%s, %s, %s, %s, %s)")
         connection.commit()
-        logger.info(f"✓ Successfully inserted {len(pairs_data)} feasible pairs")
+        logger.info(f"✓ Successfully inserted {len(pairs_data)} feasible pairs (by day)")
         return True
 
     except (OperationalError, InterfaceError) as e:
@@ -735,10 +845,13 @@ def run(csv_path=None, connection_manager=None, state=None):
         logger.info("\n" + "="*60)
         logger.info("STEP 4: EXTRACT VISIT FREQUENCIES AND WEIGHTS FROM CSV")
         logger.info("="*60)
-        frequencies, weights, statuses, stats = extract_visit_frequencies_from_csv(
+        (
+            frequencies, weights, statuses, stats,
+            frequencies_by_day, weights_by_day,
+        ) = extract_visit_frequencies_from_csv(
             csv_path, users_lookup, clients_lookup,
         )
-        if not frequencies:
+        if not frequencies_by_day:
             logger.warning("No valid visit frequencies found in CSV")
             return False
         logger.info("\n" + "="*60)
@@ -746,9 +859,9 @@ def run(csv_path=None, connection_manager=None, state=None):
         logger.info("="*60)
         truncate_feasible_pairs(connection)
         logger.info("\n" + "="*60)
-        logger.info("STEP 6: SEED FEASIBLE PAIRS TO DATABASE")
+        logger.info("STEP 6: SEED FEASIBLE PAIRS TO DATABASE (BY DAY)")
         logger.info("="*60)
-        success = seed_feasible_pairs(connection, frequencies, weights)
+        success = seed_feasible_pairs(connection, frequencies_by_day, weights_by_day)
         if success:
             logger.info("\n" + "="*60)
             logger.info("STEP 7: REFRESH PROFILE PREFERENCES (Must / Preferred / Only)")
@@ -772,7 +885,8 @@ def run(csv_path=None, connection_manager=None, state=None):
             print(f"  - Personal Care rows: {stats['personal_care_rows']}")
             print(f"  - Valid visit records: {stats['valid_rows']}")
             print(f"  - Unique caregiver-client pairs: {stats['matched_pairs']}")
-            print(f"  - Pairs with calculated weight: {stats['weighted_pairs']}")
+            print(f"  - Unique caregiver-client-day rows: {stats['matched_day_pairs']}")
+            print(f"  - Day pairs with calculated weight: {stats.get('weighted_day_pairs', 0)}")
             print(f"  - Current Primary preferred pairs: {stats.get('current_primary_pairs', 0)}")
             print(f"  - Profile preferred: {stats.get('profile_preferred', 0)}")
             print(f"  - Profile must: {stats.get('profile_must', 0)}")

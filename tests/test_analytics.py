@@ -12,6 +12,8 @@ from feasible_pairs_migration.feasible_pairs_migration import (
     identify_carer_status,
     calculate_pair_weights,
     calculate_pair_statuses,
+    calculate_pair_weights_by_day,
+    calculate_pair_statuses_by_day,
     is_valid_feasibility_row,
     is_excluded_service_type,
     ROSTER_WINDOW_DAYS,
@@ -88,6 +90,92 @@ class TestFeasiblePairWeights(unittest.TestCase):
         )
         self.assertEqual(statuses[(10, client_id)], "Current Primary")
         self.assertEqual(statuses[(11, client_id)], "Former / Relief")
+
+
+class TestFeasiblePairWeightsByDay(unittest.TestCase):
+    def test_primary_carer_higher_weight_than_former_on_same_day(self):
+        dataset_end = datetime(2026, 2, 18)  # Wednesday
+        client_id = 1
+        dow = dataset_end.weekday()
+        cg_primary = 10
+        cg_former = 11
+
+        frequencies_by_day = {
+            (cg_primary, client_id, dow): 12,
+            (cg_former, client_id, dow): 2,
+        }
+        pair_last_visit_by_day = {
+            (cg_primary, client_id, dow): dataset_end - timedelta(days=7),
+            (cg_former, client_id, dow): dataset_end - timedelta(days=60),
+        }
+        customer_totals_by_day = defaultdict(int, {(client_id, dow): 14})
+
+        weights = calculate_pair_weights_by_day(
+            frequencies_by_day,
+            pair_last_visit_by_day,
+            customer_totals_by_day,
+            dataset_end,
+        )
+        self.assertGreater(
+            weights[(cg_primary, client_id, dow)],
+            weights[(cg_former, client_id, dow)],
+        )
+        self.assertEqual(weights[(cg_primary, client_id, dow)], 1.0)
+
+    def test_weights_normalize_independently_per_client_day(self):
+        dataset_end = datetime(2026, 2, 18)
+        monday = 0
+        tuesday = 1
+        client_id = 1
+
+        frequencies_by_day = {
+            (10, client_id, monday): 8,
+            (11, client_id, monday): 2,
+            (10, client_id, tuesday): 3,
+            (11, client_id, tuesday): 7,
+        }
+        pair_last_visit_by_day = {
+            (10, client_id, monday): dataset_end - timedelta(days=1),
+            (11, client_id, monday): dataset_end - timedelta(days=1),
+            (10, client_id, tuesday): dataset_end - timedelta(days=2),
+            (11, client_id, tuesday): dataset_end - timedelta(days=2),
+        }
+        customer_totals_by_day = defaultdict(
+            int, {(client_id, monday): 10, (client_id, tuesday): 10},
+        )
+
+        weights = calculate_pair_weights_by_day(
+            frequencies_by_day,
+            pair_last_visit_by_day,
+            customer_totals_by_day,
+            dataset_end,
+        )
+        self.assertEqual(weights[(10, client_id, monday)], 1.0)
+        self.assertEqual(weights[(11, client_id, tuesday)], 1.0)
+        self.assertLess(weights[(11, client_id, monday)], 1.0)
+        self.assertLess(weights[(10, client_id, tuesday)], 1.0)
+
+    def test_pair_statuses_by_day(self):
+        dataset_end = datetime(2026, 2, 18)
+        client_id = 1
+        dow = 2
+        frequencies_by_day = {
+            (10, client_id, dow): 12,
+            (11, client_id, dow): 2,
+        }
+        pair_last_visit_by_day = {
+            (10, client_id, dow): dataset_end - timedelta(days=7),
+            (11, client_id, dow): dataset_end - timedelta(days=60),
+        }
+        customer_totals_by_day = defaultdict(int, {(client_id, dow): 14})
+        statuses = calculate_pair_statuses_by_day(
+            frequencies_by_day,
+            pair_last_visit_by_day,
+            customer_totals_by_day,
+            dataset_end,
+        )
+        self.assertEqual(statuses[(10, client_id, dow)], "Current Primary")
+        self.assertEqual(statuses[(11, client_id, dow)], "Former / Relief")
 
 
 class TestFeasibilityRowFilters(unittest.TestCase):

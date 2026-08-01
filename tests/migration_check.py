@@ -1240,14 +1240,10 @@ def _parse_full_name_for_feasible(full_name: str) -> Tuple[Optional[str], Option
 
 def check_feasible_pairs(connection) -> Tuple[bool, List[str]]:
     """
-    Verify that all Personal Care pairs from the CSV exist in the feasible_pairs table.
+    Verify that all Personal Care caregiver-client-day pairs from the CSV
+    exist in the feasible_pairs table (day_of_week Monday=0 … Sunday=6).
 
-    Requirements:
-    - Read CSV file from assets directory
-    - Filter rows where both "Planned Service Type Description" AND
-      "Planned Service Requirement Type Description" equal "Personal Care"
-    - Parse "Planned Employee Name" (caregiver) and "Service Location Name" (client)
-    - Verify each pair exists in feasible_pairs table
+    Uses the same filters / 16-week window as feasible_pairs_migration.
     """
     msgs: List[str] = []
     csv_path = _get_assets_dir() / "visit_data.csv"
@@ -1256,10 +1252,28 @@ def check_feasible_pairs(connection) -> Tuple[bool, List[str]]:
         msgs.append("SKIP: Visit data CSV not found at %s" % csv_path)
         return True, msgs
 
+    try:
+        from feasible_pairs_migration.feasible_pairs_migration import (
+            find_roster_cutoff_date,
+            get_actual_employee_name,
+            is_valid_feasibility_row,
+            parse_full_name,
+            parse_visit_datetime,
+            ROSTER_WEEKS,
+            safe_strip,
+        )
+    except ImportError as e:
+        msgs.append("SKIP: Could not import feasible_pairs_migration helpers: %s" % e)
+        return True, msgs
+
+    cutoff_date = find_roster_cutoff_date(csv_path)
+    if cutoff_date is None:
+        msgs.append("SKIP: No valid visit dates found in CSV")
+        return True, msgs
+
     # Load user and client lookups from database
     cursor = connection.cursor()
     try:
-        # Load caregivers (users)
         cursor.execute("""
             SELECT id, name, lastname
             FROM "user"
@@ -1272,7 +1286,6 @@ def check_feasible_pairs(connection) -> Tuple[bool, List[str]]:
             key = (name.lower(), lastname.lower())
             users_lookup[key] = row['id']
 
-        # Load clients
         cursor.execute("""
             SELECT id, name, lastname
             FROM client
@@ -1285,21 +1298,22 @@ def check_feasible_pairs(connection) -> Tuple[bool, List[str]]:
             key = (name.lower(), lastname.lower())
             clients_lookup[key] = row['id']
 
-        # Load existing feasible pairs
         cursor.execute("""
-            SELECT cgid, client_id, frequency
+            SELECT cgid, client_id, day_of_week, frequency
             FROM feasible_pairs
         """)
         db_pairs = {}
         for row in cursor.fetchall():
-            key = (row['cgid'], row['client_id'])
+            dow = row['day_of_week']
+            if dow is None:
+                continue
+            key = (int(row['cgid']), int(row['client_id']), int(dow))
             db_pairs[key] = row['frequency']
 
     finally:
         cursor.close()
 
-    # Parse CSV and extract Personal Care pairs
-    expected_pairs = {}  # (caregiver_id, client_id) -> count
+    expected_pairs = {}  # (caregiver_id, client_id, day_of_week) -> count
     total_rows = 0
     personal_care_rows = 0
     skipped_non_personal_care = 0
@@ -1312,26 +1326,24 @@ def check_feasible_pairs(connection) -> Tuple[bool, List[str]]:
         for row in reader:
             total_rows += 1
 
-            # Filter: Only Personal Care rows
-            service_type = _safe_strip(row.get('Planned Service Type Description', ''))
-            requirement_type = _safe_strip(row.get('Planned Service Requirement Type Description', ''))
-
-            if service_type != 'Personal Care' or requirement_type != 'Personal Care':
+            if not is_valid_feasibility_row(row):
                 skipped_non_personal_care += 1
                 continue
 
             personal_care_rows += 1
 
-            # Get caregiver and client names
-            employee_name = _safe_strip(row.get('Planned Employee Name', ''))
-            location_name = _safe_strip(row.get('Service Location Name', ''))
+            employee_name = get_actual_employee_name(row)
+            location_name = safe_strip(row.get('Service Location Name', ''))
 
             if not employee_name or not location_name:
                 continue
 
-            # Parse names
-            employee_first, employee_last = _parse_full_name_for_feasible(employee_name)
-            client_first, client_last = _parse_full_name_for_feasible(location_name)
+            visit_start = parse_visit_datetime(row)
+            if not visit_start or visit_start < cutoff_date:
+                continue
+
+            employee_first, employee_last = parse_full_name(employee_name)
+            client_first, client_last = parse_full_name(location_name)
 
             if not employee_first or not employee_last:
                 unmatched_caregivers.add(employee_name)
@@ -1341,12 +1353,10 @@ def check_feasible_pairs(connection) -> Tuple[bool, List[str]]:
                 unmatched_clients.add(location_name)
                 continue
 
-            # Look up IDs
             caregiver_key = (employee_first.lower(), employee_last.lower())
             caregiver_id = users_lookup.get(caregiver_key)
 
             if not caregiver_id:
-                # Try alternative: first word of first name
                 first_part = employee_first.split()[0] if employee_first else ''
                 alt_key = (first_part.lower(), employee_last.lower())
                 caregiver_id = users_lookup.get(alt_key)
@@ -1355,14 +1365,13 @@ def check_feasible_pairs(connection) -> Tuple[bool, List[str]]:
             client_id = clients_lookup.get(client_key)
 
             if not client_id:
-                # Try alternative: first word of first name
                 first_part = client_first.split()[0] if client_first else ''
                 alt_key = (first_part.lower(), client_last.lower())
                 client_id = clients_lookup.get(alt_key)
 
-            # Record pair if both found
             if caregiver_id and client_id:
-                pair_key = (caregiver_id, client_id)
+                day_of_week = visit_start.weekday()
+                pair_key = (caregiver_id, client_id, day_of_week)
                 expected_pairs[pair_key] = expected_pairs.get(pair_key, 0) + 1
             else:
                 if not caregiver_id:
@@ -1370,16 +1379,17 @@ def check_feasible_pairs(connection) -> Tuple[bool, List[str]]:
                 if not client_id:
                     unmatched_clients.add(location_name)
 
-    # Check for missing pairs in database
     missing_pairs = []
     for pair_key, expected_frequency in expected_pairs.items():
         if pair_key not in db_pairs:
             missing_pairs.append(pair_key)
 
-    # Report results
-    msgs.append("Feasible Pairs: %d total CSV rows, %d Personal Care rows" % (total_rows, personal_care_rows))
-    msgs.append("  Expected pairs from CSV: %d" % len(expected_pairs))
-    msgs.append("  Pairs in database: %d" % len(db_pairs))
+    msgs.append(
+        "Feasible Pairs: %d total CSV rows, %d Personal Care rows (last %d weeks)"
+        % (total_rows, personal_care_rows, ROSTER_WEEKS)
+    )
+    msgs.append("  Expected caregiver-client-day pairs from CSV: %d" % len(expected_pairs))
+    msgs.append("  Day pairs in database: %d" % len(db_pairs))
 
     if unmatched_caregivers:
         msgs.append("WARN: %d caregiver(s) from CSV not found in DB:" % len(unmatched_caregivers))
@@ -1396,9 +1406,11 @@ def check_feasible_pairs(connection) -> Tuple[bool, List[str]]:
             msgs.append("  ... and %d more" % (len(unmatched_clients) - 10))
 
     if missing_pairs:
-        msgs.append("FAIL: %d pair(s) from CSV missing in feasible_pairs table:" % len(missing_pairs))
-        # Get names for display
-        for cgid, client_id in missing_pairs[:20]:
+        msgs.append(
+            "FAIL: %d caregiver-client-day pair(s) from CSV missing in feasible_pairs:"
+            % len(missing_pairs)
+        )
+        for cgid, client_id, dow in missing_pairs[:20]:
             cursor = connection.cursor()
             try:
                 cursor.execute('SELECT name, lastname FROM "user" WHERE id = %s', (cgid,))
@@ -1409,7 +1421,10 @@ def check_feasible_pairs(connection) -> Tuple[bool, List[str]]:
                 if user_row and client_row:
                     caregiver_name = "%s %s" % (user_row['name'], user_row['lastname'])
                     client_name = "%s %s" % (client_row['name'], client_row['lastname'])
-                    msgs.append("  - Caregiver: %s <-> Client: %s" % (caregiver_name, client_name))
+                    msgs.append(
+                        "  - Caregiver: %s <-> Client: %s (day=%d)"
+                        % (caregiver_name, client_name, dow)
+                    )
             finally:
                 cursor.close()
 
@@ -1418,7 +1433,10 @@ def check_feasible_pairs(connection) -> Tuple[bool, List[str]]:
 
     passed = not missing_pairs
     if passed:
-        msgs.append("PASS: All %d expected pairs found in feasible_pairs table" % len(expected_pairs))
+        msgs.append(
+            "PASS: All %d expected caregiver-client-day pairs found in feasible_pairs"
+            % len(expected_pairs)
+        )
 
     cursor = connection.cursor()
     try:
