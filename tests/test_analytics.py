@@ -11,6 +11,7 @@ from clientWindowsAnalyzer.main import (
     get_balanced_suggestion,
     _expand_window_if_near_requested,
     _finalize_suggested_window,
+    _window_from_requested_expanded,
 )
 from feasible_pairs_migration.feasible_pairs_migration import (
     identify_carer_status,
@@ -47,7 +48,7 @@ class TestExpandWindowIfNearRequested(unittest.TestCase):
         self.assertEqual(start, req_start - EXPAND_FROM_REQUESTED_MINS)
         self.assertEqual(end, req_end + EXPAND_FROM_REQUESTED_MINS)
 
-    def test_within_15_minutes_expands(self):
+    def test_within_40_minutes_expands(self):
         req_start, req_end = 8 * 60, 9 * 60
         start, end = _expand_window_if_near_requested(
             req_start - NEAR_REQUESTED_MINS,
@@ -60,7 +61,7 @@ class TestExpandWindowIfNearRequested(unittest.TestCase):
 
     def test_far_from_requested_unchanged(self):
         req_start, req_end = 8 * 60, 9 * 60
-        sugg_start, sugg_end = req_start + 30, req_end + 30
+        sugg_start, sugg_end = req_start + 50, req_end + 50
         start, end = _expand_window_if_near_requested(
             sugg_start, sugg_end, req_start, req_end,
         )
@@ -81,6 +82,12 @@ class TestExpandWindowIfNearRequested(unittest.TestCase):
             req_start, req_end, req_start, req_end,
         )
         self.assertEqual(start, 0)
+        self.assertEqual(end, req_end + EXPAND_FROM_REQUESTED_MINS)
+
+    def test_fallback_window_from_requested(self):
+        req_start, req_end = 8 * 60, 9 * 60
+        start, end = _window_from_requested_expanded(req_start, req_end)
+        self.assertEqual(start, req_start - EXPAND_FROM_REQUESTED_MINS)
         self.assertEqual(end, req_end + EXPAND_FROM_REQUESTED_MINS)
 
 

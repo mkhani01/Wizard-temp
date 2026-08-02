@@ -8,7 +8,8 @@ using the Patient_Analyzer + anomalies pipeline on all rows in the input file.
 Pipeline: Stage 1 (load/dedupe) → 2 (percentile windows) → 3 (conflict resolution) →
 3.5 (duration anomaly removal) → 3.7 (10%% suggested duration).
 
-Skipped DB records: number_of_care_givers >= 2, overlapping slots on same day, no CSV pattern match.
+Skipped DB records: number_of_care_givers >= 2, unavailability / not_send_to_engine.
+All other schedules get a window: CSV analysis when matched, else requested ±40.
 """
 
 import os
@@ -56,7 +57,7 @@ LOWER_PERCENTILE = 0.10
 UPPER_PERCENTILE = 0.90
 MIN_WINDOW_WIDTH_MINS = 60
 TOLERANCE_MINS = 15
-NEAR_REQUESTED_MINS = 15
+NEAR_REQUESTED_MINS = 40
 EXPAND_FROM_REQUESTED_MINS = 40
 FLEXIBILITY_THRESHOLD = 10
 DURATION_SIGNIFICANCE_THRESHOLD = 0.10  # Stage 3.7: duration must appear in >= 10% of records
@@ -174,31 +175,14 @@ def _normalize_time_to_hhmmss(t) -> str:
     return s
 
 
-def _times_overlap(start1_str: str, end1_str: str, start2_str: str, end2_str: str) -> bool:
-    """Check if two time ranges overlap. Times are HH:MM:SS strings."""
-    def time_to_minutes(t_str: str) -> int:
-        """Convert HH:MM:SS to minutes from midnight."""
-        if not t_str:
-            return 0
-        parts = t_str.split(':')
-        h = int(parts[0]) if len(parts) > 0 else 0
-        m = int(parts[1]) if len(parts) > 1 else 0
-        return h * 60 + m
-
-    start1 = time_to_minutes(start1_str)
-    end1 = time_to_minutes(end1_str)
-    start2 = time_to_minutes(start2_str)
-    end2 = time_to_minutes(end2_str)
-
-    # Two ranges overlap if one starts before the other ends
-    return start1 < end2 and start2 < end1
-
-
 def load_client_schedules(connection) -> Tuple[List[Dict], Dict[int, str]]:
-    """Load existing client_schedules: id, client_id, requested_start_time, requested_end_time, requested_duration, number_of_care_givers.
-    Skip records that have:
+    """Load existing client_schedules for window updates.
+
+    Skip only:
     1. number_of_care_givers >= 2 (multiple caregivers needed)
-    2. Overlapping time slots on the same day for the same client
+    2. Unavailability or not_send_to_engine preferences
+
+    All other schedules are eligible (CSV match or requested ±40 fallback).
 
     Returns:
         Tuple of (records_to_analyze, skip_reasons_dict)
@@ -206,13 +190,11 @@ def load_client_schedules(connection) -> Tuple[List[Dict], Dict[int, str]]:
     """
     cursor = connection.cursor()
     try:
-        # Count total records
         cursor.execute("""
             SELECT COUNT(*) as total FROM client_schedules WHERE deleted_at IS NULL
         """)
         total_count = cursor.fetchone()["total"]
 
-        # Load ALL records first to detect overlaps (join preferences for unavailability filter)
         cursor.execute("""
             SELECT cs.id, cs.client_id, cs.requested_start_time, cs.requested_end_time,
                    cs.requested_duration, cs.number_of_care_givers, cs.days, cs.start_date,
@@ -225,16 +207,13 @@ def load_client_schedules(connection) -> Tuple[List[Dict], Dict[int, str]]:
         """)
         all_rows = cursor.fetchall()
 
-        # Convert to list with normalized times
         all_records = []
         for r in all_rows:
             rs = _normalize_time_to_hhmmss(r["requested_start_time"])
             re_ = _normalize_time_to_hhmmss(r["requested_end_time"])
 
-            # Parse days field - PostgreSQL array type may come as list or need parsing
             days_raw = r.get("days", [])
             if isinstance(days_raw, str):
-                # PostgreSQL array came as string like "{Tuesday,Friday}"
                 days_list = days_raw.strip('{}').split(',') if days_raw else []
                 days_list = [d.strip() for d in days_list if d.strip()]
             elif isinstance(days_raw, list):
@@ -256,82 +235,27 @@ def load_client_schedules(connection) -> Tuple[List[Dict], Dict[int, str]]:
                 "not_send_to_engine": bool(r.get("not_send_to_engine")),
             })
 
-        # Detect overlaps: for each client, check if any two time slots overlap on the same day
-        overlapping_ids = set()
-        multiple_caregiver_ids = set()
-        unavailability_ids = set()
-        skip_reasons = {}  # Track reason for each skipped record
-
-        # Group by client_id
-        client_records = defaultdict(list)
-        for rec in all_records:
-            client_records[rec["client_id"]].append(rec)
-
-        # For each client, check for overlapping time slots on the same days
-        for client_id, records in client_records.items():
-            # Check each pair of records
-            for i in range(len(records)):
-                rec1 = records[i]
-
-                # Skip if already marked or has multiple caregivers
-                if rec1["number_of_care_givers"] >= 2:
-                    multiple_caregiver_ids.add(rec1["id"])
-                    skip_reasons[rec1["id"]] = f"Multiple caregivers required (number_of_care_givers={rec1['number_of_care_givers']})"
-                    continue
-
-                # Check if this record overlaps with any other record on the same day
-                for j in range(i + 1, len(records)):
-                    rec2 = records[j]
-
-                    # Check if they share any day of week
-                    days1 = set(rec1["days"]) if rec1["days"] else set()
-                    days2 = set(rec2["days"]) if rec2["days"] else set()
-                    shared_days = days1 & days2
-
-                    if shared_days:
-                        # They share a day - check if times overlap
-                        if _times_overlap(
-                            rec1["requested_start_time"], rec1["requested_end_time"],
-                            rec2["requested_start_time"], rec2["requested_end_time"]
-                        ):
-                            # Mark both as overlapping
-                            overlapping_ids.add(rec1["id"])
-                            overlapping_ids.add(rec2["id"])
-                            skip_reasons[rec1["id"]] = f"Overlapping time slots on same day (shared days: {sorted(shared_days)})"
-                            skip_reasons[rec2["id"]] = f"Overlapping time slots on same day (shared days: {sorted(shared_days)})"
-                            logger.debug(
-                                f"  Overlap detected: client_id={client_id}, "
-                                f"slot1={rec1['requested_start_time']}-{rec1['requested_end_time']}, "
-                                f"slot2={rec2['requested_start_time']}-{rec2['requested_end_time']}, "
-                                f"shared_days={shared_days}"
-                            )
-
-        # Filter out records with multiple caregivers, overlaps, or unavailability
+        skip_reasons = {}
         out = []
         skipped_multiple = 0
-        skipped_overlap = 0
         skipped_unavailability = 0
 
         for rec in all_records:
-            if rec["id"] in multiple_caregiver_ids:
+            if rec.get("number_of_care_givers", 1) >= 2:
+                skip_reasons[rec["id"]] = (
+                    f"Multiple caregivers required (number_of_care_givers={rec['number_of_care_givers']})"
+                )
                 skipped_multiple += 1
                 continue
-            if rec["id"] in overlapping_ids:
-                skipped_overlap += 1
-                continue
             if rec.get("is_unavailability") or rec.get("not_send_to_engine"):
-                unavailability_ids.add(rec["id"])
                 skip_reasons[rec["id"]] = "Unavailability or not_send_to_engine preference"
                 skipped_unavailability += 1
                 continue
-            if rec["number_of_care_givers"] <= 1:
-                out.append(rec)
+            out.append(rec)
 
         logger.info(f"✓ Loaded {len(out)} client_schedules records for analysis")
         if skipped_multiple > 0:
             logger.info(f"  Skipped {skipped_multiple} records with multiple caregivers (number_of_care_givers >= 2)")
-        if skipped_overlap > 0:
-            logger.info(f"  Skipped {skipped_overlap} records with overlapping time slots on the same day")
         if skipped_unavailability > 0:
             logger.info(f"  Skipped {skipped_unavailability} unavailability / not_send_to_engine records")
         logger.info(f"  Total client_schedules: {total_count}")
@@ -717,6 +641,14 @@ def _clamp_minute_of_day(minutes: int) -> int:
     return max(0, min(MAX_MINUTE_OF_DAY, int(minutes)))
 
 
+def _window_from_requested_expanded(req_start_min: int, req_end_min: int) -> Tuple[int, int]:
+    """Fallback window: requested_start - 40 / requested_end + 40 (clamped to day bounds)."""
+    return (
+        _clamp_minute_of_day(req_start_min - EXPAND_FROM_REQUESTED_MINS),
+        _clamp_minute_of_day(req_end_min + EXPAND_FROM_REQUESTED_MINS),
+    )
+
+
 def _expand_window_if_near_requested(
     sugg_start_min: int,
     sugg_end_min: int,
@@ -724,17 +656,14 @@ def _expand_window_if_near_requested(
     req_end_min: int,
 ) -> Tuple[int, int]:
     """
-    If calculated window equals requested or both edges are within ±NEAR_REQUESTED_MINS,
+    If calculated window equals requested or both edges are within ±NEAR_REQUESTED_MINS (±40),
     expand to requested_start - 40 / requested_end + 40 (clamped to day bounds).
     """
     if (
         abs(sugg_start_min - req_start_min) <= NEAR_REQUESTED_MINS
         and abs(sugg_end_min - req_end_min) <= NEAR_REQUESTED_MINS
     ):
-        return (
-            _clamp_minute_of_day(req_start_min - EXPAND_FROM_REQUESTED_MINS),
-            _clamp_minute_of_day(req_end_min + EXPAND_FROM_REQUESTED_MINS),
-        )
+        return _window_from_requested_expanded(req_start_min, req_end_min)
     return sugg_start_min, sugg_end_min
 
 
@@ -1139,11 +1068,14 @@ def run(csv_path: Optional[str] = None, connection_manager=None, state=None) -> 
     try:
         patterns = run_analysis_pipeline(csv_path)
         if patterns.empty:
-            logger.warning("No patterns after analysis pipeline; nothing to update.")
-            return True
-
-        logger.info("  Analysis pipeline complete: %d slot patterns", len(patterns))
-        pattern_lookup = build_pattern_lookup(patterns)
+            logger.warning(
+                "No patterns after analysis pipeline; applying requested ±%s fallback for eligible schedules.",
+                EXPAND_FROM_REQUESTED_MINS,
+            )
+            pattern_lookup: Dict[Tuple[str, str, str], Dict] = {}
+        else:
+            logger.info("  Analysis pipeline complete: %d slot patterns", len(patterns))
+            pattern_lookup = build_pattern_lookup(patterns)
 
         config = get_db_config()
         if connection_manager:
@@ -1160,6 +1092,8 @@ def run(csv_path: Optional[str] = None, connection_manager=None, state=None) -> 
         logger.info("  Pattern lookup entries: %d", len(pattern_lookup))
 
         updated = 0
+        updated_from_csv = 0
+        updated_from_fallback = 0
         updated_ids = set()
         update_reasons: Dict[int, str] = {}
         update_args: List[Tuple[str, str, int, int, int]] = []
@@ -1168,25 +1102,9 @@ def run(csv_path: Optional[str] = None, connection_manager=None, state=None) -> 
             avail_id = avail["id"]
             client_id = avail["client_id"]
             name_key = client_id_to_name.get(client_id)
-            if not name_key:
-                skip_reasons[avail_id] = "Client not found in name lookup"
-                continue
 
             rs = _normalize_time_to_hhmmss(avail.get("requested_start_time"))
             re_ = _normalize_time_to_hhmmss(avail.get("requested_end_time"))
-            pattern = pattern_lookup.get((name_key, rs, re_))
-            if pattern is None:
-                skip_reasons[avail_id] = "No CSV pattern for this client/time slot"
-                continue
-
-            window_start_str = _normalize_time_to_hhmmss(pattern.get("start_time_str", ""))
-            window_end_str = _normalize_time_to_hhmmss(pattern.get("end_time_str", ""))
-            suggested_val = pattern.get("suggested_duration")
-            if pd.isna(suggested_val):
-                skip_reasons[avail_id] = "Pattern has no suggested_duration"
-                continue
-
-            suggested_duration = int(suggested_val)
             req_start_min = _time_str_to_minutes(rs)
             req_end_min = _time_str_to_minutes(re_)
             if req_start_min is None or req_end_min is None or req_end_min <= req_start_min:
@@ -1195,32 +1113,78 @@ def run(csv_path: Optional[str] = None, connection_manager=None, state=None) -> 
 
             slot_width = req_end_min - req_start_min
             db_duration = avail.get("requested_duration")
-            requested_duration = int(db_duration) if db_duration is not None and not pd.isna(db_duration) else suggested_duration
-            suggested_duration = min(suggested_duration, requested_duration, slot_width)
-
-            min_duration = compute_min_duration_from_suggested(
-                requested_duration, suggested_duration, slot_width,
+            requested_duration = (
+                int(db_duration)
+                if db_duration is not None and not pd.isna(db_duration)
+                else slot_width
             )
+            if requested_duration <= 0:
+                requested_duration = max(slot_width, 1)
 
-            win_start_min = _time_str_to_minutes(window_start_str)
-            win_end_min = _time_str_to_minutes(window_end_str)
-            if win_start_min is None or win_end_min is None or win_end_min <= win_start_min:
-                skip_reasons[avail_id] = "Invalid suggested window from analysis"
-                continue
-            if min_duration <= 0 or suggested_duration <= 0:
-                skip_reasons[avail_id] = "Suggested or min duration is zero; skipping update"
-                continue
+            pattern = pattern_lookup.get((name_key, rs, re_)) if name_key else None
+            used_fallback = False
+            window_start_str = ""
+            window_end_str = ""
+            suggested_duration = 0
+            min_duration = 0
+            reason_prefix = ""
+
+            if pattern is not None:
+                window_start_str = _normalize_time_to_hhmmss(pattern.get("start_time_str", ""))
+                window_end_str = _normalize_time_to_hhmmss(pattern.get("end_time_str", ""))
+                suggested_val = pattern.get("suggested_duration")
+                win_start_min = _time_str_to_minutes(window_start_str)
+                win_end_min = _time_str_to_minutes(window_end_str)
+                if (
+                    not pd.isna(suggested_val)
+                    and win_start_min is not None
+                    and win_end_min is not None
+                    and win_end_min > win_start_min
+                ):
+                    suggested_duration = min(int(suggested_val), requested_duration, slot_width)
+                    min_duration = compute_min_duration_from_suggested(
+                        requested_duration, suggested_duration, slot_width,
+                    )
+                    if min_duration > 0 and suggested_duration > 0:
+                        reason_prefix = "Patient_Analyzer pipeline"
+                    else:
+                        used_fallback = True
+                else:
+                    used_fallback = True
+            else:
+                used_fallback = True
+
+            if used_fallback:
+                win_start_min, win_end_min = _window_from_requested_expanded(
+                    req_start_min, req_end_min,
+                )
+                window_start_str = min_to_time_str(win_start_min)
+                window_end_str = min_to_time_str(win_end_min)
+                suggested_duration = min(requested_duration, slot_width)
+                min_duration = compute_min_duration_from_suggested(
+                    requested_duration, suggested_duration, slot_width,
+                )
+                if min_duration <= 0 or suggested_duration <= 0:
+                    skip_reasons[avail_id] = "Suggested or min duration is zero; skipping update"
+                    continue
+                reason_prefix = f"requested ±{EXPAND_FROM_REQUESTED_MINS} fallback"
+                updated_from_fallback += 1
+            else:
+                updated_from_csv += 1
 
             update_args.append((window_start_str, window_end_str, suggested_duration, min_duration, avail_id))
             updated_ids.add(avail_id)
             update_reasons[avail_id] = (
-                f"Patient_Analyzer pipeline "
+                f"{reason_prefix} "
                 f"(window_start={window_start_str}, window_end={window_end_str}, "
                 f"suggested_duration={suggested_duration}, min_duration={min_duration})"
             )
             updated += 1
 
-        logger.info("  Matched %d schedules to CSV patterns", updated)
+        logger.info(
+            "  Updated %d schedules (%d from CSV, %d requested ±%s fallback)",
+            updated, updated_from_csv, updated_from_fallback, EXPAND_FROM_REQUESTED_MINS,
+        )
 
         cursor = connection.cursor()
         try:
@@ -1246,12 +1210,10 @@ def run(csv_path: Optional[str] = None, connection_manager=None, state=None) -> 
         # ======================================================================
         # TRACK NON-UPDATED RECORDS
         # ======================================================================
-        # For records that were analyzed but not updated, determine why
         for rec in avail_list:
             rec_id = rec["id"]
             if rec_id not in updated_ids and rec_id not in skip_reasons:
-                # This record was eligible for analysis but no pattern matched
-                skip_reasons[rec_id] = "No matching time slot pattern found in CSV analysis"
+                skip_reasons[rec_id] = "Eligible but not updated (unexpected)"
 
         # Reload ALL client_schedules from DB to get complete data for report
         cursor = connection.cursor()
@@ -1346,6 +1308,8 @@ def run(csv_path: Optional[str] = None, connection_manager=None, state=None) -> 
         logger.info("  Total client_schedules in database: %d", len(avail_list) + len(skip_reasons))
         logger.info("  Analyzed (eligible for matching): %d", len(avail_list))
         logger.info("  Successfully updated: %d", updated)
+        logger.info("    - From CSV analysis: %d", updated_from_csv)
+        logger.info("    - Requested ±%s fallback: %d", EXPAND_FROM_REQUESTED_MINS, updated_from_fallback)
         logger.info("  Skipped: %d", len(skip_reasons))
         logger.info("")
         logger.info("  Skip reasons breakdown:")
@@ -1355,12 +1319,10 @@ def run(csv_path: Optional[str] = None, connection_manager=None, state=None) -> 
         for reason in skip_reasons.values():
             if "Multiple caregivers" in reason:
                 reason_counts["Multiple caregivers required"] += 1
-            elif "Overlapping time slots" in reason:
-                reason_counts["Overlapping time slots"] += 1
-            elif "No CSV pattern" in reason:
-                reason_counts["No CSV pattern for time slot"] += 1
-            elif "not found in name lookup" in reason:
-                reason_counts["Client name not in lookup"] += 1
+            elif "Unavailability" in reason or "not_send_to_engine" in reason:
+                reason_counts["Unavailability / not_send_to_engine"] += 1
+            elif "Invalid requested" in reason:
+                reason_counts["Invalid requested start/end"] += 1
             else:
                 reason_counts["Other"] += 1
 
@@ -1369,12 +1331,13 @@ def run(csv_path: Optional[str] = None, connection_manager=None, state=None) -> 
 
         logger.info("")
         logger.info("  Matching logic:")
-        logger.info("    - Patient_Analyzer pipeline on full CSV history")
+        logger.info("    - Patient_Analyzer pipeline on full CSV history when matched")
+        logger.info("    - Else requested ±%s fallback (even if not in CSV)", EXPAND_FROM_REQUESTED_MINS)
         logger.info("    - DB match: client name + requested_start_time + requested_end_time")
         logger.info("")
-        logger.info("  Records excluded from analysis:")
+        logger.info("  Records excluded from window updates:")
         logger.info("    - number_of_care_givers >= 2 (multiple caregivers needed)")
-        logger.info("    - Overlapping time slots on same day for same client")
+        logger.info("    - Unavailability or not_send_to_engine")
         logger.info("")
         logger.info("  Additional filtering:")
         logger.info("    - CSV visits with Service Requirement Duration < %s min excluded", MINIMUM_DURATION_MINUTES)

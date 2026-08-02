@@ -79,7 +79,7 @@ MODE_PREFERENCE_CHECK = "preference_check"
 MODE_WINDOW_CHECK = "window_check"
 
 # Wizard release version (shown in UI and window title on all platforms / frozen builds)
-WIZARD_VERSION = "0.0.24"
+WIZARD_VERSION = "0.0.26"
 
 # User-facing name for MODE_TEST_TODAY (internal id unchanged)
 LABEL_VALIDATE_ROSTER = "Validate today's roster"
@@ -1221,7 +1221,9 @@ class MigrationWizard:
             text=(
                 "Log lines start with WINDOW / REASON / SUMMARY so you can search them. "
                 "Windows come from actual visit time percentiles (±15 min), clamped to the "
-                "requested slot; if within ±15 min of requested, expand to requested ±40 min. "
+                "requested slot; if within ±40 min of requested, expand to requested ±40 min. "
+                "Schedules not in VisitExport (except multi-caregiver / unavailability) still "
+                "get requested ±40. "
                 "Each REASON line explains duration and window rules."
             ),
             style="CardMuted.TLabel",
