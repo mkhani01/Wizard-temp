@@ -139,6 +139,27 @@ def build_profile_rows(
     return out
 
 
+def clear_all_profile_preferences(connection) -> None:
+    """DELETE all rows from the six profile Must/Preferred/Only join tables (no insert)."""
+    cursor = connection.cursor()
+    try:
+        logger.info("Clearing profile preference tables (DELETE only, no re-seed)...")
+        for table in ALL_PROFILE_TABLES:
+            cursor.execute(f"DELETE FROM {table}")
+        connection.commit()
+        logger.info("  Cleared %d profile preference table(s)", len(ALL_PROFILE_TABLES))
+    except (OperationalError, InterfaceError) as e:
+        connection.rollback()
+        if ConnectionLostError:
+            raise ConnectionLostError("profile_preferences", {}) from e
+        raise
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        cursor.close()
+
+
 def refresh_all_profile_preferences(
     connection,
     weights: Dict[Tuple[int, int], float],
@@ -148,6 +169,9 @@ def refresh_all_profile_preferences(
     """
     Full refresh of all six profile preference join tables (DELETE + INSERT).
     Returns counts per table.
+
+    Currently unused by feasible-pairs migration (clear-only path is used instead);
+    kept so Must/Preferred/Only seeding can be re-enabled later.
     """
     if client_durations is None:
         client_durations = load_client_durations(connection)

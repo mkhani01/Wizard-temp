@@ -772,7 +772,11 @@ def seed_feasible_pairs(connection, frequencies_by_day, weights_by_day):
 
 
 def refresh_profile_preferences(connection, weights, statuses):
-    """Refresh Must/Preferred/Only on user and client profile join tables (two-way sync)."""
+    """
+    Refresh Must/Preferred/Only on user and client profile join tables (two-way sync).
+
+    Kept for re-enable later; feasible-pairs run() currently clears only.
+    """
     from feasible_pairs_migration.profile_preferences import refresh_all_profile_preferences
 
     client_durations = None
@@ -788,6 +792,13 @@ def refresh_profile_preferences(connection, weights, statuses):
         statuses=statuses,
         client_durations=client_durations,
     )
+
+
+def clear_profile_preferences(connection):
+    """Delete all profile Must/Preferred/Only join rows without re-seeding."""
+    from feasible_pairs_migration.profile_preferences import clear_all_profile_preferences
+
+    clear_all_profile_preferences(connection)
 
 
 def run(csv_path=None, connection_manager=None, state=None):
@@ -864,12 +875,11 @@ def run(csv_path=None, connection_manager=None, state=None):
         success = seed_feasible_pairs(connection, frequencies_by_day, weights_by_day)
         if success:
             logger.info("\n" + "="*60)
-            logger.info("STEP 7: REFRESH PROFILE PREFERENCES (Must / Preferred / Only)")
+            logger.info("STEP 7: CLEAR PROFILE PREFERENCES (Must / Preferred / Only)")
             logger.info("="*60)
-            profile_counts = refresh_profile_preferences(connection, weights, statuses)
-            stats['profile_preferred'] = profile_counts.get('user_preferred_clients', 0)
-            stats['profile_must'] = profile_counts.get('user_must_clients', 0)
-            stats['profile_only'] = profile_counts.get('user_only_clients', 0)
+            # Seeding Must/Preferred/Only is disabled for now; still clear existing rows.
+            # To re-enable: call refresh_profile_preferences(connection, weights, statuses)
+            clear_profile_preferences(connection)
             if state:
                 state.update("feasible_pairs", status="completed")
                 state.clear_step("feasible_pairs")
@@ -888,9 +898,7 @@ def run(csv_path=None, connection_manager=None, state=None):
             print(f"  - Unique caregiver-client-day rows: {stats['matched_day_pairs']}")
             print(f"  - Day pairs with calculated weight: {stats.get('weighted_day_pairs', 0)}")
             print(f"  - Current Primary preferred pairs: {stats.get('current_primary_pairs', 0)}")
-            print(f"  - Profile preferred: {stats.get('profile_preferred', 0)}")
-            print(f"  - Profile must: {stats.get('profile_must', 0)}")
-            print(f"  - Profile only: {stats.get('profile_only', 0)}")
+            print(f"  - Profile Must/Preferred/Only: cleared (seeding disabled)")
             print(f"  - Total visits recorded: {stats['total_visits']}")
             print(f"  - Unmatched caregivers: {len(stats['unmatched_caregivers'])}")
             print(f"  - Unmatched clients: {len(stats['unmatched_clients'])}")

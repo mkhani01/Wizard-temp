@@ -56,6 +56,11 @@ def main():
     pref_result = unittest.TextTestRunner(verbosity=1).run(pref_suite)
     if not pref_result.wasSuccessful():
         return 1
+    print("Window Check tests...")
+    window_suite = loader.loadTestsFromName("tests.test_window_check")
+    window_result = unittest.TextTestRunner(verbosity=1).run(window_suite)
+    if not window_result.wasSuccessful():
+        return 1
     print("\n✓ All tests OK. You can run the wizard or CLI.")
     return 0
 

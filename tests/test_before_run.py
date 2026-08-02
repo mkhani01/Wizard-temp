@@ -73,6 +73,8 @@ def check_migration_imports():
         ("feasible_pairs_migration.profile_preferences", "Profile preferences"),
         ("distance_migration.pair_scope", "Distance pair scope"),
         ("clientWindowsAnalyzer.main", "Client windows analyzer"),
+        ("clientWindowsAnalyzer.window_check", "Window check"),
+        ("feasible_pairs_migration.preference_check", "Preference check"),
         ("carerTravelLimitsMigration.main", "Carer travel limits"),
         ("distance_migration.travel_distances_migration", "Travel distances"),
     ]

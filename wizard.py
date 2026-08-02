@@ -69,19 +69,22 @@ STEP_SUMMARY = 4
 STEP_RUN = 5
 STEP_TEST_TODAY = 6
 STEP_PREFERENCE_CHECK = 7
-TOTAL_STEPS = 8
+STEP_WINDOW_CHECK = 8
+TOTAL_STEPS = 9
 
 # Top-level wizard modes (chosen on welcome)
 MODE_MIGRATION = "migration"
 MODE_TEST_TODAY = "test_today"
 MODE_PREFERENCE_CHECK = "preference_check"
+MODE_WINDOW_CHECK = "window_check"
 
 # Wizard release version (shown in UI and window title on all platforms / frozen builds)
-WIZARD_VERSION = "0.0.21"
+WIZARD_VERSION = "0.0.22"
 
 # User-facing name for MODE_TEST_TODAY (internal id unchanged)
 LABEL_VALIDATE_ROSTER = "Validate today's roster"
 LABEL_PREFERENCE_CHECK = "Preference Check"
+LABEL_WINDOW_CHECK = "Window Check"
 
 RUN_HELP_MIGRATION = (
     "Do not close this window until the migration finishes. Cancel stops between steps. "
@@ -95,6 +98,10 @@ RUN_HELP_VALIDATE = (
 RUN_HELP_PREFERENCE_CHECK = (
     "Do not close this window until Preference Check finishes. "
     "PAIR and SUMMARY lines are searchable in the log file."
+)
+RUN_HELP_WINDOW_CHECK = (
+    "Do not close this window until Window Check finishes. "
+    "WINDOW, REASON, and SUMMARY lines are searchable in the log file."
 )
 
 # Migration option keys (must match checkbox keys and file keys)
@@ -323,6 +330,9 @@ class MigrationWizard:
         self.pref_check_first_name = StringVar(value="")
         self.pref_check_last_name = StringVar(value="")
         self.pref_check_visit_export = StringVar(value="")
+        self.window_check_first_name = StringVar(value="")
+        self.window_check_last_name = StringVar(value="")
+        self.window_check_visit_export = StringVar(value="")
         self.log_search_var = StringVar(value="")
         self.log_filter_var = StringVar(value="All")
         self._log_search_start = "1.0"
@@ -633,6 +643,7 @@ class MigrationWizard:
         self._build_step_run(self.frames[STEP_RUN])
         self._build_step_test_today(self.frames[STEP_TEST_TODAY])
         self._build_step_preference_check(self.frames[STEP_PREFERENCE_CHECK])
+        self._build_step_window_check(self.frames[STEP_WINDOW_CHECK])
 
         # Footer actions
         footer_sep = ttk.Separator(main, orient="horizontal")
@@ -826,7 +837,7 @@ class MigrationWizard:
         self._wrap_label(
             body,
             "Choose a mode below, then continue. Migration writes to the database; "
-            "Validate and Preference Check are read-only tools.",
+            "Validate, Preference Check, and Window Check are read-only tools.",
             style="Lead.TLabel",
             padding=(0, 4),
         ).grid(row=row, column=0, sticky=W, pady=(0, 14))
@@ -857,6 +868,13 @@ class MigrationWizard:
                 "Offline",
                 "Enter a caregiver name and VisitExport CSV to see Must / Only clients and why. "
                 "Same weight logic as feasible-pairs migration. No DB or API.",
+            ),
+            (
+                MODE_WINDOW_CHECK,
+                LABEL_WINDOW_CHECK,
+                "Offline",
+                "Enter a client name and VisitExport CSV to see which schedule windows would be "
+                "suggested and why. Same logic as Client windows analyzer. No DB or API.",
             ),
         ]
         self._mode_cards = []
@@ -1145,6 +1163,77 @@ class MigrationWizard:
             self._prefcheck_on_mousewheel_linux,
         )
 
+    def _build_step_window_check(self, parent):
+        body = self._create_scrollable_area(parent, "wincheck")
+        body.columnconfigure(0, weight=1)
+        row = self._add_step_header(body, 0)
+        ttk.Label(body, text=LABEL_WINDOW_CHECK, style="Title.TLabel").grid(
+            row=row, column=0, sticky=W, pady=(0, 4)
+        )
+        row += 1
+        self._wrap_label(
+            body,
+            "See which schedule windows would be suggested for a client, and why — using the same "
+            "VisitExport pipeline as Client windows analyzer. Offline only (no database, no API).",
+            style="Lead.TLabel",
+            padding=(0, 4),
+        ).grid(row=row, column=0, sticky=W, pady=(0, 14))
+        row += 1
+
+        client_card = self._build_form_card(body, "Client", row)
+        row += 1
+        self._add_form_fields(
+            client_card,
+            [
+                (
+                    "First name",
+                    self.window_check_first_name,
+                    "text",
+                    "Given name as in VisitExport Service Location Name.",
+                ),
+                (
+                    "Last name",
+                    self.window_check_last_name,
+                    "text",
+                    "Family name as in VisitExport Service Location Name.",
+                ),
+            ],
+        )
+
+        file_card = self._build_form_card(body, "VisitExport", row)
+        row += 1
+        self._add_form_fields(
+            file_card,
+            [
+                (
+                    "VisitExport CSV",
+                    self.window_check_visit_export,
+                    "file",
+                    "Same VisitExport CSV used for Client windows analyzer migration.",
+                ),
+            ],
+        )
+
+        tip = ttk.Labelframe(body, text="How to read results", style="Card.TLabelframe", padding=(14, 10))
+        tip.grid(row=row, column=0, sticky=(E, W), pady=(0, 8))
+        ttk.Label(
+            tip,
+            text=(
+                "Log lines start with WINDOW / REASON / SUMMARY so you can search them. "
+                "Windows come from actual visit time percentiles (±15 min), clamped to the "
+                "requested slot. Each REASON line explains duration and window rules."
+            ),
+            style="CardMuted.TLabel",
+            wraplength=720,
+            justify="left",
+        ).grid(row=0, column=0, sticky=W)
+
+        _bind_mousewheel_recursive(
+            body,
+            self._wincheck_on_mousewheel,
+            self._wincheck_on_mousewheel_linux,
+        )
+
     def _build_step_db(self, parent):
         body = self._create_scrollable_area(parent, "db")
         body.columnconfigure(0, weight=1)
@@ -1316,7 +1405,7 @@ class MigrationWizard:
             (OPT_GEOCODE_ALL_CLIENTS, "Geocode all Clients", "Re-geocode all clients with a postcode, including those that already have coordinates."),
             (OPT_GEOCODE_ALL_USERS, "Geocode all Users", "Re-geocode all users with a postcode, including those that already have coordinates."),
             (OPT_CALCULATE_DISTANCES, "Calculate distances", "Build the travel distance matrix via OSRM for users and clients with coordinates. See More info for modes."),
-            (OPT_FVISIT_HISTORY, "Feasible pairs (visit history)", "Seed feasible pairs and profile Must/Preferred/Only from VisitExport CSV. Run before Calculate distances."),
+            (OPT_FVISIT_HISTORY, "Feasible pairs (visit history)", "Seed feasible pairs from VisitExport CSV (also clears profile Must/Preferred/Only). Run before Calculate distances."),
             (OPT_CLIENT_WINDOWS, "Client windows analyzer", "Update client schedule windows from VisitExport history. Requires Clients Availability."),
             (OPT_CARER_TRAVEL_LIMITS, "Carer travel limits (max distance)", "Set caregiver max distance from VisitExport routes and travel_distances. Requires Calculate distances first."),
         ]
@@ -1680,7 +1769,7 @@ class MigrationWizard:
         self.log_filter = ttk.Combobox(
             toolbar,
             textvariable=self.log_filter_var,
-            values=["All", "FAIL", "PASS", "PAIR", "SUMMARY", "DELETED", "MUST/ONLY"],
+            values=["All", "FAIL", "PASS", "PAIR", "WINDOW", "SUMMARY", "DELETED", "MUST/ONLY"],
             state="readonly",
             width=12,
         )
@@ -1743,6 +1832,7 @@ class MigrationWizard:
         mode = self.wizard_mode.get()
         is_test = mode == MODE_TEST_TODAY
         is_pref = mode == MODE_PREFERENCE_CHECK
+        is_win = mode == MODE_WINDOW_CHECK
         if is_test:
             titles = {
                 STEP_WELCOME: "Step 1 of 3 – Welcome",
@@ -1757,6 +1847,13 @@ class MigrationWizard:
                 STEP_RUN: "Step 3 of 3 – Running Preference Check",
             }
             self.step_label.config(text=titles.get(step, LABEL_PREFERENCE_CHECK))
+        elif is_win:
+            titles = {
+                STEP_WELCOME: "Step 1 of 3 – Welcome",
+                STEP_WINDOW_CHECK: "Step 2 of 3 – Client & VisitExport",
+                STEP_RUN: "Step 3 of 3 – Running Window Check",
+            }
+            self.step_label.config(text=titles.get(step, LABEL_WINDOW_CHECK))
         else:
             titles = [
                 "Step 1 of 6 – Welcome",
@@ -1781,6 +1878,7 @@ class MigrationWizard:
             STEP_DB: "db",
             STEP_TEST_TODAY: "validate",
             STEP_PREFERENCE_CHECK: "prefcheck",
+            STEP_WINDOW_CHECK: "wincheck",
             STEP_SUMMARY: "summary",
             STEP_CHECKBOXES: "checkbox",
             STEP_FILES: "files",
@@ -1789,7 +1887,7 @@ class MigrationWizard:
             self._bind_step_scroll(scroll_prefixes[step])
 
         # Show/hide Check files button for file selection step
-        if step == STEP_FILES and not is_test and not is_pref:
+        if step == STEP_FILES and not is_test and not is_pref and not is_win:
             self._refresh_file_step()
             self.btn_check_files.pack(side="right", padx=4)
         else:
@@ -1810,6 +1908,9 @@ class MigrationWizard:
             elif is_pref:
                 self.run_title_label.config(text="%s in progress" % LABEL_PREFERENCE_CHECK)
                 self.run_help_label.config(text=RUN_HELP_PREFERENCE_CHECK)
+            elif is_win:
+                self.run_title_label.config(text="%s in progress" % LABEL_WINDOW_CHECK)
+                self.run_help_label.config(text=RUN_HELP_WINDOW_CHECK)
             else:
                 self.run_title_label.config(text="Migration in progress")
                 self.run_help_label.config(text=RUN_HELP_MIGRATION)
@@ -1822,6 +1923,8 @@ class MigrationWizard:
                 self.btn_continue.config(text="Start validation")
             elif step == STEP_PREFERENCE_CHECK:
                 self.btn_continue.config(text="Start Preference Check")
+            elif step == STEP_WINDOW_CHECK:
+                self.btn_continue.config(text="Start Window Check")
             else:
                 self.btn_continue.config(text="Continue")
 
@@ -2038,8 +2141,84 @@ class MigrationWizard:
                 % log_path,
             )
 
+    def _run_window_check(self):
+        """Start Window Check in a background thread."""
+        self._run_cancelled = False
+        self._run_in_progress = True
+        self._hide_retry_continue_buttons()
+        self.btn_run_again.pack_forget()
+        self.btn_check_migration.pack_forget()
+        self.btn_back.config(state="disabled")
+        self._log_clear_widget()
+        log_path = PROJECT_ROOT / (
+            "window_check_%s.log" % datetime.now().strftime("%Y%m%d_%H%M%S")
+        )
+        self._run_log_path = log_path
+        self._append_log("Log file: %s\n" % log_path)
+        self.run_progress.start()
+        thread = threading.Thread(
+            target=self._do_run_window_check, args=(log_path,), daemon=True
+        )
+        thread.start()
+
+    def _do_run_window_check(self, log_path: Path):
+        all_msgs: list = []
+        ok = False
+        try:
+            if str(BUNDLE_ROOT) not in sys.path:
+                sys.path.insert(0, str(BUNDLE_ROOT))
+            from clientWindowsAnalyzer.window_check import run_window_check
+
+            def _log_line(msg):
+                all_msgs.append(msg)
+                self.root.after(0, lambda m=msg: self._append_log(m + "\n"))
+
+            ok, msgs = run_window_check(
+                visit_export_path=self.window_check_visit_export.get().strip(),
+                first_name=self.window_check_first_name.get().strip(),
+                last_name=self.window_check_last_name.get().strip(),
+                log_callback=_log_line,
+            )
+            if msgs and not all_msgs:
+                all_msgs = list(msgs)
+        except Exception as e:
+            err = "%s error: %s" % (LABEL_WINDOW_CHECK, e)
+            all_msgs.append(err)
+            self.root.after(0, lambda m=err: self._append_log(m + "\n"))
+            logging.exception("%s failed", LABEL_WINDOW_CHECK)
+            ok = False
+        finally:
+            try:
+                log_path.write_text("\n".join(all_msgs) + "\n", encoding="utf-8")
+            except OSError:
+                pass
+            self.run_progress.stop()
+            self.root.after(0, lambda: self._window_check_finished(log_path, ok))
+
+    def _window_check_finished(self, log_path: Path, ok: bool):
+        self._run_in_progress = False
+        self._append_log("\nDetailed log saved to: %s\n" % log_path)
+        self.btn_cancel.config(state="normal")
+        self.btn_cancel.config(text="Close")
+        self.btn_back.config(state="normal")
+        self.btn_run_again.pack(side="right", padx=4)
+        if ok:
+            self._append_log("\nDone successfully.\n")
+            messagebox.showinfo(
+                LABEL_WINDOW_CHECK,
+                "Window Check finished.\n\nSearch WINDOW / REASON / SUMMARY lines in the log.\n\nLog saved to:\n%s"
+                % log_path,
+            )
+        else:
+            self._append_log("\nFinished with errors.\n")
+            messagebox.showwarning(
+                LABEL_WINDOW_CHECK,
+                "Window Check failed. Review the log on this screen.\n\nLog file:\n%s"
+                % log_path,
+            )
+
     def _on_run_again(self):
-        """Re-run the full migration / Validate today's roster / Preference Check."""
+        """Re-run the full migration / Validate today's roster / Preference Check / Window Check."""
         self.btn_run_again.pack_forget()
         self.btn_check_migration.pack_forget()
         self.btn_cancel.config(text="Cancel")
@@ -2050,6 +2229,8 @@ class MigrationWizard:
             self._run_test_today()
         elif mode == MODE_PREFERENCE_CHECK:
             self._run_preference_check()
+        elif mode == MODE_WINDOW_CHECK:
+            self._run_window_check()
         else:
             self._run_migrations(start_from=0)
 
@@ -2121,6 +2302,10 @@ class MigrationWizard:
             self.pref_check_first_name.set("")
             self.pref_check_last_name.set("")
             self.pref_check_visit_export.set("")
+        elif step == STEP_WINDOW_CHECK:
+            self.window_check_first_name.set("")
+            self.window_check_last_name.set("")
+            self.window_check_visit_export.set("")
 
     def _on_back(self):
         if self.current_step <= 0:
@@ -2148,6 +2333,17 @@ class MigrationWizard:
                 self._hide_retry_continue_buttons()
                 self._show_step(STEP_PREFERENCE_CHECK)
             return
+        if mode == MODE_WINDOW_CHECK:
+            if self.current_step == STEP_WINDOW_CHECK:
+                self._clear_step_inputs(STEP_WINDOW_CHECK)
+                self._show_step(STEP_WELCOME)
+            elif self.current_step == STEP_RUN:
+                self.btn_run_again.pack_forget()
+                self.btn_check_migration.pack_forget()
+                self.btn_cancel.config(text="Cancel")
+                self._hide_retry_continue_buttons()
+                self._show_step(STEP_WINDOW_CHECK)
+            return
         prev_step = self.current_step - 1
         self._clear_step_inputs(prev_step)
         self._show_step(prev_step)
@@ -2159,6 +2355,8 @@ class MigrationWizard:
                 self._show_step(STEP_TEST_TODAY)
             elif mode == MODE_PREFERENCE_CHECK:
                 self._show_step(STEP_PREFERENCE_CHECK)
+            elif mode == MODE_WINDOW_CHECK:
+                self._show_step(STEP_WINDOW_CHECK)
             else:
                 self._show_step(STEP_DB)
             return
@@ -2173,6 +2371,12 @@ class MigrationWizard:
                 return
             self._show_step(STEP_RUN)
             self._run_preference_check()
+            return
+        if self.current_step == STEP_WINDOW_CHECK:
+            if not self._validate_window_check():
+                return
+            self._show_step(STEP_RUN)
+            self._run_window_check()
             return
         if self.current_step == STEP_DB:
             if not self._validate_db():
@@ -2192,6 +2396,31 @@ class MigrationWizard:
                 return
             self._show_step(STEP_RUN)
             self._run_migrations()
+
+    def _validate_window_check(self):
+        first = self.window_check_first_name.get().strip()
+        last = self.window_check_last_name.get().strip()
+        path = self.window_check_visit_export.get().strip()
+        title = LABEL_WINDOW_CHECK
+        if not first:
+            messagebox.showwarning(title, "Please enter the client first name.")
+            return False
+        if not last:
+            messagebox.showwarning(title, "Please enter the client last name.")
+            return False
+        if not path:
+            messagebox.showwarning(title, "Please select the VisitExport CSV file.")
+            return False
+        if not Path(path).exists():
+            messagebox.showwarning(title, "VisitExport file does not exist:\n%s" % path)
+            return False
+        if not path.lower().endswith(".csv"):
+            messagebox.showwarning(
+                title,
+                "VisitExport should be a CSV file (same format as Client windows analyzer).",
+            )
+            return False
+        return True
 
     def _validate_preference_check(self):
         first = self.pref_check_first_name.get().strip()
@@ -2389,6 +2618,7 @@ class MigrationWizard:
         self.run_log.tag_configure("fail", foreground=colors.get("fail", "#fca5a5"))
         self.run_log.tag_configure("pass", foreground=colors.get("pass", "#86efac"))
         self.run_log.tag_configure("pair", foreground=colors.get("pair", "#93c5fd"))
+        self.run_log.tag_configure("window", foreground="#67e8f9")
         self.run_log.tag_configure("only", foreground=colors.get("only", "#c4b5fd"))
         self.run_log.tag_configure("must", foreground=colors.get("must", "#7dd3fc"))
         self.run_log.tag_configure("summary", foreground=colors.get("summary", "#fdba74"), font=mono_bold)
@@ -2412,6 +2642,8 @@ class MigrationWizard:
             tags.append("pass")
         if upper.startswith("PAIR ") or "\nPAIR " in upper:
             tags.append("pair")
+        if upper.startswith("WINDOW ") or upper.startswith("REASON ") or upper.startswith("WINDOW_CHECK"):
+            tags.append("window")
         if "CATEGORY=ONLY" in upper:
             tags.append("only")
         if "CATEGORY=MUST" in upper:
@@ -2422,6 +2654,8 @@ class MigrationWizard:
             tags.append("warn")
         if upper.startswith("PREF_CHECK") or "PREFERENCE CHECK" in upper:
             tags.append("pref")
+        if "WINDOW CHECK" in upper:
+            tags.append("window")
         return tags
 
     def _log_line_matches_filter(self, line: str, filt: str) -> bool:
@@ -2434,6 +2668,12 @@ class MigrationWizard:
             return "PASS" in u
         if filt == "PAIR":
             return u.lstrip().startswith("PAIR ") or "\nPAIR " in u
+        if filt == "WINDOW":
+            return (
+                u.lstrip().startswith("WINDOW ")
+                or u.lstrip().startswith("REASON ")
+                or u.lstrip().startswith("WINDOW_CHECK")
+            )
         if filt == "SUMMARY":
             return "SUMMARY" in u
         if filt == "DELETED":

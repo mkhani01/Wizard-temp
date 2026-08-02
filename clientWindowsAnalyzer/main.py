@@ -24,11 +24,14 @@ from typing import Optional, Dict, List, Tuple, Any
 try:
     import pandas as pd
     import numpy as np
-    import psycopg2
-    from psycopg2.extras import RealDictCursor, execute_batch
 except ImportError:
     pd = None  # type: ignore
     np = None  # type: ignore
+
+try:
+    import psycopg2
+    from psycopg2.extras import RealDictCursor, execute_batch
+except ImportError:
     psycopg2 = None  # type: ignore
     RealDictCursor = None  # type: ignore
     execute_batch = None  # type: ignore
@@ -1055,7 +1058,15 @@ def run_analysis_pipeline(csv_path: str) -> pd.DataFrame:
 
 
 def _require_runtime_deps():
-    if pd is None or np is None or psycopg2 is None:
+    if pd is None or np is None:
+        raise MigrationError(
+            "Missing required packages. Install: pip install pandas numpy"
+        )
+
+
+def _require_db_deps():
+    _require_runtime_deps()
+    if psycopg2 is None:
         raise MigrationError(
             "Missing required packages. Install: pip install psycopg2-binary pandas numpy"
         )
@@ -1066,7 +1077,7 @@ def run(csv_path: Optional[str] = None, connection_manager=None, state=None) -> 
     Entry point: run 3-stage analysis on CSV, then UPDATE client_schedule_preferences.
     connection_manager and state used from wizard for resume support.
     """
-    _require_runtime_deps()
+    _require_db_deps()
     print("""
     ╔════════════════════════════════════════════════════════════════╗
     ║   CLIENT WINDOWS ANALYZER                                      ║

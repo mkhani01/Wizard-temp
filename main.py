@@ -44,7 +44,7 @@ def print_usage():
         travel-distances     Compute full travel distance matrix via OSRM (DISTANCE_MODE=full default)
         csv-distances [args] Geocode carer/customer CSVs and export OSRM walking/driving/cycling JSON
         json-distances [args] Geocode users/clients JSONs and export walking/driving/cycling JSON
-        feasible-pairs [path]   Seed feasible_pairs + profile Must/Preferred/Only (16-week VisitExport)
+        feasible-pairs [path]   Seed feasible_pairs from VisitExport; clears profile Must/Preferred/Only (16-week)
         client-windows [path]   Patient_Analyzer windows from full VisitExport (default: assets/client_windows_data.csv)
         carer-travel-limits [path]   Set max_distance_km / max_p2p_distance_km from VisitExport routes (default: assets/visit_data.csv)
         update-today-visits [xlsx] [YYYY-MM-DD]   Update roster visits for a date from Client Hours (cancel + temp schedules/visits from Actual)

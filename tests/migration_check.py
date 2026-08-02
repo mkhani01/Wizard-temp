@@ -1449,8 +1449,15 @@ def check_feasible_pairs(connection) -> Tuple[bool, List[str]]:
         only_count = cursor.fetchone()["total"] or 0
         msgs.append("  user_must_clients rows: %d" % must_count)
         msgs.append("  user_only_clients rows: %d" % only_count)
-        if len(db_pairs) > 0 and preferred_count == 0 and must_count == 0 and only_count == 0:
-            msgs.append("WARN: feasible_pairs populated but profile preference tables are empty")
+        # Profile Must/Preferred/Only seeding is disabled; feasible-pairs clears these tables.
+        if preferred_count == 0 and must_count == 0 and only_count == 0:
+            msgs.append("PASS: profile Must/Preferred/Only tables cleared (seeding disabled)")
+        else:
+            msgs.append(
+                "WARN: profile preference tables still have rows "
+                "(preferred=%d must=%d only=%d); expected cleared after feasible-pairs"
+                % (preferred_count, must_count, only_count)
+            )
     finally:
         cursor.close()
 
