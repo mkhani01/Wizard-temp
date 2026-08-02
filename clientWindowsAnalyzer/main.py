@@ -56,8 +56,12 @@ LOWER_PERCENTILE = 0.10
 UPPER_PERCENTILE = 0.90
 MIN_WINDOW_WIDTH_MINS = 60
 TOLERANCE_MINS = 15
+NEAR_REQUESTED_MINS = 15
+EXPAND_FROM_REQUESTED_MINS = 40
 FLEXIBILITY_THRESHOLD = 10
 DURATION_SIGNIFICANCE_THRESHOLD = 0.10  # Stage 3.7: duration must appear in >= 10% of records
+MINUTES_PER_DAY = 24 * 60
+MAX_MINUTE_OF_DAY = MINUTES_PER_DAY - 1  # 23:59
 
 # ============================================================================
 # LOGGING
@@ -708,6 +712,47 @@ def _clamp_suggested_window_to_required(
     return lo, hi
 
 
+def _clamp_minute_of_day(minutes: int) -> int:
+    """Clamp to [0, 23:59] without overnight wrapping."""
+    return max(0, min(MAX_MINUTE_OF_DAY, int(minutes)))
+
+
+def _expand_window_if_near_requested(
+    sugg_start_min: int,
+    sugg_end_min: int,
+    req_start_min: int,
+    req_end_min: int,
+) -> Tuple[int, int]:
+    """
+    If calculated window equals requested or both edges are within ±NEAR_REQUESTED_MINS,
+    expand to requested_start - 40 / requested_end + 40 (clamped to day bounds).
+    """
+    if (
+        abs(sugg_start_min - req_start_min) <= NEAR_REQUESTED_MINS
+        and abs(sugg_end_min - req_end_min) <= NEAR_REQUESTED_MINS
+    ):
+        return (
+            _clamp_minute_of_day(req_start_min - EXPAND_FROM_REQUESTED_MINS),
+            _clamp_minute_of_day(req_end_min + EXPAND_FROM_REQUESTED_MINS),
+        )
+    return sugg_start_min, sugg_end_min
+
+
+def _finalize_suggested_window(
+    sugg_start_min: int,
+    sugg_end_min: int,
+    req_start_min: int,
+    req_end_min: int,
+) -> Tuple[int, int]:
+    """Clamp to requested ±tolerance, then expand if near requested."""
+    clamped = _clamp_suggested_window_to_required(
+        sugg_start_min, sugg_end_min, req_start_min, req_end_min,
+    )
+    return _expand_window_if_near_requested(
+        clamped[0], clamped[1], req_start_min, req_end_min,
+    )
+
+
 def _process_day_patterns(patterns: List[Dict]) -> List[Dict]:
     """
     Patient_Analyzer Stage 3 logic for one patient-day:
@@ -718,7 +763,7 @@ def _process_day_patterns(patterns: List[Dict]) -> List[Dict]:
     patterns = sorted(patterns, key=lambda p: p["req_start_min"])
     if len(patterns) == 1:
         p = patterns[0]
-        sugg_start, sugg_end = _clamp_suggested_window_to_required(
+        sugg_start, sugg_end = _finalize_suggested_window(
             int(p["sugg_start_min"]), int(p["sugg_end_min"]),
             int(p["req_start_min"]), int(p["req_end_min"]),
         )
@@ -782,7 +827,7 @@ def _process_day_patterns(patterns: List[Dict]) -> List[Dict]:
 
     rows_out = []
     for p in adjusted:
-        sugg_start, sugg_end = _clamp_suggested_window_to_required(
+        sugg_start, sugg_end = _finalize_suggested_window(
             int(p["sugg_start_min"]), int(p["sugg_end_min"]),
             int(p["req_start_min"]), int(p["req_end_min"]),
         )
@@ -842,15 +887,15 @@ def stage3_context_aware_suggestion(stage2: pd.DataFrame) -> pd.DataFrame:
         "minDuration": "min",
         "Service Requirement Duration": "first",
     }).reset_index()
-    # Boundary clamp after aggregation (safety net)
-    def clamp_agg_row(r):
+    # Boundary clamp + near-requested expand after aggregation (safety net)
+    def finalize_agg_row(r):
         req_start = int(r["req_start_hour"]) * 60 + int(r["req_start_minute"])
         req_end = int(r["req_end_hour"]) * 60 + int(r["req_end_minute"])
-        return _clamp_suggested_window_to_required(
+        return _finalize_suggested_window(
             int(r["sugg_start_min"]), int(r["sugg_end_min"]), req_start, req_end,
         )
 
-    sugg_pairs = agg.apply(clamp_agg_row, axis=1)
+    sugg_pairs = agg.apply(finalize_agg_row, axis=1)
     agg["sugg_start_min"] = [p[0] for p in sugg_pairs]
     agg["sugg_end_min"] = [p[1] for p in sugg_pairs]
     agg["requested_start_str"] = agg.apply(

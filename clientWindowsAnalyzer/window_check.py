@@ -18,8 +18,10 @@ from encoding_utils import normalize_name_for_match
 from feasible_pairs_migration.feasible_pairs_migration import parse_full_name
 from clientWindowsAnalyzer.main import (
     DURATION_SIGNIFICANCE_THRESHOLD,
+    EXPAND_FROM_REQUESTED_MINS,
     LOWER_PERCENTILE,
     MIN_WINDOW_WIDTH_MINS,
+    NEAR_REQUESTED_MINS,
     TOLERANCE_MINS,
     UPPER_PERCENTILE,
     compute_min_duration_from_suggested,
@@ -123,7 +125,9 @@ def build_window_reason(
             f"window from actual times "
             f"(P{int(LOWER_PERCENTILE * 100)}/P{int(UPPER_PERCENTILE * 100)} "
             f"±{TOLERANCE_MINS}min, min_width={MIN_WINDOW_WIDTH_MINS}min), "
-            f"clamped to requested ±{TOLERANCE_MINS}min"
+            f"clamped to requested ±{TOLERANCE_MINS}min; "
+            f"if within ±{NEAR_REQUESTED_MINS}min of requested, "
+            f"expand to requested ±{EXPAND_FROM_REQUESTED_MINS}min"
         ),
         f"suggested_window={window_start}-{window_end}",
     ]
@@ -186,6 +190,8 @@ def run_window_check(
         log_callback,
         f"Rules: P{int(LOWER_PERCENTILE * 100)}/P{int(UPPER_PERCENTILE * 100)} "
         f"actual times ±{TOLERANCE_MINS}min, min width {MIN_WINDOW_WIDTH_MINS}min, "
+        f"near requested (±{NEAR_REQUESTED_MINS}min) → expand requested "
+        f"±{EXPAND_FROM_REQUESTED_MINS}min, "
         f"duration significance ≥{int(DURATION_SIGNIFICANCE_THRESHOLD * 100)}%",
     )
     _log(msgs, log_callback, "=" * 70)

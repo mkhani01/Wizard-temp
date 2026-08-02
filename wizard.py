@@ -79,7 +79,7 @@ MODE_PREFERENCE_CHECK = "preference_check"
 MODE_WINDOW_CHECK = "window_check"
 
 # Wizard release version (shown in UI and window title on all platforms / frozen builds)
-WIZARD_VERSION = "0.0.23"
+WIZARD_VERSION = "0.0.24"
 
 # User-facing name for MODE_TEST_TODAY (internal id unchanged)
 LABEL_VALIDATE_ROSTER = "Validate today's roster"
@@ -1149,8 +1149,8 @@ class MigrationWizard:
             tip,
             text=(
                 "Log lines start with PAIR / SUMMARY so you can search them. "
-                "ONLY = weight ≥ 0.9 and long client duration (≥ 300 min). "
-                "MUST = weight ≥ 0.9 and shorter duration. Each PAIR line includes the reason."
+                "ONLY = weight ≥ 1.0 and long client duration (≥ 480 min / 8h). "
+                "MUST = weight ≥ 1.0 and shorter duration. Each PAIR line includes the reason."
             ),
             style="CardMuted.TLabel",
             wraplength=720,
@@ -1221,7 +1221,8 @@ class MigrationWizard:
             text=(
                 "Log lines start with WINDOW / REASON / SUMMARY so you can search them. "
                 "Windows come from actual visit time percentiles (±15 min), clamped to the "
-                "requested slot. Each REASON line explains duration and window rules."
+                "requested slot; if within ±15 min of requested, expand to requested ±40 min. "
+                "Each REASON line explains duration and window rules."
             ),
             style="CardMuted.TLabel",
             wraplength=720,
@@ -1405,7 +1406,7 @@ class MigrationWizard:
             (OPT_GEOCODE_ALL_CLIENTS, "Geocode all Clients", "Re-geocode all clients with a postcode, including those that already have coordinates."),
             (OPT_GEOCODE_ALL_USERS, "Geocode all Users", "Re-geocode all users with a postcode, including those that already have coordinates."),
             (OPT_CALCULATE_DISTANCES, "Calculate distances", "Build the travel distance matrix via OSRM for users and clients with coordinates. See More info for modes."),
-            (OPT_FVISIT_HISTORY, "Feasible pairs (visit history)", "Seed feasible pairs from VisitExport CSV (also clears profile Must/Preferred/Only). Run before Calculate distances."),
+            (OPT_FVISIT_HISTORY, "Feasible pairs (visit history)", "Seed feasible pairs from VisitExport CSV (also refreshes profile Must/Preferred/Only). Run before Calculate distances."),
             (OPT_CLIENT_WINDOWS, "Client windows analyzer", "Update client schedule windows from VisitExport history. Requires Clients Availability."),
             (OPT_CARER_TRAVEL_LIMITS, "Carer travel limits (max distance)", "Set caregiver max distance from VisitExport routes and travel_distances. Requires Calculate distances first."),
         ]

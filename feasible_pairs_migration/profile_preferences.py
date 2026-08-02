@@ -24,8 +24,8 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-WEIGHT_THRESHOLD = 0.9
-LONG_DURATION_MINUTES = 300
+WEIGHT_THRESHOLD = 1.0
+LONG_DURATION_MINUTES = 480  # 8 hours
 PREFERRED_STATUS = "Current Primary"
 
 PROFILE_TABLES = {
@@ -170,8 +170,7 @@ def refresh_all_profile_preferences(
     Full refresh of all six profile preference join tables (DELETE + INSERT).
     Returns counts per table.
 
-    Currently unused by feasible-pairs migration (clear-only path is used instead);
-    kept so Must/Preferred/Only seeding can be re-enabled later.
+    Full refresh used by feasible-pairs migration after seeding feasible_pairs.
     """
     if client_durations is None:
         client_durations = load_client_durations(connection)

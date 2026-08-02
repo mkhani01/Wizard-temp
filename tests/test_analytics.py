@@ -5,8 +5,12 @@ from datetime import datetime, timedelta
 from collections import defaultdict
 
 from clientWindowsAnalyzer.main import (
+    EXPAND_FROM_REQUESTED_MINS,
+    NEAR_REQUESTED_MINS,
     compute_min_duration_from_suggested,
     get_balanced_suggestion,
+    _expand_window_if_near_requested,
+    _finalize_suggested_window,
 )
 from feasible_pairs_migration.feasible_pairs_migration import (
     identify_carer_status,
@@ -32,6 +36,52 @@ class TestMinDurationFormula(unittest.TestCase):
 
     def test_minimum_one_minute(self):
         self.assertEqual(compute_min_duration_from_suggested(5, 1, 10), 1)
+
+
+class TestExpandWindowIfNearRequested(unittest.TestCase):
+    def test_exact_match_expands_to_requested_plus_minus_40(self):
+        req_start, req_end = 8 * 60, 9 * 60
+        start, end = _expand_window_if_near_requested(
+            req_start, req_end, req_start, req_end,
+        )
+        self.assertEqual(start, req_start - EXPAND_FROM_REQUESTED_MINS)
+        self.assertEqual(end, req_end + EXPAND_FROM_REQUESTED_MINS)
+
+    def test_within_15_minutes_expands(self):
+        req_start, req_end = 8 * 60, 9 * 60
+        start, end = _expand_window_if_near_requested(
+            req_start - NEAR_REQUESTED_MINS,
+            req_end + NEAR_REQUESTED_MINS,
+            req_start,
+            req_end,
+        )
+        self.assertEqual(start, req_start - EXPAND_FROM_REQUESTED_MINS)
+        self.assertEqual(end, req_end + EXPAND_FROM_REQUESTED_MINS)
+
+    def test_far_from_requested_unchanged(self):
+        req_start, req_end = 8 * 60, 9 * 60
+        sugg_start, sugg_end = req_start + 30, req_end + 30
+        start, end = _expand_window_if_near_requested(
+            sugg_start, sugg_end, req_start, req_end,
+        )
+        self.assertEqual((start, end), (sugg_start, sugg_end))
+
+    def test_finalize_near_requested_after_clamp_expands(self):
+        req_start, req_end = 8 * 60, 9 * 60
+        # Same as requested → clamp keeps it → expand ±40
+        start, end = _finalize_suggested_window(
+            req_start, req_end, req_start, req_end,
+        )
+        self.assertEqual(start, req_start - EXPAND_FROM_REQUESTED_MINS)
+        self.assertEqual(end, req_end + EXPAND_FROM_REQUESTED_MINS)
+
+    def test_expand_clamps_to_day_bounds(self):
+        req_start, req_end = 10, 70  # early morning
+        start, end = _expand_window_if_near_requested(
+            req_start, req_end, req_start, req_end,
+        )
+        self.assertEqual(start, 0)
+        self.assertEqual(end, req_end + EXPAND_FROM_REQUESTED_MINS)
 
 
 class TestBalancedSuggestion(unittest.TestCase):

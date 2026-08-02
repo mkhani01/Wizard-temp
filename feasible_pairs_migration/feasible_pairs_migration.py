@@ -775,7 +775,7 @@ def refresh_profile_preferences(connection, weights, statuses):
     """
     Refresh Must/Preferred/Only on user and client profile join tables (two-way sync).
 
-    Kept for re-enable later; feasible-pairs run() currently clears only.
+    DELETE all six tables then INSERT classified rows (weight/status/duration rules).
     """
     from feasible_pairs_migration.profile_preferences import refresh_all_profile_preferences
 
@@ -875,11 +875,9 @@ def run(csv_path=None, connection_manager=None, state=None):
         success = seed_feasible_pairs(connection, frequencies_by_day, weights_by_day)
         if success:
             logger.info("\n" + "="*60)
-            logger.info("STEP 7: CLEAR PROFILE PREFERENCES (Must / Preferred / Only)")
+            logger.info("STEP 7: REFRESH PROFILE PREFERENCES (Must / Preferred / Only)")
             logger.info("="*60)
-            # Seeding Must/Preferred/Only is disabled for now; still clear existing rows.
-            # To re-enable: call refresh_profile_preferences(connection, weights, statuses)
-            clear_profile_preferences(connection)
+            refresh_profile_preferences(connection, weights, statuses)
             if state:
                 state.update("feasible_pairs", status="completed")
                 state.clear_step("feasible_pairs")

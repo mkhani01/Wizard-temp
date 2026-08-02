@@ -70,12 +70,12 @@ class TestMinuteTolerance(unittest.TestCase):
 class TestPreferenceCheck(unittest.TestCase):
     def test_build_pair_reason_must_and_only(self):
         must = build_pair_reason(
-            "must", 0.97, 45, 62.0, "Current Primary", 3, 18, 29
+            "must", 1.0, 45, 62.0, "Current Primary", 3, 18, 29
         )
         self.assertIn(f">={WEIGHT_THRESHOLD}", must)
         self.assertIn(f"<{LONG_DURATION_MINUTES}", must)
         only = build_pair_reason(
-            "only", 1.0, 360, 80.0, "Current Primary", 1, 40, 50
+            "only", 1.0, 500, 80.0, "Current Primary", 1, 40, 50
         )
         self.assertIn(f">={LONG_DURATION_MINUTES}", only)
 
@@ -89,7 +89,7 @@ class TestPreferenceCheck(unittest.TestCase):
         # Another carer on each client so weights normalize.
         end = datetime(2026, 7, 29, 12, 0)
         rows = []
-        # Client Long: 6h visits — Jane dominates
+        # Client Long: 9h visits — Jane dominates (ONLY: weight>=1 and duration>=8h)
         for i in range(10):
             day = end - timedelta(days=i)
             rows.append(
@@ -100,7 +100,7 @@ class TestPreferenceCheck(unittest.TestCase):
                     "Planned Service Requirement Type Description": "Personal Care",
                     "Service Requirement Service Type Description": "Personal Care",
                     "Service Requirement Start Date And Time": day.strftime("%d/%m/%Y 08:00"),
-                    "Service Requirement End Date And Time": day.strftime("%d/%m/%Y 14:00"),
+                    "Service Requirement End Date And Time": day.strftime("%d/%m/%Y 17:00"),
                 }
             )
         for i in range(1):
@@ -113,7 +113,7 @@ class TestPreferenceCheck(unittest.TestCase):
                     "Planned Service Requirement Type Description": "Personal Care",
                     "Service Requirement Service Type Description": "Personal Care",
                     "Service Requirement Start Date And Time": day.strftime("%d/%m/%Y 08:00"),
-                    "Service Requirement End Date And Time": day.strftime("%d/%m/%Y 14:00"),
+                    "Service Requirement End Date And Time": day.strftime("%d/%m/%Y 17:00"),
                 }
             )
         # Client Short: 45m visits — Jane dominates
