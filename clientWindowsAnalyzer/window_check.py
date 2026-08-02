@@ -43,16 +43,13 @@ def _log(msgs: List[str], log_callback: Optional[LogFn], line: str) -> None:
 
 
 def _name_keys_for_person(first: str, last: str) -> Set[str]:
+    """Full-name keys only (First Last / Last, First). Never first- or last-only."""
     keys: Set[str] = set()
     f = normalize_name_for_match(first)
     l = normalize_name_for_match(last)
     if f and l:
         keys.add(normalize_name_for_match(f"{f} {l}"))
         keys.add(normalize_name_for_match(f"{l}, {f}"))
-    if f:
-        keys.add(f)
-    if l:
-        keys.add(l)
     return {k for k in keys if k}
 
 
@@ -75,37 +72,39 @@ def resolve_client_formatted_name(
 ) -> Optional[str]:
     """
     Match client first/last to a Formatted_Name value from VisitExport.
-    Returns the canonical Formatted_Name string, or None if no match.
+
+    Requires both first and last name to match (no first-only / last-only hits).
+    Returns the canonical Formatted_Name string, or None if no match — callers
+    must not suggest or update windows when this returns None.
     """
-    query = _name_keys_for_person(first_name, last_name)
-    query.add(normalize_name_for_match(f"{first_name} {last_name}"))
-    query.add(normalize_name_for_match(f"{last_name}, {first_name}"))
-
-    matches: List[str] = []
-    for name in candidate_names:
-        if _formatted_name_keys(name) & query:
-            matches.append(name)
-
-    if len(matches) == 1:
-        return matches[0]
-    if not matches:
-        return None
-
-    # Prefer exact "Last, First" display when multiple
     f = normalize_name_for_match(first_name)
     l = normalize_name_for_match(last_name)
-    exact = []
-    for name in matches:
-        pf, pl = parse_full_name(name)
+    if not f or not l:
+        return None
+
+    query = _name_keys_for_person(f, l)
+    matches: List[str] = []
+    for name in candidate_names:
+        raw = (name or "").strip()
+        if not raw:
+            continue
+        # Prefer parsed first+last equality so shared given names cannot collide
+        pf, pl = parse_full_name(raw)
         if (
             pf
             and pl
             and normalize_name_for_match(pf) == f
             and normalize_name_for_match(pl) == l
         ):
-            exact.append(name)
-    if len(exact) == 1:
-        return exact[0]
+            matches.append(name)
+            continue
+        if _formatted_name_keys(raw) & query:
+            matches.append(name)
+
+    if not matches:
+        return None
+    if len(matches) == 1:
+        return matches[0]
     return matches[0]
 
 

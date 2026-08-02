@@ -70,6 +70,17 @@ class TestWindowCheckHelpers(unittest.TestCase):
         )
         self.assertIsNone(resolve_client_formatted_name("Nobody", "Here", candidates))
 
+    def test_resolve_requires_first_and_last_not_first_only(self):
+        """Shared first name must not match a different last name (e.g. Fiona)."""
+        candidates = ["Buchannon (DS), Fiona", "Smith, Alice"]
+        self.assertIsNone(
+            resolve_client_formatted_name("Fiona", "McKinnon", candidates)
+        )
+        self.assertEqual(
+            resolve_client_formatted_name("Fiona", "Buchannon (DS)", candidates),
+            "Buchannon (DS), Fiona",
+        )
+
     def test_build_window_reason_includes_rules(self):
         reason = build_window_reason(8, 60, 45, 29, "08:00:00", "09:00:00")
         self.assertIn("visits=8", reason)
