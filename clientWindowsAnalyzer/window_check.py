@@ -143,7 +143,10 @@ def build_window_reason(
             f"(kept requested={requested_duration}; no significant shorter actual duration)"
         )
     pct = 65 if requested_duration != suggested_duration else 85
-    parts.append(f"min_duration={min_duration} ({pct}% of suggested, capped by slot/requested)")
+    parts.append(
+        f"min_duration={min_duration} "
+        f"({pct}% of suggested, capped at 75% of requested and by slot)"
+    )
     return "; ".join(parts)
 
 

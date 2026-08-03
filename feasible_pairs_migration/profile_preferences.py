@@ -160,6 +160,77 @@ def clear_all_profile_preferences(connection) -> None:
         cursor.close()
 
 
+def sync_extended_feasibility(cursor) -> Dict[str, int]:
+    """
+    Set extended_feasibility true for all non-deleted users/clients except those
+    with Only preferences (user_only_clients / client_only_users), who stay false.
+
+    Must run after Only join tables are written (same transaction).
+    Returns counts: user_true, user_false, client_true, client_false.
+    """
+    cursor.execute(
+        """
+        UPDATE "user"
+        SET extended_feasibility = NOT EXISTS (
+            SELECT 1 FROM user_only_clients uoc WHERE uoc.user_id = "user".id
+        )
+        WHERE deleted_at IS NULL
+        """
+    )
+    cursor.execute(
+        """
+        SELECT
+            COUNT(*) FILTER (WHERE extended_feasibility) AS n_true,
+            COUNT(*) FILTER (WHERE NOT extended_feasibility) AS n_false
+        FROM "user"
+        WHERE deleted_at IS NULL
+        """
+    )
+    user_counts = cursor.fetchone()
+    cursor.execute(
+        """
+        UPDATE "client"
+        SET extended_feasibility = NOT EXISTS (
+            SELECT 1 FROM client_only_users cou WHERE cou.client_id = "client".id
+        )
+        WHERE deleted_at IS NULL
+        """
+    )
+    cursor.execute(
+        """
+        SELECT
+            COUNT(*) FILTER (WHERE extended_feasibility) AS n_true,
+            COUNT(*) FILTER (WHERE NOT extended_feasibility) AS n_false
+        FROM "client"
+        WHERE deleted_at IS NULL
+        """
+    )
+    client_counts = cursor.fetchone()
+
+    def _count(row, key: str) -> int:
+        if row is None:
+            return 0
+        if isinstance(row, dict):
+            return int(row.get(key) or 0)
+        # RealDictCursor fallback: (n_true, n_false)
+        return int(row[0] if key == "n_true" else row[1] or 0)
+
+    result = {
+        "user_true": _count(user_counts, "n_true"),
+        "user_false": _count(user_counts, "n_false"),
+        "client_true": _count(client_counts, "n_true"),
+        "client_false": _count(client_counts, "n_false"),
+    }
+    logger.info(
+        "  extended_feasibility: user true=%d false=%d; client true=%d false=%d",
+        result["user_true"],
+        result["user_false"],
+        result["client_true"],
+        result["client_false"],
+    )
+    return result
+
+
 def refresh_all_profile_preferences(
     connection,
     weights: Dict[Tuple[int, int], float],
@@ -168,7 +239,8 @@ def refresh_all_profile_preferences(
 ) -> Dict[str, int]:
     """
     Full refresh of all six profile preference join tables (DELETE + INSERT).
-    Returns counts per table.
+    Also syncs user/client extended_feasibility (true except Only entities).
+    Returns counts per table (plus extended_feasibility_* keys).
 
     Full refresh used by feasible-pairs migration after seeding feasible_pairs.
     """
@@ -204,11 +276,14 @@ def refresh_all_profile_preferences(
                 template = "(%s, %s, %s)"
             execute_values(cursor, insert_sql, rows, template=template)
 
+        extend_counts = sync_extended_feasibility(cursor)
+
         connection.commit()
         result = {table: len(table_rows.get(table, [])) for table in ALL_PROFILE_TABLES}
         for table, cnt in result.items():
             if cnt:
                 logger.info("  %s: %d row(s)", table, cnt)
+        result.update({f"extended_feasibility_{k}": v for k, v in extend_counts.items()})
         return result
     except (OperationalError, InterfaceError) as e:
         connection.rollback()

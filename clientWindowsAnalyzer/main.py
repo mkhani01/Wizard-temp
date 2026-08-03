@@ -899,7 +899,8 @@ def compute_min_duration_from_suggested(
 ) -> int:
     """
     min_duration = 65% of suggested when requested != suggested, else 85%.
-    Clamped to [1, suggested, requested, slot_width].
+    Capped at 75% of requested (keep if already below), then clamped to
+    [1, suggested, requested, slot_width].
     """
     if suggested_duration <= 0:
         return 0
@@ -907,6 +908,10 @@ def compute_min_duration_from_suggested(
         min_dur = round(0.65 * suggested_duration)
     else:
         min_dur = round(0.85 * suggested_duration)
+    if requested_duration > 0:
+        max_vs_requested = round(0.75 * requested_duration)
+        if min_dur > max_vs_requested:
+            min_dur = max_vs_requested
     caps = [suggested_duration, requested_duration]
     if slot_width is not None and slot_width > 0:
         caps.append(slot_width)

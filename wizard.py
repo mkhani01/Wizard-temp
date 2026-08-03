@@ -79,7 +79,7 @@ MODE_PREFERENCE_CHECK = "preference_check"
 MODE_WINDOW_CHECK = "window_check"
 
 # Wizard release version (shown in UI and window title on all platforms / frozen builds)
-WIZARD_VERSION = "0.0.26"
+WIZARD_VERSION = "0.0.28"
 
 # User-facing name for MODE_TEST_TODAY (internal id unchanged)
 LABEL_VALIDATE_ROSTER = "Validate today's roster"

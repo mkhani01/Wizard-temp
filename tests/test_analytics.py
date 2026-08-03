@@ -26,13 +26,20 @@ from feasible_pairs_migration.feasible_pairs_migration import (
 
 
 class TestMinDurationFormula(unittest.TestCase):
-    def test_sixty_five_percent_when_requested_differs(self):
+    def test_keep_when_below_seventy_five_percent_of_requested(self):
+        # 65% of 45 = 29; 75% of requested 60 = 45 → keep 29
         self.assertEqual(compute_min_duration_from_suggested(60, 45, 60), 29)
 
-    def test_eighty_five_percent_when_requested_matches(self):
-        self.assertEqual(compute_min_duration_from_suggested(45, 45, 60), 38)
+    def test_cap_at_seventy_five_percent_of_requested_when_equal(self):
+        # 85% of 45 = 38; 75% of requested 45 = 34 → cap to 34
+        self.assertEqual(compute_min_duration_from_suggested(45, 45, 60), 34)
+
+    def test_cap_at_seventy_five_percent_when_requested_matches_longer(self):
+        # 85% of 60 = 51; 75% of requested 60 = 45 → cap to 45
+        self.assertEqual(compute_min_duration_from_suggested(60, 60, 60), 45)
 
     def test_clamped_to_slot_width(self):
+        # 29 kept vs 75% of requested, then slot_width=20 caps it
         self.assertEqual(compute_min_duration_from_suggested(60, 45, 20), 20)
 
     def test_minimum_one_minute(self):

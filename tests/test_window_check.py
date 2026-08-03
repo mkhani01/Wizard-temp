@@ -87,6 +87,7 @@ class TestWindowCheckHelpers(unittest.TestCase):
         self.assertIn("suggested_duration=45", reason)
         self.assertIn("min_duration=29", reason)
         self.assertIn("65%", reason)
+        self.assertIn("75% of requested", reason)
         self.assertIn("expand to requested ±40min", reason)
 
 

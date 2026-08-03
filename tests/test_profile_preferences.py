@@ -2,6 +2,7 @@
 
 import sys
 from pathlib import Path
+from unittest.mock import MagicMock
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -13,6 +14,7 @@ from feasible_pairs_migration.profile_preferences import (
     classify_pairs,
     classify_profile_category,
     build_profile_rows,
+    sync_extended_feasibility,
 )
 
 
@@ -77,6 +79,50 @@ def test_two_way_sync_row_counts():
     assert cid == cid2 == 100
 
 
+def test_only_entities_get_extended_feasibility_false_others_true():
+    """Only join membership implies extended_feasibility=false; Must/Preferred do not."""
+    categorized = classify_pairs(
+        weights={(1, 10): 1.0, (2, 20): 1.0, (3, 30): 0.5},
+        statuses={(3, 30): "Current Primary"},
+        client_durations={10: 500, 20: 60, 30: 60},
+    )
+    rows = build_profile_rows(categorized)
+    only_users = {r[0] for r in rows["user_only_clients"]}
+    only_clients = {r[0] for r in rows["client_only_users"]}
+    must_users = {r[0] for r in rows["user_must_clients"]}
+    preferred_users = {r[0] for r in rows["user_preferred_clients"]}
+
+    assert only_users == {1}
+    assert only_clients == {10}
+    assert 2 in must_users
+    assert 3 in preferred_users
+    # Rule mirrored by sync_extended_feasibility SQL: Only → false, else true
+    for uid in must_users | preferred_users:
+        assert uid not in only_users  # would get extended_feasibility=true
+    for uid in only_users:
+        assert uid not in must_users and uid not in preferred_users
+
+
+def test_sync_extended_feasibility_sql_and_counts():
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [
+        {"n_true": 10, "n_false": 2},
+        {"n_true": 8, "n_false": 1},
+    ]
+    result = sync_extended_feasibility(cursor)
+    assert result == {
+        "user_true": 10,
+        "user_false": 2,
+        "client_true": 8,
+        "client_false": 1,
+    }
+    sqls = [call.args[0] for call in cursor.execute.call_args_list]
+    assert any("user_only_clients" in sql and "extended_feasibility" in sql for sql in sqls)
+    assert any("client_only_users" in sql and "extended_feasibility" in sql for sql in sqls)
+    assert any('UPDATE "user"' in sql for sql in sqls)
+    assert any('UPDATE "client"' in sql for sql in sqls)
+
+
 if __name__ == "__main__":
     test_classify_only_for_long_duration_high_weight()
     test_classify_must_for_normal_duration_high_weight()
@@ -85,4 +131,6 @@ if __name__ == "__main__":
     test_must_only_take_precedence_over_preferred()
     test_exclusivity_in_build_profile_rows()
     test_two_way_sync_row_counts()
+    test_only_entities_get_extended_feasibility_false_others_true()
+    test_sync_extended_feasibility_sql_and_counts()
     print("All profile preference tests passed.")
